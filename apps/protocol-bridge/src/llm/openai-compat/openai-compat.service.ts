@@ -58,7 +58,68 @@ interface ChatCompletionRequest {
   max_tokens?: number
   temperature?: number
   top_p?: number
+  reasoning?: { effort: string }
+  reasoning_effort?: string
   [key: string]: unknown
+}
+
+function supportsOpenAiCompatReasoning(modelName: string): boolean {
+  const normalized = modelName.toLowerCase().trim()
+  return (
+    normalized.startsWith("o1") ||
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4") ||
+    normalized.startsWith("gpt-5") ||
+    normalized.startsWith("codex")
+  )
+}
+
+function normalizeOpenAiCompatReasoningEffort(effort: string): string {
+  const normalized = effort.toLowerCase().trim()
+
+  switch (normalized) {
+    case "none":
+    case "minimal":
+    case "low":
+      return "low"
+    case "medium":
+      return "medium"
+    case "high":
+    case "xhigh":
+    case "max":
+    case "auto":
+      return "high"
+    default:
+      return "medium"
+  }
+}
+
+function resolveOpenAiCompatReasoningEffort(dto: CreateMessageDto): string {
+  if (!dto.thinking) {
+    return "medium"
+  }
+
+  switch (dto.thinking.type) {
+    case "enabled": {
+      const budget = dto.thinking.budget_tokens
+      if (budget == null) return "medium"
+      if (budget <= 0) return "low"
+      if (budget <= 1024) return "low"
+      if (budget <= 8192) return "medium"
+      return "high"
+    }
+    case "disabled":
+      return "low"
+    case "adaptive":
+    case "auto":
+      return normalizeOpenAiCompatReasoningEffort(
+        typeof dto.output_config?.effort === "string"
+          ? dto.output_config.effort
+          : "high"
+      )
+    default:
+      return "medium"
+  }
 }
 
 // ── Streaming state ────────────────────────────────────────────────────
@@ -70,6 +131,7 @@ interface StreamState {
   responseId: string
   model: string
   messageStartEmitted: boolean
+  thinkingBlockActive: boolean
 }
 
 function createStreamState(): StreamState {
@@ -80,6 +142,7 @@ function createStreamState(): StreamState {
     responseId: "",
     model: "",
     messageStartEmitted: false,
+    thinkingBlockActive: false,
   }
 }
 
@@ -336,6 +399,12 @@ export class OpenaiCompatService implements OnModuleInit {
       stream,
     }
 
+    if (supportsOpenAiCompatReasoning(dto.model)) {
+      const effort = resolveOpenAiCompatReasoningEffort(dto)
+      request.reasoning = { effort }
+      request.reasoning_effort = effort
+    }
+
     if (dto.max_tokens) {
       request.max_tokens = dto.max_tokens
     }
@@ -562,7 +631,7 @@ export class OpenaiCompatService implements OnModuleInit {
     const headers = this.buildHeaders(false)
 
     this.logger.log(
-      `[OpenAI-Compat] Non-stream request: model=${request.model}, url=${url}`
+      `[OpenAI-Compat] Non-stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -685,7 +754,7 @@ export class OpenaiCompatService implements OnModuleInit {
     const headers = this.buildHeaders(true)
 
     this.logger.log(
-      `[OpenAI-Compat] Stream request: model=${request.model}, url=${url}`
+      `[OpenAI-Compat] Stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -771,6 +840,67 @@ export class OpenaiCompatService implements OnModuleInit {
    *   data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":"..."}}]}
    *   data: [DONE]
    */
+  private previewReasoningValue(value: unknown): string {
+    if (typeof value === "string") {
+      return value.slice(0, 200)
+    }
+
+    try {
+      return JSON.stringify(value).slice(0, 200)
+    } catch {
+      return String(value).slice(0, 200)
+    }
+  }
+
+  private logReasoningHit(source: string, value: unknown): void {
+    this.logger.debug(
+      `[OpenAI-Compat] Reasoning chunk detected: source=${source}, type=${typeof value}, preview=${this.previewReasoningValue(value)}`
+    )
+  }
+
+  private emitThinkingDelta(
+    state: StreamState,
+    thinkingText: string
+  ): string[] {
+    if (!thinkingText) return []
+
+    const results: string[] = []
+    if (!state.thinkingBlockActive) {
+      results.push(
+        formatSseEvent("content_block_start", {
+          type: "content_block_start",
+          index: state.blockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        })
+      )
+      state.thinkingBlockActive = true
+    }
+
+    results.push(
+      formatSseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: { type: "thinking_delta", thinking: thinkingText },
+      })
+    )
+
+    return results
+  }
+
+  private closeThinkingBlock(state: StreamState): string[] {
+    if (!state.thinkingBlockActive) return []
+
+    state.thinkingBlockActive = false
+    const results = [
+      formatSseEvent("content_block_stop", {
+        type: "content_block_stop",
+        index: state.blockIndex,
+      }),
+    ]
+    state.blockIndex++
+    return results
+  }
+
   private translateStreamChunk(line: string, state: StreamState): string[] {
     if (!line.startsWith("data:")) return []
 
@@ -824,9 +954,53 @@ export class OpenaiCompatService implements OnModuleInit {
 
     const finishReason = choice.finish_reason as string | null
 
+    const closeThinkingBeforeContent = () => {
+      if (state.thinkingBlockActive) {
+        results.push(...this.closeThinkingBlock(state))
+      }
+    }
+
+    // Handle provider-specific reasoning/thinking deltas
+    const deltaReasoning = delta.reasoning as string | undefined
+    const deltaReasoningContent = delta.reasoning_content as string | undefined
+    const deltaReasoningText =
+      deltaReasoning || deltaReasoningContent || delta.reasoning_text
+
+    if (typeof deltaReasoningText === "string" && deltaReasoningText) {
+      const source = deltaReasoning
+        ? "delta.reasoning"
+        : deltaReasoningContent
+          ? "delta.reasoning_content"
+          : "delta.reasoning_text"
+      this.logReasoningHit(source, deltaReasoningText)
+      results.push(...this.emitThinkingDelta(state, deltaReasoningText))
+    }
+
+    const providerMessage = chunk.message
+    const providerReasoning =
+      providerMessage && typeof providerMessage === "object"
+        ? (providerMessage as Record<string, unknown>).reasoning
+        : undefined
+    if (typeof providerReasoning === "string" && providerReasoning) {
+      this.logReasoningHit("message.reasoning", providerReasoning)
+      results.push(...this.emitThinkingDelta(state, providerReasoning))
+    } else if (
+      providerReasoning &&
+      typeof providerReasoning === "object" &&
+      typeof (providerReasoning as Record<string, unknown>).content === "string"
+    ) {
+      results.push(
+        ...this.emitThinkingDelta(
+          state,
+          (providerReasoning as Record<string, unknown>).content as string
+        )
+      )
+    }
+
     // Handle text content delta
     const contentDelta = delta.content as string | null
     if (contentDelta != null && contentDelta !== "") {
+      closeThinkingBeforeContent()
       // Start a new text block if this is the first text content
       if (
         state.blockIndex === 0 ||
@@ -861,6 +1035,7 @@ export class OpenaiCompatService implements OnModuleInit {
         const func = tc.function as Record<string, unknown> | undefined
 
         if (!state.activeToolCalls.has(tcIndex)) {
+          closeThinkingBeforeContent()
           // Close previous content block if needed
           if (state.blockIndex > 0 || contentDelta != null) {
             results.push(
@@ -927,6 +1102,7 @@ export class OpenaiCompatService implements OnModuleInit {
 
     // Handle finish
     if (finishReason) {
+      closeThinkingBeforeContent()
       // Close the current content block
       results.push(
         formatSseEvent("content_block_stop", {
@@ -971,6 +1147,11 @@ export class OpenaiCompatService implements OnModuleInit {
    * Emit final stream end events (fallback if finish_reason was missed).
    */
   private *emitStreamEnd(state: StreamState): Generator<string, void, unknown> {
+    const pendingThinking = this.closeThinkingBlock(state)
+    for (const event of pendingThinking) {
+      yield event
+    }
+
     const stopReason = state.hasToolCall ? "tool_use" : "end_turn"
 
     yield formatSseEvent("message_delta", {
