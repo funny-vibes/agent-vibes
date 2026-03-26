@@ -604,6 +604,8 @@ export class OpenaiCompatService implements OnModuleInit {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.apiKey}`,
       Accept: stream ? "text/event-stream" : "application/json",
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
     }
   }
 
@@ -778,15 +780,44 @@ export class OpenaiCompatService implements OnModuleInit {
       throw new Error("OpenAI-compatible response has no body")
     }
 
+    // Check content-type to ensure we are actually getting a stream,
+    // not an HTML challenge page (e.g. from Cloudflare)
+    const contentType = response.headers.get("content-type") || ""
+    if (contentType.includes("text/html")) {
+      const errorBodyText = await response.text()
+      this.logger.error(
+        `[OpenAI-Compat] Expected stream but got HTML (possible captcha/WAF block). HTML start: ${errorBodyText.slice(0, 200)}`
+      )
+      throw new Error(
+        `OpenAI-compatible API returned HTML page. API may be blocked by anti-bot protection.`
+      )
+    }
+
     // Stream SSE events
     const state = createStreamState()
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
 
+    // We implement an idle timeout for reader.read(). If no chunk is received
+    // within IDLE_TIMEOUT_MS, we throw an error to prevent the bridge from hanging forever.
+    const IDLE_TIMEOUT_MS = 60_000
+
     try {
       while (true) {
-        const { done, value } = await reader.read()
+        // Race between reading the next chunk and the idle timeout
+        const timeoutPromise = new Promise<{ done: never; value: never }>(
+          (_, reject) => {
+            setTimeout(
+              () => reject(new Error("Timeout reading from SSE stream")),
+              IDLE_TIMEOUT_MS
+            )
+          }
+        )
+
+        const readResult = await Promise.race([reader.read(), timeoutPromise])
+
+        const { done, value } = readResult
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
