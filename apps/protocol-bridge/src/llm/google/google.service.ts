@@ -1174,17 +1174,34 @@ export class GoogleService {
   ): Promise<string> {
     if (!this.processPool.isConfigured()) return ""
     try {
+      // Prepend a system instruction to make the model generate a short tab name
+      // instead of responding to the user's question
+      const tabNamingContents = [
+        {
+          role: "user" as const,
+          parts: [
+            {
+              text:
+                "Based on the following conversation, generate a very short title (3-8 words, no quotes, no markdown, no punctuation at the end) that summarizes the topic. Reply with ONLY the title, nothing else.\n\n" +
+                contents
+                  .map((c) => c.parts.map((p) => p.text).join(" "))
+                  .join("\n"),
+            },
+          ],
+        },
+      ]
+
       const payload = {
         project: "",
         model: "tab_flash_lite_preview",
         request: {
-          contents,
+          contents: tabNamingContents,
           generationConfig: {
             temperature: 0.2,
             topP: 1,
             topK: 40,
             candidateCount: 1,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 32,
             thinkingConfig: {
               includeThoughts: false,
               thinkingBudget: 0,
@@ -1200,7 +1217,13 @@ export class GoogleService {
         unknown
       >
       const responseData = this.unwrapCloudCodeResponse(data)
-      return this.extractGenerateContentText(responseData).trim()
+      const rawName = this.extractGenerateContentText(responseData).trim()
+      // Sanitize: take only the first line, strip quotes, limit length
+      const firstLine = rawName.split("\n")[0]?.trim() || ""
+      const cleaned = firstLine.replace(/^["']+|["']+$/g, "").trim()
+      return cleaned.length > 0 && cleaned.length <= 80
+        ? cleaned
+        : cleaned.slice(0, 80) || ""
     } catch (error) {
       this.logger.warn(
         `generateTabName failed: ${error instanceof Error ? error.message : String(error)}`
