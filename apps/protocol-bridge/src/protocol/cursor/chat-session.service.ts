@@ -883,12 +883,8 @@ export class ChatSessionManager implements OnModuleDestroy {
       if (initialRequest?.cursorRules) {
         session.cursorRules = initialRequest.cursorRules
       }
-      if (initialRequest?.cursorCommands) {
-        session.cursorCommands = initialRequest.cursorCommands
-      }
-      if (initialRequest?.customSystemPrompt) {
-        session.customSystemPrompt = initialRequest.customSystemPrompt
-      }
+      session.cursorCommands = initialRequest?.cursorCommands
+      session.customSystemPrompt = initialRequest?.customSystemPrompt
       if (initialRequest?.explicitContext) {
         session.explicitContext = initialRequest.explicitContext
       }

@@ -15,7 +15,10 @@ import {
   type RequestedModel_ModelParameterValue,
   UserMessage,
 } from "../../gen/agent/v1_pb"
-import { getDefaultAgentToolNames } from "./cursor-tool-mapper"
+import {
+  getDefaultAgentToolNames,
+  isCursorBuiltInToolAllowed,
+} from "./cursor-tool-mapper"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
@@ -853,24 +856,35 @@ export class CursorRequestParser {
     // 提取支持的工具
     // RequestContext.tools / mcp_tools 只承载 MCP 定义；内置 Cursor 工具需要结合
     // capability flags 和 customSubagents[].tools 一起判断，避免把显式工具选择扩回默认全集。
-    const defaultBuiltInTools = getDefaultAgentToolNames({
+    const builtInToolCapabilityOptions = {
       webSearchEnabled: requestContext?.webSearchEnabled,
       webFetchEnabled: requestContext?.webFetchEnabled,
       readLintsEnabled: requestContext?.readLintsEnabled,
-    })
+    }
+    const defaultBuiltInTools = getDefaultAgentToolNames(
+      builtInToolCapabilityOptions
+    )
     const defaultBuiltInToolSet = new Set(defaultBuiltInTools)
     const supportedToolsSet = new Set<string>()
+
+    const appendSupportedToolName = (toolName?: string) => {
+      if (!toolName) return
+      if (!isCursorBuiltInToolAllowed(toolName, builtInToolCapabilityOptions)) {
+        return
+      }
+      supportedToolsSet.add(toolName)
+    }
 
     const appendDeclaredMcpToolName = (tool: {
       name?: string
       toolName?: string
     }) => {
       if (tool.name) {
-        supportedToolsSet.add(tool.name)
+        appendSupportedToolName(tool.name)
         return
       }
       if (tool.toolName) {
-        supportedToolsSet.add(tool.toolName)
+        appendSupportedToolName(tool.toolName)
       }
     }
 
@@ -891,9 +905,7 @@ export class CursorRequestParser {
       for (const subagent of requestContext.customSubagents) {
         if (!subagent.tools?.length) continue
         for (const toolName of subagent.tools) {
-          if (toolName) {
-            supportedToolsSet.add(toolName)
-          }
+          appendSupportedToolName(toolName)
         }
       }
     }

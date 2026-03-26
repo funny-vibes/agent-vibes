@@ -402,7 +402,7 @@ export class ToolIntegrityService {
    * Sanitize messages to ensure tool protocol integrity.
    *
    * This is the single entry point for post-truncation repair:
-   * 1. Forward cleanup: remove tool_use blocks without matching tool_result
+   * 1. Preserve pending tool_use blocks that may still be waiting on results
    * 2. Reverse cleanup: remove tool_result blocks without matching tool_use
    * 3. Remove messages that become empty after cleanup
    * 4. Merge consecutive same-role messages (invalid for most backends)
@@ -432,40 +432,9 @@ export class ToolIntegrityService {
 
     // Collect all tool_use IDs and tool_result IDs
     const allToolUseIds = new Set<string>()
-    const allToolResultIds = new Set<string>()
     for (const msg of result.messages) {
       for (const id of this.extractToolUseIds(msg)) {
         allToolUseIds.add(id)
-      }
-      for (const id of this.extractToolResultIds(msg)) {
-        allToolResultIds.add(id)
-      }
-    }
-
-    // Forward cleanup: remove orphan tool_use (no matching tool_result)
-    for (const msg of result.messages) {
-      if (msg.role !== "assistant") continue
-
-      if (Array.isArray(msg.content)) {
-        const before = msg.content.length
-        msg.content = msg.content.filter((block: ContentBlock) => {
-          if (isToolUseBlock(block) && !allToolResultIds.has(block.id)) {
-            return false
-          }
-          return true
-        })
-        result.removedOrphanToolUses += before - msg.content.length
-      }
-
-      if (msg.tool_calls) {
-        const before = msg.tool_calls.length
-        msg.tool_calls = msg.tool_calls.filter(
-          (tc: { id?: string }) => !tc.id || allToolResultIds.has(tc.id)
-        )
-        result.removedOrphanToolUses += before - msg.tool_calls.length
-        if (msg.tool_calls.length === 0) {
-          delete msg.tool_calls
-        }
       }
     }
 
@@ -494,18 +463,18 @@ export class ToolIntegrityService {
 
     // Remove empty messages
     result.messages = result.messages.filter((msg) => {
-      const hasText =
+      const hasContent =
         typeof msg.content === "string"
           ? msg.content.trim().length > 0
           : Array.isArray(msg.content) &&
             msg.content.length > 0 &&
-            msg.content.some(
-              (b) => isTextBlock(b) || isToolUseBlock(b) || isToolResultBlock(b)
+            msg.content.some((block) =>
+              isTextBlock(block) ? block.text.trim().length > 0 : true
             )
       const hasToolCalls =
         msg.tool_calls && (msg.tool_calls as unknown[]).length > 0
 
-      if (!hasText && !hasToolCalls) {
+      if (!hasContent && !hasToolCalls) {
         result.removedEmptyMessages++
         return false
       }

@@ -1116,6 +1116,10 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
 ] as const
 
+const BUILTIN_CURSOR_TOOL_KEYS = new Set<string>(
+  DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS
+)
+
 const BUILTIN_WEB_SEARCH_TOOL_KEYS = new Set<string>([
   "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
 ])
@@ -1246,6 +1250,16 @@ export function getDefaultAgentToolNames(
   return DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS.filter((toolName) =>
     shouldIncludeBuiltInTool(toolName, options)
   )
+}
+
+export function isCursorBuiltInToolAllowed(
+  toolName: string,
+  options?: CursorBuiltInToolCapabilityOptions
+): boolean {
+  if (!BUILTIN_CURSOR_TOOL_KEYS.has(toolName)) {
+    return true
+  }
+  return shouldIncludeBuiltInTool(toolName, options)
 }
 
 // ToolDefinition format compatible with CreateMessageDto
