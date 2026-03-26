@@ -131,6 +131,8 @@ claude
 
 ### Use with Cursor IDE
 
+For the Cursor client side, a free account is enough. No paid Cursor plan is required.
+
 Cursor requires HTTPS interception — one-time setup:
 
 ```bash
@@ -174,13 +176,38 @@ Zero-config for local dev. For server deployment, configure in `apps/protocol-br
 
 Use this when you want GPT, O-series, or Codex models.
 
+You can connect the Codex backend in three ways:
+
+- Sync local Codex CLI / ChatGPT auth
+- Set an official OpenAI API key directly
+- Set a third-party Codex-compatible API key with a custom base URL
+
+**Option 1: sync Codex CLI auth**
+
 ```bash
 agent-vibes sync --codex
 # or
 npm run codex:sync
 ```
 
-Or set `CODEX_API_KEY` in `apps/protocol-bridge/.env.local`.
+**Option 2: set an API key directly**
+
+Set `CODEX_API_KEY` in `apps/protocol-bridge/.env.local`.
+
+**Option 3: use a third-party Codex-compatible key**
+
+Set both `CODEX_BASE_URL` and `CODEX_API_KEY` in `apps/protocol-bridge/.env.local`:
+
+```dotenv
+CODEX_BASE_URL=https://example.com/codex
+CODEX_API_KEY=sk-xxx
+```
+
+`CODEX_BASE_URL` should point to the parent Codex / Responses path. Do not include `/responses` at the end, because Agent Vibes appends it automatically.
+
+> **Note:** If `OPENAI_COMPAT_BASE_URL` and `OPENAI_COMPAT_API_KEY` are also
+> configured, GPT / O-series requests are routed to the OpenAI-compatible
+> backend first. Otherwise they use the Codex backend.
 
 Then start the proxy:
 
@@ -365,7 +392,7 @@ npm run issues                 # Collect logs & environment info, copy to clipbo
 
 ## Community
 
-Join the discussion and share your thoughts about Agent Vibes on [LINUX DO](https://linux.do), or feel free to report bugs and feedback on [GitHub Issues](https://github.com/funny-vibes/agent-vibes/issues).
+Join the discussion and share your thoughts about Agent Vibes on [LINUX DO](https://linux.do/t/topic/1814066), or feel free to report bugs and feedback on [GitHub Issues](https://github.com/funny-vibes/agent-vibes/issues).
 
 ## Contributing
 
