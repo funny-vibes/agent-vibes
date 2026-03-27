@@ -11,12 +11,15 @@ import {
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
   NameAgentResponseSchema,
+  UploadConversationBlobsRequestSchema,
+  UploadConversationBlobsResponseSchema,
 } from "../../gen/agent/v1_pb"
 import {
   GetDiffReviewRequestSchema,
   StreamDiffReviewResponseSchema,
   type GetDiffReviewRequest_SimpleFileDiff,
 } from "../../gen/aiserver/v1_pb"
+import { KvStorageService } from "./kv-storage.service"
 
 /**
  * Cursor ConnectRPC Adapter Controller
@@ -29,7 +32,8 @@ export class CursorAdapterController {
   constructor(
     private readonly connectStreamService: CursorConnectStreamService,
     private readonly codexService: CodexService,
-    private readonly openaiCompatService: OpenaiCompatService
+    private readonly openaiCompatService: OpenaiCompatService,
+    private readonly kvStorageService: KvStorageService
   ) {}
 
   /**
@@ -129,6 +133,42 @@ export class CursorAdapterController {
       .status(200)
       .send(
         Buffer.from(toBinary(GetAllowedModelIntentsResponseSchema, response))
+      )
+  }
+
+  /**
+   * agent.v1.AgentService/UploadConversationBlobs
+   */
+  @Post("agent.v1.AgentService/UploadConversationBlobs")
+  handleUploadConversationBlobs(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    this.logger.log(">>> AgentService/UploadConversationBlobs request received")
+
+    const payload = connectRPCHandler.stripEnvelope(req.body as Buffer)
+    const uploadRequest = fromBinary(
+      UploadConversationBlobsRequestSchema,
+      payload
+    )
+    const textDecoder = new TextDecoder()
+
+    for (const blob of uploadRequest.blobs) {
+      const blobId = textDecoder.decode(blob.id)
+      this.kvStorageService.storeBinaryBlob(blobId, blob.value)
+    }
+
+    this.logger.log(
+      `Stored ${uploadRequest.blobs.length} conversation blob(s) for conversation=${uploadRequest.conversationId || "(none)"} chunk=${uploadRequest.chunkIndex + 1}/${uploadRequest.totalChunks || 1}`
+    )
+
+    res.header("Content-Type", "application/proto")
+    res.header("Connect-Protocol-Version", "1")
+    const response = create(UploadConversationBlobsResponseSchema, {})
+    res
+      .status(200)
+      .send(
+        Buffer.from(toBinary(UploadConversationBlobsResponseSchema, response))
       )
   }
 

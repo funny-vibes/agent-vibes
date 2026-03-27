@@ -881,6 +881,14 @@ export class CursorConnectStreamService {
     return false
   }
 
+  private isChatTurn(parsed: ParsedCursorRequest): boolean {
+    return !!(
+      parsed.newMessage ||
+      parsed.isResumeAction ||
+      parsed.attachedImages?.length
+    )
+  }
+
   private messageHasToolUse(
     content: MessageContent | undefined,
     toolCallId: string
@@ -5717,11 +5725,15 @@ ${raw}
               `Still waiting for ${sessionAfterTool.pendingToolCalls.size} more tool result(s)`
             )
           }
-        } else if (parsed.newMessage || parsed.isResumeAction) {
-          // This is a new chat message or a resume_action turn.
+        } else if (this.isChatTurn(parsed)) {
+          // This is a new chat message (text and/or images) or a resume_action turn.
           if (parsed.newMessage) {
             this.logger.log(
               `Received chat message: "${parsed.newMessage.substring(0, 50)}..."`
+            )
+          } else if (parsed.attachedImages?.length) {
+            this.logger.log(
+              `Received image-only chat message (${parsed.attachedImages.length} image(s))`
             )
           } else {
             this.logger.log(

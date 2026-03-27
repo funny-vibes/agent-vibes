@@ -26,7 +26,7 @@ export interface KvServerMessage {
 export class KvStorageService {
   private readonly logger = new Logger(KvStorageService.name)
   private kvMessageIdCounter = 0
-  private blobStore = new Map<string, string>() // blobId -> blobData
+  private static readonly blobStore = new Map<string, string>() // blobId -> base64 blobData
 
   /**
    * Reset KV message ID counter for new conversation
@@ -56,7 +56,7 @@ export class KvStorageService {
     const blobId = generateBlobId(blobData)
 
     // Store in local cache
-    this.blobStore.set(blobId, blobData)
+    KvStorageService.blobStore.set(blobId, blobData)
 
     const message: KvServerMessage = {
       setBlobArgs: {
@@ -83,6 +83,23 @@ export class KvStorageService {
   }
 
   /**
+   * Store an already-encoded base64 blob under a known blob ID.
+   */
+  storeBlob(blobId: string, blobData: string): void {
+    KvStorageService.blobStore.set(blobId, blobData)
+    this.logger.debug(
+      `Stored blob ${blobId.substring(0, 20)}... (${blobData.length} base64 chars)`
+    )
+  }
+
+  /**
+   * Store raw bytes under a known blob ID.
+   */
+  storeBinaryBlob(blobId: string, blobBytes: Uint8Array): void {
+    this.storeBlob(blobId, Buffer.from(blobBytes).toString("base64"))
+  }
+
+  /**
    * Create getBlobArgs message
    */
   createGetBlobMessage(blobId: string, traceId?: string): KvServerMessage {
@@ -104,14 +121,14 @@ export class KvStorageService {
    * Get blob data by ID
    */
   getBlob(blobId: string): string | undefined {
-    return this.blobStore.get(blobId)
+    return KvStorageService.blobStore.get(blobId)
   }
 
   /**
    * Clear all stored blobs
    */
   clearBlobs(): void {
-    this.blobStore.clear()
+    KvStorageService.blobStore.clear()
     this.logger.debug("Cleared all blob storage")
   }
 
@@ -120,7 +137,7 @@ export class KvStorageService {
    */
   getStats(): { blobCount: number; messageIdCounter: number } {
     return {
-      blobCount: this.blobStore.size,
+      blobCount: KvStorageService.blobStore.size,
       messageIdCounter: this.kvMessageIdCounter,
     }
   }

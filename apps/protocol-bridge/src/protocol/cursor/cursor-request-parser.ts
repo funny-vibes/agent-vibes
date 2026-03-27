@@ -19,6 +19,7 @@ import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
+import { KvStorageService } from "./kv-storage.service"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
@@ -242,6 +243,14 @@ export class CursorRequestParser {
   private readonly logger = new Logger(CursorRequestParser.name)
 
   private readonly textDecoder = new TextDecoder()
+
+  constructor(
+    private readonly kvStorageService: KvStorageService = new KvStorageService()
+  ) {}
+
+  private decodeBlobId(blobId: Uint8Array): string {
+    return this.textDecoder.decode(blobId)
+  }
 
   /**
    * Convert a protobuf google.protobuf.Value to plain JS value.
@@ -735,26 +744,39 @@ export class CursorRequestParser {
         if (userMsg.selectedContext?.selectedImages?.length) {
           for (const img of userMsg.selectedContext.selectedImages) {
             const mimeType = img.mimeType || "image/png"
-            let rawBytes: Uint8Array | undefined
+            let base64Data: string | undefined
 
             switch (img.dataOrBlobId.case) {
               case "data":
-                rawBytes = img.dataOrBlobId.value
-                break
-              case "blobIdWithData":
-                rawBytes = img.dataOrBlobId.value.data
-                break
-              case "blobId":
-                // blobId-only: data not inline, would need KV store lookup
-                this.logger.warn(
-                  `Image with blobId-only not supported yet (uuid=${img.uuid})`
+                base64Data = Buffer.from(img.dataOrBlobId.value).toString(
+                  "base64"
                 )
                 break
+              case "blobIdWithData": {
+                const blobId = this.decodeBlobId(img.dataOrBlobId.value.blobId)
+                base64Data = Buffer.from(img.dataOrBlobId.value.data).toString(
+                  "base64"
+                )
+                if (blobId) {
+                  this.kvStorageService.storeBlob(blobId, base64Data)
+                }
+                break
+              }
+              case "blobId": {
+                const blobId = this.decodeBlobId(img.dataOrBlobId.value)
+                base64Data = this.kvStorageService.getBlob(blobId)
+                if (!base64Data) {
+                  this.logger.error(
+                    `Image blob not found for selected image (uuid=${img.uuid}, blobId=${blobId})`
+                  )
+                }
+                break
+              }
             }
 
-            if (rawBytes && rawBytes.length > 0) {
+            if (base64Data) {
               attachedImages.push({
-                data: Buffer.from(rawBytes).toString("base64"),
+                data: base64Data,
                 mimeType,
                 width: img.dimension?.width,
                 height: img.dimension?.height,
