@@ -3,6 +3,7 @@ import Database from "better-sqlite3"
 import * as fs from "fs"
 import * as path from "path"
 import { ParsedCursorRequest } from "./cursor-request-parser"
+import { enforceToolProtocol } from "../../context/message-integrity-guard"
 
 /**
  * Content block types for messages
@@ -729,6 +730,10 @@ export class ChatSessionManager implements OnModuleDestroy {
     return {
       conversationId: persisted.conversationId,
       messages: Array.isArray(persisted.messages) ? persisted.messages : [],
+      // Note: We do NOT run enforceToolProtocol here.
+      // Deserialized sessions may have legitimate interrupted tool calls that
+      // should be handled by repairInterruptedToolProtocol() with proper
+      // restart recovery context, not by generic synthetic tool_result injection.
       model: persisted.model || "claude-sonnet-4.5",
       thinkingLevel:
         typeof persisted.thinkingLevel === "number"
@@ -925,6 +930,12 @@ export class ChatSessionManager implements OnModuleDestroy {
     if (session) {
       session.messages.push({ role, content })
       session.lastActivityAt = new Date()
+
+      // Note: We do NOT run enforceToolProtocol here.
+      // addMessage is an incremental operation — assistant writes tool_use first,
+      // then user writes tool_result later. The intermediate state (orphan tool_use
+      // with no tool_result yet) is a legitimate pending-tool-call window.
+      // Guard only runs on batch operations (replaceMessages) and at send time.
 
       // Estimate token usage (rough estimate: 1 token ≈ 4 characters)
       const contentStr =
@@ -1505,7 +1516,23 @@ export class ChatSessionManager implements OnModuleDestroy {
   ): void {
     const session = this.getSession(conversationId)
     if (!session) return
-    session.messages = messages
+
+    // Write-time validation: enforce tool protocol integrity before storing
+    const guardResult = enforceToolProtocol(
+      messages as Array<{ role: "user" | "assistant"; content: unknown }>,
+      { mode: "global" }
+    )
+    if (guardResult.changed) {
+      this.logger.warn(
+        `Write-time integrity repair (replaceMessages): injected ${guardResult.injectedToolResults} synthetic tool_result, ` +
+          `removed ${guardResult.removedToolResults} orphan tool_result, ` +
+          `${guardResult.removedEmptyMessages} empty messages`
+      )
+    }
+    session.messages = guardResult.messages as Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+    }>
     session.lastActivityAt = new Date()
     this.schedulePersist(conversationId)
   }

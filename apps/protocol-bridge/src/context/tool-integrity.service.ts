@@ -1,14 +1,13 @@
 import { Injectable, Logger } from "@nestjs/common"
 import {
-  ContentBlock,
   ToolPair,
   UnifiedMessage,
-  isTextBlock,
   isToolResultBlock,
   isToolUseBlock,
   normalizeContent,
 } from "./types"
 import { TokenCounterService } from "./token-counter.service"
+import { enforceToolProtocol } from "./message-integrity-guard"
 
 /**
  * Result of sanitizeMessages operation
@@ -418,79 +417,27 @@ export class ToolIntegrityService {
       }
     }
 
+    // Delegate all repair logic to the unified MessageIntegrityGuard
+    const guardResult = enforceToolProtocol(
+      messages as Array<
+        UnifiedMessage & { role: "user" | "assistant"; content: unknown }
+      >,
+      { mode: "global" }
+    )
+
     const result: SanitizeResult = {
-      messages: messages.map((m) => ({
-        ...m,
-        content: Array.isArray(m.content) ? [...m.content] : m.content,
-        tool_calls: m.tool_calls ? [...m.tool_calls] : undefined,
-      })),
-      removedOrphanToolUses: 0,
-      removedOrphanToolResults: 0,
-      removedEmptyMessages: 0,
+      messages: guardResult.messages as UnifiedMessage[],
+      // "removedOrphanToolUses" is repurposed: counts synthetic tool_result injected
+      removedOrphanToolUses: guardResult.injectedToolResults,
+      removedOrphanToolResults: guardResult.removedToolResults,
+      removedEmptyMessages: guardResult.removedEmptyMessages,
       mergedConsecutiveMessages: 0,
     }
 
-    // Collect all tool_use IDs and tool_result IDs
-    const allToolUseIds = new Set<string>()
-    for (const msg of result.messages) {
-      for (const id of this.extractToolUseIds(msg)) {
-        allToolUseIds.add(id)
-      }
-    }
-
-    // Reverse cleanup: remove orphan tool_result (no matching tool_use)
-    for (const msg of result.messages) {
-      if (msg.role !== "user" || !Array.isArray(msg.content)) continue
-
-      const before = msg.content.length
-      msg.content = msg.content.filter((block: ContentBlock) => {
-        if (isToolResultBlock(block) && !allToolUseIds.has(block.tool_use_id)) {
-          return false
-        }
-        return true
-      })
-      result.removedOrphanToolResults += before - msg.content.length
-    }
-
-    // Also handle function-call style orphan tool_result (role=user with tool_call_id)
-    result.messages = result.messages.filter((msg) => {
-      if (msg.tool_call_id && !allToolUseIds.has(msg.tool_call_id)) {
-        result.removedOrphanToolResults++
-        return false
-      }
-      return true
-    })
-
-    // Remove empty messages
-    result.messages = result.messages.filter((msg) => {
-      const hasContent =
-        typeof msg.content === "string"
-          ? msg.content.trim().length > 0
-          : Array.isArray(msg.content) &&
-            msg.content.length > 0 &&
-            msg.content.some((block) =>
-              isTextBlock(block) ? block.text.trim().length > 0 : true
-            )
-      const hasToolCalls =
-        msg.tool_calls && (msg.tool_calls as unknown[]).length > 0
-
-      if (!hasContent && !hasToolCalls) {
-        result.removedEmptyMessages++
-        return false
-      }
-      return true
-    })
-
-    // Log if any changes were made
-    const totalRemoved =
-      result.removedOrphanToolUses +
-      result.removedOrphanToolResults +
-      result.removedEmptyMessages
-
-    if (totalRemoved > 0) {
+    if (guardResult.changed) {
       this.logger.warn(
-        `Sanitized messages: removed ${result.removedOrphanToolUses} orphan tool_use, ` +
-          `${result.removedOrphanToolResults} orphan tool_result, ` +
+        `Sanitized messages: injected ${result.removedOrphanToolUses} synthetic tool_result for orphan tool_use, ` +
+          `removed ${result.removedOrphanToolResults} orphan tool_result, ` +
           `${result.removedEmptyMessages} empty message(s)`
       )
     }

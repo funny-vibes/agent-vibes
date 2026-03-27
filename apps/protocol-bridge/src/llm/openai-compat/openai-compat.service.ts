@@ -15,6 +15,13 @@ import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
+import { translateClaudeToCodex } from "../codex/codex-request-translator"
+import {
+  createStreamState as createCodexStreamState,
+  translateCodexSseEvent,
+  translateCodexToClaudeNonStream,
+} from "../codex/codex-response-translator"
+import { buildReverseMapFromClaudeTools } from "../codex/tool-name-shortener"
 
 // ── Types for OpenAI Chat Completions API ──────────────────────────────
 
@@ -168,6 +175,25 @@ export class OpenaiCompatService implements OnModuleInit {
   private baseUrl = ""
   private proxyUrl = ""
 
+  /**
+   * Responses API routing mode:
+   * - "auto": Try Chat Completions first, fallback to Responses API on 503/provider errors (default)
+   * - "always": Always use Responses API for reasoning models
+   * - "never": Only use Chat Completions
+   */
+  private responsesApiMode: "auto" | "always" | "never" = "auto"
+
+  /**
+   * Per-model endpoint preference cache.
+   * When auto mode detects a 503 on Chat Completions and succeeds with Responses API,
+   * it remembers this for subsequent requests to avoid repeated fallback overhead.
+   * Key: model name (lowercase), Value: "responses" | "chat-completions"
+   */
+  private endpointPreference = new Map<
+    string,
+    "responses" | "chat-completions"
+  >()
+
   constructor(private readonly configService: ConfigService) {}
 
   onModuleInit() {
@@ -181,10 +207,32 @@ export class OpenaiCompatService implements OnModuleInit {
       .get<string>("OPENAI_COMPAT_PROXY_URL", "")
       .trim()
 
+    // Responses API routing mode
+    const responsesApiEnv = this.configService
+      .get<string>("OPENAI_COMPAT_USE_RESPONSES_API", "")
+      .trim()
+      .toLowerCase()
+    if (
+      responsesApiEnv === "always" ||
+      responsesApiEnv === "true" ||
+      responsesApiEnv === "1"
+    ) {
+      this.responsesApiMode = "always"
+    } else if (
+      responsesApiEnv === "never" ||
+      responsesApiEnv === "false" ||
+      responsesApiEnv === "0"
+    ) {
+      this.responsesApiMode = "never"
+    } else {
+      this.responsesApiMode = "auto"
+    }
+
     const hasCredentials = !!(this.apiKey && this.baseUrl)
     this.logger.log(
       `OpenAI-compatible backend initialized: baseUrl=${this.baseUrl || "(none)"}, ` +
-        `hasApiKey=${!!this.apiKey}, hasProxy=${!!this.proxyUrl}`
+        `hasApiKey=${!!this.apiKey}, hasProxy=${!!this.proxyUrl}, ` +
+        `responsesApiMode=${this.responsesApiMode}`
     )
     if (!hasCredentials) {
       this.logger.log(
@@ -597,6 +645,81 @@ export class OpenaiCompatService implements OnModuleInit {
     return `${this.baseUrl.replace(/\/+$/, "")}/chat/completions`
   }
 
+  private buildResponsesUrl(): string {
+    return `${this.baseUrl.replace(/\/+$/, "")}/responses`
+  }
+
+  /**
+   * Check if a model is eligible for Responses API routing.
+   */
+  private isResponsesApiEligible(model: string): boolean {
+    return supportsOpenAiCompatReasoning(model)
+  }
+
+  /**
+   * Determine which endpoint to try first for a model.
+   * Returns "responses" if Responses API should be tried first,
+   * "chat-completions" otherwise.
+   */
+  private resolveEndpoint(model: string): "responses" | "chat-completions" {
+    const normalizedModel = model.toLowerCase().trim()
+
+    // Mode: always → force Responses API for eligible models
+    if (
+      this.responsesApiMode === "always" &&
+      this.isResponsesApiEligible(model)
+    ) {
+      return "responses"
+    }
+    // Mode: never → always Chat Completions
+    if (this.responsesApiMode === "never") {
+      return "chat-completions"
+    }
+    // Mode: auto → check per-model cache, default to chat-completions
+    const cached = this.endpointPreference.get(normalizedModel)
+    if (cached) return cached
+    return "chat-completions"
+  }
+
+  /**
+   * Record successful endpoint for a model (auto mode learning).
+   */
+  private recordEndpointSuccess(
+    model: string,
+    endpoint: "responses" | "chat-completions"
+  ): void {
+    if (this.responsesApiMode !== "auto") return
+    const normalizedModel = model.toLowerCase().trim()
+    const current = this.endpointPreference.get(normalizedModel)
+    if (current !== endpoint) {
+      this.endpointPreference.set(normalizedModel, endpoint)
+      this.logger.log(
+        `[OpenAI-Compat] Learned endpoint preference: ${model} → ${endpoint}`
+      )
+    }
+  }
+
+  /**
+   * Check if an error from Chat Completions should trigger Responses API fallback.
+   */
+  private shouldFallbackToResponsesApi(
+    status: number,
+    errorBody: string,
+    model: string
+  ): boolean {
+    if (this.responsesApiMode === "never") return false
+    if (!this.isResponsesApiEligible(model)) return false
+
+    // 503 with "no_available_providers" is the classic case
+    if (status === 503) return true
+    // 404 could mean endpoint not found for the model
+    if (status === 404) return true
+    // Some providers return 400 for unsupported model on chat/completions
+    if (status === 400 && errorBody.includes("model")) return true
+
+    return false
+  }
+
   // ── Headers ──────────────────────────────────────────────────────────
 
   private buildHeaders(stream: boolean): Record<string, string> {
@@ -621,6 +744,54 @@ export class OpenaiCompatService implements OnModuleInit {
       )
     }
 
+    const endpoint = this.resolveEndpoint(dto.model)
+
+    if (endpoint === "responses") {
+      try {
+        const result = await this.sendClaudeMessageViaResponses(dto)
+        this.recordEndpointSuccess(dto.model, "responses")
+        return result
+      } catch (e) {
+        // If forced mode, don't fallback
+        if (this.responsesApiMode === "always") throw e
+        this.logger.warn(
+          `[OpenAI-Compat] Responses API failed for ${dto.model}, trying Chat Completions: ${(e as Error).message?.slice(0, 100)}`
+        )
+      }
+    }
+
+    // Try Chat Completions
+    try {
+      const result = await this.sendClaudeMessageViaChatCompletions(dto)
+      this.recordEndpointSuccess(dto.model, "chat-completions")
+      return result
+    } catch (e) {
+      // Check if we should fallback to Responses API
+      const errorMsg = (e as Error).message || ""
+      const statusMatch = errorMsg.match(/API error (\d+)/)
+      const status = statusMatch ? parseInt(statusMatch[1]!) : 0
+
+      if (
+        endpoint !== "responses" &&
+        this.shouldFallbackToResponsesApi(status, errorMsg, dto.model)
+      ) {
+        this.logger.warn(
+          `[OpenAI-Compat] Chat Completions returned ${status} for ${dto.model}, falling back to Responses API`
+        )
+        const result = await this.sendClaudeMessageViaResponses(dto)
+        this.recordEndpointSuccess(dto.model, "responses")
+        return result
+      }
+      throw e
+    }
+  }
+
+  /**
+   * Non-streaming via Chat Completions endpoint.
+   */
+  private async sendClaudeMessageViaChatCompletions(
+    dto: CreateMessageDto
+  ): Promise<AnthropicResponse> {
     const request = this.translateRequest(dto, false)
     const url = this.buildUrl()
     const headers = this.buildHeaders(false)
@@ -744,6 +915,66 @@ export class OpenaiCompatService implements OnModuleInit {
       )
     }
 
+    const endpoint = this.resolveEndpoint(dto.model)
+
+    if (endpoint === "responses") {
+      let emittedResponsesEvents = false
+      try {
+        for await (const event of this.sendClaudeMessageStreamViaResponses(
+          dto
+        )) {
+          emittedResponsesEvents = true
+          yield event
+        }
+        this.recordEndpointSuccess(dto.model, "responses")
+        return
+      } catch (e) {
+        if (this.responsesApiMode === "always" || emittedResponsesEvents) {
+          throw e
+        }
+        this.logger.warn(
+          `[OpenAI-Compat] Responses API stream failed for ${dto.model}, trying Chat Completions: ${(e as Error).message?.slice(0, 100)}`
+        )
+      }
+    }
+
+    // Try Chat Completions with fallback
+    let emittedChatEvents = false
+    try {
+      for await (const event of this.sendClaudeMessageStreamViaChatCompletions(
+        dto
+      )) {
+        emittedChatEvents = true
+        yield event
+      }
+      this.recordEndpointSuccess(dto.model, "chat-completions")
+    } catch (e) {
+      const errorMsg = (e as Error).message || ""
+      const statusMatch = errorMsg.match(/API error (\d+)/)
+      const status = statusMatch ? parseInt(statusMatch[1]!) : 0
+
+      if (
+        !emittedChatEvents &&
+        endpoint !== "responses" &&
+        this.shouldFallbackToResponsesApi(status, errorMsg, dto.model)
+      ) {
+        this.logger.warn(
+          `[OpenAI-Compat] Chat Completions stream returned ${status} for ${dto.model}, falling back to Responses API`
+        )
+        yield* this.sendClaudeMessageStreamViaResponses(dto)
+        this.recordEndpointSuccess(dto.model, "responses")
+        return
+      }
+      throw e
+    }
+  }
+
+  /**
+   * Stream via Chat Completions endpoint.
+   */
+  private async *sendClaudeMessageStreamViaChatCompletions(
+    dto: CreateMessageDto
+  ): AsyncGenerator<string, void, unknown> {
     const request = this.translateRequest(dto, true)
     const url = this.buildUrl()
     const headers = this.buildHeaders(true)
@@ -1184,5 +1415,216 @@ export class OpenaiCompatService implements OnModuleInit {
       usage: { input_tokens: 0, output_tokens: 0 },
     })
     yield formatSseEvent("message_stop", { type: "message_stop" })
+  }
+
+  // ── Responses API methods ─────────────────────────────────────────────
+  // These methods use the Codex Responses API format (/responses endpoint)
+  // instead of Chat Completions (/chat/completions), reusing the existing
+  // codex translator infrastructure.
+
+  /**
+   * Stream via Responses API endpoint.
+   * Translates Claude DTO → Codex Responses API request,
+   * sends to /responses, and translates Codex SSE → Claude SSE.
+   */
+  private async *sendClaudeMessageStreamViaResponses(
+    dto: CreateMessageDto
+  ): AsyncGenerator<string, void, unknown> {
+    const modelName = dto.model
+    const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
+
+    // Translate to Codex Responses API format
+    const codexRequest = translateClaudeToCodex(dto, modelName) as Record<
+      string,
+      unknown
+    >
+
+    const url = this.buildResponsesUrl()
+    const headers = this.buildHeaders(true)
+    const requestBody = JSON.stringify(codexRequest)
+
+    this.logger.log(
+      `[OpenAI-Compat/Responses] Stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify(codexRequest.reasoning || null)}`
+    )
+
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers,
+      body: requestBody,
+      signal: AbortSignal.timeout(600_000),
+    }
+
+    const agent = this.buildProxyAgent()
+    if (agent) {
+      fetchOptions.dispatcher = agent
+    }
+
+    const response = await fetch(url, fetchOptions)
+
+    if (!response.ok) {
+      const errorBody = await response.text()
+      this.logger.error(
+        `[OpenAI-Compat/Responses] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
+      )
+      throw new Error(
+        `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
+      )
+    }
+
+    if (!response.body) {
+      throw new Error("OpenAI-compatible Responses API response has no body")
+    }
+
+    // Check content-type
+    const contentType = response.headers.get("content-type") || ""
+    if (contentType.includes("text/html")) {
+      const errorBodyText = await response.text()
+      this.logger.error(
+        `[OpenAI-Compat/Responses] Expected stream but got HTML. HTML start: ${errorBodyText.slice(0, 200)}`
+      )
+      throw new Error(
+        `OpenAI-compatible API returned HTML page. API may be blocked by anti-bot protection.`
+      )
+    }
+
+    // Stream SSE events using Codex response translator
+    const state = createCodexStreamState()
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ""
+
+    const IDLE_TIMEOUT_MS = 60_000
+
+    try {
+      while (true) {
+        const timeoutPromise = new Promise<{ done: never; value: never }>(
+          (_, reject) => {
+            setTimeout(
+              () => reject(new Error("Timeout reading from SSE stream")),
+              IDLE_TIMEOUT_MS
+            )
+          }
+        )
+
+        const readResult = await Promise.race([reader.read(), timeoutPromise])
+        const { done, value } = readResult
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+
+          // Use Codex SSE translator to convert to Claude SSE events
+          const events = translateCodexSseEvent(trimmed, state, reverseToolMap)
+          for (const event of events) {
+            yield event
+          }
+        }
+      }
+
+      // Process remaining buffer
+      if (buffer.trim()) {
+        const events = translateCodexSseEvent(
+          buffer.trim(),
+          state,
+          reverseToolMap
+        )
+        for (const event of events) {
+          yield event
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+
+    this.logger.log(
+      `[OpenAI-Compat/Responses] Stream completed: model=${state.model || modelName}, blocks=${state.blockIndex}, hasToolCall=${state.hasToolCall}`
+    )
+  }
+
+  /**
+   * Non-streaming via Responses API endpoint.
+   * Translates Claude DTO → Codex Responses API request,
+   * sends to /responses, reads all SSE events to find response.completed,
+   * and translates the completed event back to Claude format.
+   */
+  private async sendClaudeMessageViaResponses(
+    dto: CreateMessageDto
+  ): Promise<AnthropicResponse> {
+    const modelName = dto.model
+    const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
+
+    // Translate to Codex Responses API format
+    const codexRequest = translateClaudeToCodex(dto, modelName) as Record<
+      string,
+      unknown
+    >
+
+    const url = this.buildResponsesUrl()
+    const headers = this.buildHeaders(true) // Responses API always streams
+    const requestBody = JSON.stringify(codexRequest)
+
+    this.logger.log(
+      `[OpenAI-Compat/Responses] Non-stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify(codexRequest.reasoning || null)}`
+    )
+
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers,
+      body: requestBody,
+      signal: AbortSignal.timeout(300_000),
+    }
+
+    const agent = this.buildProxyAgent()
+    if (agent) {
+      fetchOptions.dispatcher = agent
+    }
+
+    const response = await fetch(url, fetchOptions)
+
+    if (!response.ok) {
+      const errorBody = await response.text()
+      this.logger.error(
+        `[OpenAI-Compat/Responses] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
+      )
+      throw new Error(
+        `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
+      )
+    }
+
+    // Read the full SSE stream and find response.completed
+    const fullBody = await response.text()
+    const lines = fullBody.split("\n")
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed.startsWith("data:")) continue
+
+      const jsonStr = trimmed.slice(5).trim()
+      if (!jsonStr || jsonStr === "[DONE]") continue
+
+      try {
+        const event = JSON.parse(jsonStr) as Record<string, unknown>
+        if (event.type === "response.completed") {
+          const result = translateCodexToClaudeNonStream(event, reverseToolMap)
+          if (result) {
+            this.logger.log(
+              `[OpenAI-Compat/Responses] Non-stream response: model=${result.model}, stop=${result.stop_reason}`
+            )
+            return result
+          }
+        }
+      } catch {
+        // Skip unparseable lines
+      }
+    }
+
+    throw new Error(
+      "OpenAI-compatible Responses API stream ended without response.completed event"
+    )
   }
 }

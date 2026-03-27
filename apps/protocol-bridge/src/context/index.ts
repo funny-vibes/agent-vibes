@@ -15,6 +15,11 @@ export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
 export { normalizeToolProtocolMessages } from "./tool-protocol-normalizer"
 export type { ToolProtocolNormalizationResult } from "./tool-protocol-normalizer"
+export { enforceToolProtocol, assertIntegrity } from "./message-integrity-guard"
+export type {
+  RepairResult,
+  IntegrityViolation,
+} from "./message-integrity-guard"
 
 // Tokenizer service
 export { TokenizerService } from "./tokenizer.service"

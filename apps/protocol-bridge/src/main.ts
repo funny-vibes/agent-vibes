@@ -245,9 +245,24 @@ async function bootstrap() {
   const codexStatus = modelRouter.isCodexAvailable ? ok : no
 
   // Determine GPT routing target
+  const responsesApiMode = (() => {
+    const m = (process.env.OPENAI_COMPAT_USE_RESPONSES_API || "")
+      .trim()
+      .toLowerCase()
+    if (["always", "true", "1"].includes(m)) return "always" as const
+    if (["never", "false", "0"].includes(m)) return "never" as const
+    return "auto" as const
+  })()
+
   let gptRoute = `${c.red}NOT CONFIGURED${c.reset}`
   if (modelRouter.isOpenaiCompatAvailable) {
-    gptRoute = `${c.green}OpenAI-Compat${c.reset}`
+    const modeHint =
+      responsesApiMode === "always"
+        ? " (Responses API)"
+        : responsesApiMode === "auto"
+          ? " (Auto Fallback)"
+          : ""
+    gptRoute = `${c.green}OpenAI-Compat${c.reset}${c.dim}${modeHint}${c.reset}`
   } else if (modelRouter.isCodexAvailable) {
     gptRoute = `${c.green}Codex${c.reset}`
   }
@@ -267,8 +282,8 @@ ${empty}
 ${sep}
 ${line(`${c.yellow}${c.bold}Backends${c.reset}`)}
 ${line(`  ${googleStatus} Google Cloud Code    ${c.dim}(Gemini + Claude)${c.reset}`)}
-${line(`  ${openaiCompatStatus} OpenAI-Compatible    ${c.dim}(${process.env.OPENAI_COMPAT_BASE_URL || "not set"})${c.reset}`)}
-${line(`  ${codexStatus} Codex (OpenAI)       ${c.dim}(GPT/O-series reverse proxy)${c.reset}`)}
+${line(`  ${openaiCompatStatus} OpenAI-Compatible    ${c.dim}(GPT/O-series)${c.reset} ${responsesApiMode === "always" ? `${c.yellow}[Responses API]${c.reset}` : responsesApiMode === "never" ? `${c.dim}[Chat Completions]${c.reset}` : `${c.green}[Auto Fallback]${c.reset}`}`)}
+${modelRouter.isCodexAvailable ? line(`  ${codexStatus} Codex (OpenAI)       ${c.dim}(GPT/O-series reverse proxy)${c.reset}`) : line(`  ${c.dim}· Codex (OpenAI)       (covered by OpenAI-Compat)${c.reset}`)}
 ${empty}
 ${sep}
 ${line(`${c.yellow}${c.bold}Model Routing${c.reset}`)}

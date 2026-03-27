@@ -1862,9 +1862,13 @@ export class GoogleService {
     const protocolNormalized = normalizeToolProtocolMessages(
       dto.messages as Array<{ role: "user" | "assistant"; content: unknown }>
     )
-    if (protocolNormalized.removedToolResults > 0) {
+    if (
+      protocolNormalized.removedToolResults > 0 ||
+      protocolNormalized.injectedToolResults > 0
+    ) {
       this.logger.warn(
-        `Dropped ${protocolNormalized.removedToolResults} invalid tool_result block(s) before Cloud Code request`
+        `Cloud Code protocol normalization: dropped ${protocolNormalized.removedToolResults} orphan tool_result, ` +
+          `injected ${protocolNormalized.injectedToolResults} synthetic tool_result for orphan tool_use`
       )
     }
     const normalizedMessages = protocolNormalized.messages
