@@ -456,7 +456,7 @@ export class CursorConnectStreamService {
           if (race.result.done) {
             done = true
           } else {
-            const value = race.result.value ?? ""
+            const value = String(race.result.value ?? "")
             yield { type: "data" as const, value }
           }
         } else {
