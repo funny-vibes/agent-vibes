@@ -15,6 +15,7 @@ import { CursorConnectStreamService } from "./cursor-connect-stream.service"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
+import { KnowledgeBaseService } from "./knowledge-base.service"
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { SemanticSearchProviderService } from "./semantic-search-provider.servic
     CursorGrpcService,
     KvStorageService,
     SemanticSearchProviderService,
+    KnowledgeBaseService,
   ],
   exports: [CursorAuthService, CursorConnectStreamService],
 })

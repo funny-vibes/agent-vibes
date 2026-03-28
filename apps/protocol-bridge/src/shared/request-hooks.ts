@@ -18,8 +18,16 @@ export function registerRequestHooks(
 
       // Log ALL proto requests for debugging routing issues
       if (ct.includes("proto") || ct.includes("connect")) {
+        const rawEncoding =
+          request.headers["connect-content-encoding"] ||
+          request.headers["content-encoding"] ||
+          ""
+        const encoding = Array.isArray(rawEncoding)
+          ? rawEncoding[0]
+          : rawEncoding
         logger.debug(
-          `[ALL-PROTO] ${request.method} ${url} - Content-Type: ${ct}`
+          `[ALL-PROTO] ${request.method} ${url} - Content-Type: ${ct}` +
+            (encoding ? `, Encoding: ${encoding}` : "")
         )
       }
 

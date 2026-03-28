@@ -44,6 +44,14 @@ interface PendingRequest {
 }
 
 /**
+ * Per-model cooldown state for a worker (inspired by CLIProxyAPI's ModelState)
+ */
+interface WorkerModelState {
+  cooldownUntil: number // Date.now() timestamp; 0 = available
+  quotaExhausted: boolean
+}
+
+/**
  * A managed worker process
  */
 interface WorkerHandle {
@@ -53,6 +61,7 @@ interface WorkerHandle {
   pending: Map<string, PendingRequest>
   requestCount: number
   cooldownUntil: number // Date.now() timestamp; 0 = available
+  modelStates: Map<string, WorkerModelState> // per-model cooldown state
   bootstrapComplete: boolean
   readyResolve?: () => void // event-driven ready notification
 }
@@ -108,6 +117,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   private readonly workers: WorkerHandle[] = []
   private currentWorkerIndex = -1
   private requestCounter = 0
+  /** Tracks the worker that most recently executed a request (for precise cooldown targeting) */
+  private lastUsedWorker: WorkerHandle | null = null
   /** Timeout for non-streaming generation (deep thinking models may take long) */
   private readonly GENERATE_TIMEOUT_MS = 3_600_000 // 1 hour
   private antigravityNodeBinary: string | null = null
@@ -328,6 +339,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       pending: new Map(),
       requestCount: 0,
       cooldownUntil: 0,
+      modelStates: new Map(),
       bootstrapComplete: false,
     }
 
@@ -646,13 +658,16 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Get the next available worker (round-robin, cooldown-aware)
+   * Get the next available worker (round-robin, cooldown-aware, model-aware)
    *
-   * Prefers workers that are ready AND not in cooldown.
+   * If `model` is provided, also skips workers that are in per-model cooldown
+   * for that model (inspired by CLIProxyAPI's isAuthBlockedForModel).
+   *
+   * Prefers workers that are ready AND not in any applicable cooldown.
    * If every ready worker is cooling down, returns the one whose
    * cooldown expires soonest so the caller can sleep on it.
    */
-  private getNextWorker(): WorkerHandle {
+  private getNextWorker(model?: string): WorkerHandle {
     const now = Date.now()
     const readyWorkers = this.workers.filter((w) => w.ready)
     if (readyWorkers.length === 0) {
@@ -667,12 +682,23 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       const index = (startIndex + offset) % readyWorkers.length
       const worker = readyWorkers[index]
       if (!worker) continue
-      if (worker.cooldownUntil <= now) {
+
+      const globalAvailable = worker.cooldownUntil <= now
+      const modelState = model ? worker.modelStates.get(model) : undefined
+      const modelAvailable = !modelState || modelState.cooldownUntil <= now
+
+      if (globalAvailable && modelAvailable) {
         this.currentWorkerIndex = index
         return worker
       }
-      if (worker.cooldownUntil < fallbackCooldown) {
-        fallbackCooldown = worker.cooldownUntil
+
+      // Track the worker whose effective cooldown expires soonest
+      const effectiveCooldown = Math.max(
+        worker.cooldownUntil,
+        modelState?.cooldownUntil ?? 0
+      )
+      if (effectiveCooldown < fallbackCooldown) {
+        fallbackCooldown = effectiveCooldown
         fallbackIndex = index
       }
     }
@@ -712,26 +738,73 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     )
   }
 
+  private formatDuration(delayMs: number): string {
+    if (delayMs >= 3600_000) {
+      return `${Math.floor(delayMs / 3600_000)}h ${Math.floor((delayMs % 3600_000) / 60_000)}m`
+    }
+    if (delayMs >= 60_000) {
+      return `${Math.floor(delayMs / 60_000)}m ${Math.floor((delayMs % 60_000) / 1000)}s`
+    }
+    return `${delayMs}ms`
+  }
+
   /**
-   * Mark the current worker as rate-limited for `delayMs` milliseconds.
+   * @deprecated Use setCooldownForLastWorker() for accurate targeting.
+   * Legacy: marks the last-used worker as rate-limited.
    */
   setCooldown(delayMs: number): void {
-    const now = Date.now()
-    const readyWorkers = this.workers.filter((w) => w.ready)
-    if (readyWorkers.length === 0) return
-    const idx = this.normalizeWorkerIndex(readyWorkers.length)
-    const worker = readyWorkers[idx]
+    this.setCooldownForLastWorker(delayMs)
+  }
+
+  /**
+   * Mark the last-used worker (the one that actually executed the request)
+   * as globally rate-limited for `delayMs` milliseconds.
+   *
+   * Unlike the old setCooldown which relied on a drifting currentWorkerIndex,
+   * this precisely targets the worker that reported the error.
+   */
+  setCooldownForLastWorker(delayMs: number): void {
+    const worker = this.lastUsedWorker
     if (!worker) return
+    const now = Date.now()
     worker.cooldownUntil = now + delayMs
-    const readableDuration =
-      delayMs >= 3600_000
-        ? `${Math.floor(delayMs / 3600_000)}h ${Math.floor((delayMs % 3600_000) / 60_000)}m`
-        : delayMs >= 60_000
-          ? `${Math.floor(delayMs / 60_000)}m ${Math.floor((delayMs % 60_000) / 1000)}s`
-          : `${delayMs}ms`
     this.logger.warn(
-      `[Worker ${worker.account.email}] rate-limited, cooldown ${readableDuration}`
+      `[Worker ${worker.account.email}] rate-limited, cooldown ${this.formatDuration(delayMs)}`
     )
+  }
+
+  /**
+   * Mark the last-used worker as rate-limited for a specific model.
+   * Inspired by CLIProxyAPI's MarkResult per-model state tracking.
+   *
+   * The worker may still be available for other models.
+   */
+  setModelCooldownForLastWorker(
+    model: string,
+    delayMs: number,
+    quotaExhausted: boolean = false
+  ): void {
+    const worker = this.lastUsedWorker
+    if (!worker || !model) return
+    const now = Date.now()
+    worker.modelStates.set(model, {
+      cooldownUntil: now + delayMs,
+      quotaExhausted,
+    })
+    this.logger.warn(
+      `[Worker ${worker.account.email}] model ${model} ${
+        quotaExhausted ? "quota exhausted" : "rate-limited"
+      }, cooldown ${this.formatDuration(delayMs)}`
+    )
+  }
+
+  /**
+   * Clear per-model cooldown for the last-used worker (on success).
+   */
+  clearModelCooldownForLastWorker(model: string): void {
+    const worker = this.lastUsedWorker
+    if (!worker || !model) return
+    worker.modelStates.delete(model)
   }
 
   /**
@@ -740,6 +813,19 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   hasAvailableWorker(): boolean {
     const now = Date.now()
     return this.workers.some((w) => w.ready && w.cooldownUntil <= now)
+  }
+
+  /**
+   * Returns true if at least one ready worker is available for a specific model.
+   * Checks both global cooldown and per-model cooldown.
+   */
+  hasAvailableWorkerForModel(model: string): boolean {
+    const now = Date.now()
+    return this.workers.some((w) => {
+      if (!w.ready || w.cooldownUntil > now) return false
+      const modelState = model ? w.modelStates.get(model) : undefined
+      return !modelState || modelState.cooldownUntil <= now
+    })
   }
 
   /**
@@ -752,6 +838,26 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     for (const w of this.workers) {
       if (!w.ready) continue
       const remaining = Math.max(0, w.cooldownUntil - now)
+      if (remaining < min) min = remaining
+    }
+    return min === Infinity ? 0 : min
+  }
+
+  /**
+   * Returns the shortest remaining cooldown (ms) for a specific model.
+   * Considers both global cooldown and per-model cooldown.
+   */
+  getMinCooldownMsForModel(model: string): number {
+    const now = Date.now()
+    let min = Infinity
+    for (const w of this.workers) {
+      if (!w.ready) continue
+      const globalRemaining = Math.max(0, w.cooldownUntil - now)
+      const modelState = model ? w.modelStates.get(model) : undefined
+      const modelRemaining = modelState
+        ? Math.max(0, modelState.cooldownUntil - now)
+        : 0
+      const remaining = Math.max(globalRemaining, modelRemaining)
       if (remaining < min) min = remaining
     }
     return min === Infinity ? 0 : min
@@ -785,10 +891,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Send non-streaming generate request
+   * Send non-streaming generate request.
+   * If `model` is provided, per-model cooldown is checked during worker selection.
    */
-  async generate(payload: Record<string, unknown>): Promise<unknown> {
-    const worker = this.getNextWorker()
+  async generate(
+    payload: Record<string, unknown>,
+    model?: string
+  ): Promise<unknown> {
+    const worker = this.getNextWorker(model)
+    this.lastUsedWorker = worker
     worker.requestCount++
     await this.preparePayloadForWorker(worker, payload)
     // Use long timeout for non-streaming generation, especially for deep thinking models
@@ -801,13 +912,16 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Send streaming generate request
+   * Send streaming generate request.
+   * If `model` is provided, per-model cooldown is checked during worker selection.
    */
   async generateStream(
     payload: Record<string, unknown>,
-    onChunk: (chunk: unknown) => void
+    onChunk: (chunk: unknown) => void,
+    model?: string
   ): Promise<void> {
-    const worker = this.getNextWorker()
+    const worker = this.getNextWorker(model)
+    this.lastUsedWorker = worker
     worker.requestCount++
     await this.preparePayloadForWorker(worker, payload)
     await this.sendStreamRequest(worker, "generateStream", { payload }, onChunk)
@@ -897,6 +1011,14 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     const idx = this.normalizeWorkerIndex(readyWorkers.length)
     const worker = readyWorkers[idx]
     return worker?.account.email ?? null
+  }
+
+  /**
+   * Get the email of the worker that last executed a request.
+   * Useful for logging which worker encountered an error.
+   */
+  getLastWorkerEmail(): string | null {
+    return this.lastUsedWorker?.account.email ?? null
   }
 
   /**

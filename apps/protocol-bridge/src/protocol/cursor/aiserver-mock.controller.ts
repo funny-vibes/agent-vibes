@@ -24,9 +24,21 @@ import {
   NameTabRequestSchema,
   NameTabResponseSchema,
   SubmitSpansResponseSchema,
+  KnowledgeBaseAddRequestSchema,
+  KnowledgeBaseAddResponseSchema,
+  KnowledgeBaseGetRequestSchema,
+  KnowledgeBaseGetResponseSchema,
+  KnowledgeBaseGetResponse_ItemSchema,
+  KnowledgeBaseListResponseSchema,
+  KnowledgeBaseListResponse_ItemSchema,
+  KnowledgeBaseUpdateRequestSchema,
+  KnowledgeBaseUpdateResponseSchema,
+  KnowledgeBaseRemoveRequestSchema,
+  KnowledgeBaseRemoveResponseSchema,
 } from "../../gen/aiserver/v1_pb"
 import { CodexService } from "../../llm/codex/codex.service"
 import { GoogleService } from "../../llm/google/google.service"
+import { KnowledgeBaseService } from "./knowledge-base.service"
 import {
   DEFAULT_GEMINI_MODEL,
   getCursorDisplayModels,
@@ -71,7 +83,8 @@ export class AiserverMockController {
 
   constructor(
     private readonly googleService: GoogleService,
-    private readonly codexService: CodexService
+    private readonly codexService: CodexService,
+    private readonly knowledgeBaseService: KnowledgeBaseService
   ) {}
 
   private buildCursorModels(req?: FastifyRequest) {
@@ -434,18 +447,117 @@ export class AiserverMockController {
   }
 
   @Post("aiserver.v1.AiService/KnowledgeBaseAdd")
-  handleKnowledgeBaseAdd(@Res() res: FastifyReply): void {
-    this.sendEmpty(res)
+  handleKnowledgeBaseAdd(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    try {
+      const body = req.body as Buffer | undefined
+      if (body && body.length > 0) {
+        const request = fromBinary(KnowledgeBaseAddRequestSchema, body)
+        this.knowledgeBaseService.add(request.knowledge, request.title, false)
+      }
+      const response = create(KnowledgeBaseAddResponseSchema, {})
+      this.sendProto(res, KnowledgeBaseAddResponseSchema, response)
+    } catch (error) {
+      this.logger.error(`KnowledgeBaseAdd failed: ${String(error)}`)
+      this.sendEmpty(res)
+    }
+  }
+
+  @Post("aiserver.v1.AiService/KnowledgeBaseGet")
+  handleKnowledgeBaseGet(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    try {
+      const body = req.body as Buffer | undefined
+      if (body && body.length > 0) {
+        const request = fromBinary(KnowledgeBaseGetRequestSchema, body)
+        const item = this.knowledgeBaseService.get(request.id)
+        if (item) {
+          const response = create(KnowledgeBaseGetResponseSchema, {
+            result: create(KnowledgeBaseGetResponse_ItemSchema, {
+              id: item.id,
+              knowledge: item.knowledge,
+              title: item.title,
+              createdAt: item.createdAt,
+            }),
+          })
+          this.sendProto(res, KnowledgeBaseGetResponseSchema, response)
+          return
+        }
+      }
+      this.sendEmpty(res)
+    } catch (error) {
+      this.logger.error(`KnowledgeBaseGet failed: ${String(error)}`)
+      this.sendEmpty(res)
+    }
   }
 
   @Post("aiserver.v1.AiService/KnowledgeBaseList")
   handleKnowledgeBaseList(@Res() res: FastifyReply): void {
-    this.sendEmpty(res)
+    try {
+      const items = this.knowledgeBaseService.list()
+      const protoItems = items.map((item) =>
+        create(KnowledgeBaseListResponse_ItemSchema, {
+          id: item.id,
+          knowledge: item.knowledge,
+          title: item.title,
+          createdAt: item.createdAt,
+          isGenerated: item.isGenerated,
+        })
+      )
+      const response = create(KnowledgeBaseListResponseSchema, {
+        allResults: protoItems,
+      })
+      this.sendProto(res, KnowledgeBaseListResponseSchema, response)
+    } catch (error) {
+      this.logger.error(`KnowledgeBaseList failed: ${String(error)}`)
+      this.sendEmpty(res)
+    }
   }
 
   @Post("aiserver.v1.AiService/KnowledgeBaseUpdate")
-  handleKnowledgeBaseUpdate(@Res() res: FastifyReply): void {
-    this.sendEmpty(res)
+  handleKnowledgeBaseUpdate(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    try {
+      const body = req.body as Buffer | undefined
+      if (body && body.length > 0) {
+        const request = fromBinary(KnowledgeBaseUpdateRequestSchema, body)
+        this.knowledgeBaseService.update(
+          request.id,
+          request.knowledge,
+          request.title
+        )
+      }
+      const response = create(KnowledgeBaseUpdateResponseSchema, {})
+      this.sendProto(res, KnowledgeBaseUpdateResponseSchema, response)
+    } catch (error) {
+      this.logger.error(`KnowledgeBaseUpdate failed: ${String(error)}`)
+      this.sendEmpty(res)
+    }
+  }
+
+  @Post("aiserver.v1.AiService/KnowledgeBaseRemove")
+  handleKnowledgeBaseRemove(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    try {
+      const body = req.body as Buffer | undefined
+      if (body && body.length > 0) {
+        const request = fromBinary(KnowledgeBaseRemoveRequestSchema, body)
+        this.knowledgeBaseService.remove(request.id)
+      }
+      const response = create(KnowledgeBaseRemoveResponseSchema, {})
+      this.sendProto(res, KnowledgeBaseRemoveResponseSchema, response)
+    } catch (error) {
+      this.logger.error(`KnowledgeBaseRemove failed: ${String(error)}`)
+      this.sendEmpty(res)
+    }
   }
 
   @Post("aiserver.v1.AiService/CppEditHistoryStatus")

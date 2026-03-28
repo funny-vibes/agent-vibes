@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common"
 import type { FastifyInstance, FastifyRequest } from "fastify"
 import type { Readable } from "stream"
+import * as zlib from "zlib"
 
 /**
  * Register custom content type parsers for gRPC/ConnectRPC.
@@ -141,11 +142,17 @@ export function registerContentTypeParsers(
     "application/proto",
     { bodyLimit: 52428800 },
     (
-      _request: FastifyRequest,
+      request: FastifyRequest,
       payload: Readable,
       done: (err: Error | null, body?: Buffer) => void
     ) => {
       logger.debug("[ContentTypeParser] Handling application/proto")
+
+      // ConnectRPC uses Connect-Content-Encoding for compressed payloads
+      const encoding =
+        (request.headers["connect-content-encoding"] as string) ||
+        (request.headers["content-encoding"] as string) ||
+        ""
 
       const chunks: Buffer[] = []
       payload.on("data", (chunk: Buffer) => {
@@ -154,9 +161,29 @@ export function registerContentTypeParsers(
       payload.on("end", () => {
         const buffer = Buffer.concat(chunks)
         logger.debug(
-          `[ContentTypeParser] application/proto: received ${buffer.length} bytes`
+          `[ContentTypeParser] application/proto: received ${buffer.length} bytes` +
+            (encoding ? `, encoding=${encoding}` : "")
         )
-        done(null, buffer)
+
+        // Decompress gzip if needed
+        if (encoding.toLowerCase() === "gzip" && buffer.length > 0) {
+          zlib.gunzip(buffer, (err, decompressed) => {
+            if (err) {
+              logger.error(
+                `[ContentTypeParser] gzip decompression failed: ${err.message}`
+              )
+              // Fall back to raw buffer in case encoding header was wrong
+              done(null, buffer)
+            } else {
+              logger.debug(
+                `[ContentTypeParser] application/proto: decompressed ${buffer.length} -> ${decompressed.length} bytes`
+              )
+              done(null, decompressed)
+            }
+          })
+        } else {
+          done(null, buffer)
+        }
       })
       payload.on("error", (err: Error) => {
         if (err.name === "AbortError" || err.message.includes("aborted")) {

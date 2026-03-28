@@ -2964,10 +2964,10 @@ export class GoogleService {
       try {
         this.logger.debug(`Attempt ${attempt + 1}, model: ${resolvedModel}`)
 
-        const data = (await this.processPool.generate(payload)) as Record<
-          string,
-          unknown
-        >
+        const data = (await this.processPool.generate(
+          payload,
+          resolvedModel
+        )) as Record<string, unknown>
         const traceId = this.getCloudCodeTraceId(data)
         this.rememberConversationMetricContext(dto, payload, traceId)
 
@@ -3002,7 +3002,7 @@ export class GoogleService {
         }
         consecutiveAuthErrors = 0
 
-        // 429 — rate limited: cooldown current worker, try another
+        // 429 — rate limited: precisely cooldown the worker that reported the error
         if (errMsg.includes("429")) {
           const retryMs = this.parseRetryDelayMs(errMsg)
           const exhausted = this.isQuotaExhausted(errMsg)
@@ -3011,17 +3011,42 @@ export class GoogleService {
           const cooldownMs = exhausted
             ? (retryMs ?? this.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS)
             : Math.min(retryMs ?? 60_000, this.MAX_429_WAIT_MS)
-          this.processPool.setCooldown(cooldownMs)
 
-          if (this.processPool.hasAvailableWorker()) {
+          // Precisely target the worker that actually failed (not a random one)
+          this.processPool.setModelCooldownForLastWorker(
+            resolvedModel,
+            cooldownMs,
+            exhausted
+          )
+
+          // Check if another worker is available for this specific model
+          if (this.processPool.hasAvailableWorkerForModel(resolvedModel)) {
             this.logger.warn(
-              `Rate limited${exhausted ? " (QUOTA_EXHAUSTED)" : ""}, switching to available worker (cooldown ${cooldownMs}ms)`
+              `Rate limited${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker for ${resolvedModel}`
             )
-          } else {
-            const waitMs = this.processPool.getMinCooldownMs()
-            this.logger.warn(`All workers rate-limited, waiting ${waitMs}ms`)
-            await this.sleep(waitMs)
+            lastError = error as Error
+            continue
           }
+
+          // All workers exhausted for this model — graceful degradation instead of crash
+          // Wait for the shortest model-specific cooldown, then retry
+          const waitMs =
+            this.processPool.getMinCooldownMsForModel(resolvedModel)
+          if (waitMs > this.MAX_429_WAIT_MS) {
+            // Cooldown too long (quota exhausted on all accounts) — return 429 with Retry-After
+            this.logger.error(
+              `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
+            )
+            throw new HttpException(
+              `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+              HttpStatus.TOO_MANY_REQUESTS
+            )
+          }
+
+          this.logger.warn(
+            `All workers rate-limited for ${resolvedModel}, waiting ${waitMs}ms before retry`
+          )
+          await this.sleep(waitMs)
           lastError = error as Error
           continue
         }
@@ -3254,7 +3279,11 @@ export class GoogleService {
         workerAttempt++
       ) {
         try {
-          await this.processPool.generateStream(payload, onChunkHandler)
+          await this.processPool.generateStream(
+            payload,
+            onChunkHandler,
+            resolvedModel
+          )
           return // success
         } catch (err) {
           const errMsg = (err as Error).message || ""
@@ -3267,18 +3296,42 @@ export class GoogleService {
             const cooldownMs = exhausted
               ? (retryMs ?? self.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS)
               : Math.min(retryMs ?? 60_000, self.MAX_429_WAIT_MS)
-            self.processPool.setCooldown(cooldownMs)
 
-            if (!isLast && self.processPool.hasAvailableWorker()) {
+            // Precisely target the worker that actually failed
+            self.processPool.setModelCooldownForLastWorker(
+              resolvedModel,
+              cooldownMs,
+              exhausted
+            )
+
+            // Check if another worker is available for this model
+            if (
+              !isLast &&
+              self.processPool.hasAvailableWorkerForModel(resolvedModel)
+            ) {
               self.logger.warn(
-                `Streaming 429${exhausted ? " (QUOTA_EXHAUSTED)" : ""} (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker`
+                `Streaming 429${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}`
               )
               continue
-            } else if (!isLast) {
-              // All workers in cooldown — wait for the shortest one
-              const waitMs = self.processPool.getMinCooldownMs()
+            }
+
+            // All workers exhausted for this model — graceful degradation
+            const waitMs =
+              self.processPool.getMinCooldownMsForModel(resolvedModel)
+            if (waitMs > self.MAX_429_WAIT_MS) {
+              // Cooldown too long — return 429 with context instead of crashing
+              self.logger.error(
+                `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
+              )
+              throw new HttpException(
+                `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+                HttpStatus.TOO_MANY_REQUESTS
+              )
+            }
+
+            if (!isLast) {
               self.logger.warn(
-                `Streaming 429, all workers rate-limited, waiting ${waitMs}ms before retry`
+                `Streaming 429, all workers rate-limited for ${resolvedModel}, waiting ${waitMs}ms before retry`
               )
               await self.sleep(waitMs)
               continue
