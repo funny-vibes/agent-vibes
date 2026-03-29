@@ -4,8 +4,7 @@
  * Sync Codex CLI credentials into agent-vibes.
  *
  * Reads ~/.codex/auth.json (created by `codex --login`) and writes
- * CODEX_ACCESS_TOKEN, CODEX_REFRESH_TOKEN, and CODEX_ACCOUNT_ID
- * into apps/protocol-bridge/.env.local.
+ * the account entry into apps/protocol-bridge/data/codex-accounts.json.
  *
  * Usage:
  *   agent-vibes sync --codex
@@ -21,12 +20,38 @@ const os = require("os")
 // ---------------------------------------------------------------------------
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..")
-const ENV_FILE = path.join(PROJECT_ROOT, "apps/protocol-bridge/.env.local")
+const DEST_FILE = path.join(
+  PROJECT_ROOT,
+  "apps/protocol-bridge/data/codex-accounts.json"
+)
 
 /** Codex CLI credential file — respects CODEX_HOME env var */
 function codexAuthPath() {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
   return path.join(codexHome, "auth.json")
+}
+
+function parseJwtClaims(token) {
+  if (!token) return null
+
+  try {
+    const parts = token.split(".")
+    if (parts.length !== 3) return null
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"))
+  } catch {
+    return null
+  }
+}
+
+function inferTokenExpiry(...tokens) {
+  for (const token of tokens) {
+    const claims = parseJwtClaims(token)
+    if (claims && typeof claims.exp === "number" && claims.exp > 0) {
+      return new Date(claims.exp * 1000).toISOString()
+    }
+  }
+
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -40,7 +65,7 @@ function readCodexAuth() {
     console.error("❌ Codex CLI not logged in (auth.json not found)")
     console.error(`   Expected at: ${authFile}`)
     console.error("")
-    console.error("   Run \`codex --login\` first to authenticate with OpenAI.")
+    console.error("   Run `codex --login` first to authenticate with OpenAI.")
     process.exit(1)
   }
 
@@ -68,107 +93,74 @@ function readCodexAuth() {
     console.error("❌ No credentials found in auth.json")
     console.error("   Neither OPENAI_API_KEY nor OAuth tokens are present.")
     console.error("")
-    console.error("   Run \`codex --login\` to authenticate.")
+    console.error("   Run `codex --login` to authenticate.")
     process.exit(1)
   }
 
-  // Extract email from id_token JWT (best-effort)
+  // Extract email and plan from id_token JWT (best-effort)
   let email = ""
   let planType = ""
+  let accountId = ""
+  let idToken = tokens.id_token || ""
   if (tokens.id_token) {
-    try {
-      const parts = tokens.id_token.split(".")
-      if (parts.length === 3) {
-        const claims = JSON.parse(
-          Buffer.from(parts[1], "base64url").toString("utf-8")
-        )
-        email = claims.email || ""
-        planType =
-          claims["https://api.openai.com/auth"]?.chatgpt_plan_type || ""
-      }
-    } catch {
-      // ignore parse errors
+    const claims = parseJwtClaims(tokens.id_token)
+    if (claims) {
+      email = claims.email || ""
+      planType = claims["https://api.openai.com/auth"]?.chatgpt_plan_type || ""
+      accountId =
+        claims["https://api.openai.com/auth"]?.chatgpt_account_id || ""
     }
+  }
+
+  // Use tokens.account_id as fallback
+  if (!accountId && tokens.account_id) {
+    accountId = tokens.account_id
   }
 
   return {
     mode: "oauth",
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token || "",
-    accountId: tokens.account_id || "",
+    idToken,
+    accountId,
     email,
     planType,
+    expire: inferTokenExpiry(tokens.access_token, tokens.id_token),
   }
 }
 
 // ---------------------------------------------------------------------------
-// Write to .env.local
+// Write to codex-accounts.json
 // ---------------------------------------------------------------------------
 
-/**
- * Upsert key=value pairs into .env.local.
- * Preserves existing entries that are not being updated.
- */
-function upsertEnvFile(envPath, updates) {
-  let lines = []
-
-  if (fs.existsSync(envPath)) {
-    lines = fs.readFileSync(envPath, "utf-8").split("\n")
-  }
-
-  const updatedKeys = new Set()
-
-  // Update existing lines
-  lines = lines
-    .map((line) => {
-      const trimmed = line.trim()
-      // Skip comments and empty lines
-      if (!trimmed || trimmed.startsWith("#")) return line
-
-      const eqIdx = trimmed.indexOf("=")
-      if (eqIdx === -1) return line
-
-      const key = trimmed.substring(0, eqIdx).trim()
-      if (key in updates) {
-        updatedKeys.add(key)
-        if (updates[key] === null) return null // mark for removal
-        return `${key}=${updates[key]}`
+function writeAccountsFile(destPath, account) {
+  // Load existing accounts (if any) to preserve other entries
+  let existing = { accounts: [] }
+  if (fs.existsSync(destPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(destPath, "utf-8"))
+      if (!Array.isArray(existing.accounts)) {
+        existing.accounts = []
       }
-      return line
-    })
-    .filter((line) => line !== null)
-
-  // Append new keys that weren't already in the file
-  const newKeys = Object.entries(updates).filter(
-    ([k, v]) => !updatedKeys.has(k) && v !== null
-  )
-
-  if (newKeys.length > 0) {
-    // Add a blank line separator if file doesn't end with one
-    const lastLine = lines[lines.length - 1]
-    if (lastLine && lastLine.trim() !== "") {
-      lines.push("")
-    }
-
-    // Add section header if no Codex vars exist yet
-    const hasCodexSection = lines.some(
-      (l) => l.includes("Codex") || l.includes("CODEX_")
-    )
-    if (!hasCodexSection) {
-      lines.push(
-        "# ── Codex Backend (synced via \`agent-vibes sync --codex\`) ─"
-      )
-    }
-
-    for (const [key, value] of newKeys) {
-      lines.push(`${key}=${value}`)
+    } catch {
+      existing = { accounts: [] }
     }
   }
 
-  // Ensure trailing newline
-  const content = lines.join("\n").replace(/\n*$/, "\n")
-  fs.mkdirSync(path.dirname(envPath), { recursive: true })
-  fs.writeFileSync(envPath, content, "utf-8")
+  // Upsert: replace by email + accountId combo (supports multiple teams per email)
+  const idx = existing.accounts.findIndex(
+    (a) =>
+      a.email === account.email &&
+      (a.accountId || "") === (account.accountId || "")
+  )
+  if (idx >= 0) {
+    existing.accounts[idx] = account
+  } else {
+    existing.accounts.push(account)
+  }
+
+  fs.mkdirSync(path.dirname(destPath), { recursive: true })
+  fs.writeFileSync(destPath, JSON.stringify(existing, null, 2), "utf-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -183,14 +175,12 @@ if (auth.mode === "api_key") {
   console.log("✅ Found API key in Codex CLI config")
   console.log(`   API Key: ${auth.apiKey.substring(0, 10)}...`)
 
-  upsertEnvFile(ENV_FILE, {
-    CODEX_API_KEY: auth.apiKey,
-    // Clear OAuth vars if switching to API key mode
-    CODEX_ACCESS_TOKEN: null,
-    CODEX_REFRESH_TOKEN: null,
-    CODEX_ACCOUNT_ID: null,
-    CODEX_PLAN_TYPE: null,
-  })
+  const account = {
+    email: "api-key",
+    apiKey: auth.apiKey,
+  }
+
+  writeAccountsFile(DEST_FILE, account)
 } else {
   // OAuth mode
   const label = auth.email ? `${auth.email}` : "OAuth account"
@@ -206,17 +196,26 @@ if (auth.mode === "api_key") {
     console.log(`   Plan Type: ${auth.planType}`)
   }
 
-  upsertEnvFile(ENV_FILE, {
-    CODEX_ACCESS_TOKEN: auth.accessToken,
-    CODEX_REFRESH_TOKEN: auth.refreshToken || null,
-    CODEX_ACCOUNT_ID: auth.accountId || null,
-    CODEX_PLAN_TYPE: auth.planType || null,
-    // Clear API key if switching to OAuth mode
-    CODEX_API_KEY: null,
-  })
+  const account = {
+    email: auth.email,
+    accessToken: auth.accessToken,
+    refreshToken: auth.refreshToken || undefined,
+    idToken: auth.idToken || undefined,
+    accountId: auth.accountId || undefined,
+    planType: auth.planType || undefined,
+    expire: auth.expire || undefined,
+  }
+
+  // Remove undefined keys for clean JSON
+  Object.keys(account).forEach(
+    (k) => account[k] === undefined && delete account[k]
+  )
+
+  writeAccountsFile(DEST_FILE, account)
 }
 
 console.log(
-  `\n✅ Credentials written to ${path.relative(PROJECT_ROOT, ENV_FILE)}`
+  `\n✅ Credentials written to ${path.relative(PROJECT_ROOT, DEST_FILE)}`
 )
 console.log("   Restart the proxy to apply changes.")
+console.log("   To deploy to remote, run: npm run deploy:sync")

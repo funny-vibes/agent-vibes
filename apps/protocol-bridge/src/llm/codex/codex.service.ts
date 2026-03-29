@@ -31,7 +31,14 @@ import { SocksProxyAgent } from "socks-proxy-agent"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { CodexModelTier, normalizeCodexModelTier } from "../model-registry"
-import { CodexAuthService } from "./codex-auth.service"
+import {
+  type CooldownableAccount,
+  markAccountCooldown,
+  markAccountSuccess,
+  pickAvailableAccount,
+  getEarliestRecovery,
+} from "../shared/account-cooldown"
+import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
 import { translateClaudeToCodex } from "./codex-request-translator"
 import {
@@ -51,6 +58,12 @@ const CODEX_CLIENT_VERSION = "0.101.0"
 const CODEX_USER_AGENT =
   "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
+const CODEX_ACCOUNTS_CONFIG_PATHS = [
+  path.resolve("data/codex-accounts.json"),
+  path.resolve("apps/protocol-bridge/data/codex-accounts.json"),
+]
+const CODEX_ACCOUNTS_DEFAULT_PATH = CODEX_ACCOUNTS_CONFIG_PATHS[1]!
+const CODEX_MODEL_TIER_ORDER: CodexModelTier[] = ["free", "plus", "team", "pro"]
 
 export class CodexApiError extends HttpException {
   constructor(
@@ -78,14 +91,54 @@ export class CodexApiError extends HttpException {
 
 // ── Service ────────────────────────────────────────────────────────────
 
+interface PersistedCodexAccountRecord {
+  label?: string
+  apiKey?: string
+  accessToken?: string
+  refreshToken?: string
+  idToken?: string
+  accountId?: string
+  email?: string
+  planType?: string
+  expire?: string
+  baseUrl?: string
+  proxyUrl?: string
+}
+
+interface CodexAccountSlot extends CooldownableAccount {
+  label?: string
+  apiKey?: string
+  accessToken?: string
+  refreshToken?: string
+  accountId?: string
+  email?: string
+  planType?: CodexModelTier
+  baseUrl: string
+  proxyUrl?: string
+  source: "env" | "file"
+  /** Per-slot token data for independent refresh */
+  tokenData: CodexTokenData | null
+  refreshPromise?: Promise<CodexTokenData | null>
+  persistedMatch?: {
+    apiKey?: string
+    email?: string
+    accountId?: string
+    accessToken?: string
+    refreshToken?: string
+  }
+}
+
 @Injectable()
 export class CodexService implements OnModuleInit {
   private readonly logger = new Logger(CodexService.name)
 
-  private apiKey: string = ""
-  private accessToken: string = ""
-  private baseUrl: string = DEFAULT_BASE_URL
-  private proxyUrl: string = ""
+  /** All loaded accounts (round-robin pool) */
+  private accounts: CodexAccountSlot[] = []
+  /** Round-robin counter */
+  private accountIndex = 0
+  /** Backing file used for multi-account OAuth persistence */
+  private accountsFilePath: string = CODEX_ACCOUNTS_DEFAULT_PATH
+
   private sessionId: string = crypto.randomUUID()
   private configuredModelTier: CodexModelTier | null = null
 
@@ -102,14 +155,29 @@ export class CodexService implements OnModuleInit {
   ) {}
 
   onModuleInit() {
-    this.apiKey = this.configService.get<string>("CODEX_API_KEY", "").trim()
-    this.accessToken = this.configService
+    const envApiKey = this.configService.get<string>("CODEX_API_KEY", "").trim()
+    const envAccessToken = this.configService
       .get<string>("CODEX_ACCESS_TOKEN", "")
       .trim()
-    this.baseUrl = this.configService
-      .get<string>("CODEX_BASE_URL", DEFAULT_BASE_URL)
+    const envIdToken = this.configService
+      .get<string>("CODEX_ID_TOKEN", "")
       .trim()
-    this.proxyUrl = this.configService.get<string>("CODEX_PROXY_URL", "").trim()
+    const envRefreshToken = this.configService
+      .get<string>("CODEX_REFRESH_TOKEN", "")
+      .trim()
+    const envAccountId = this.configService
+      .get<string>("CODEX_ACCOUNT_ID", "")
+      .trim()
+    const envPlanType = normalizeCodexModelTier(
+      this.configService.get<string>("CODEX_PLAN_TYPE", "")
+    )
+    const envBaseUrl =
+      this.configService
+        .get<string>("CODEX_BASE_URL", DEFAULT_BASE_URL)
+        .trim() || DEFAULT_BASE_URL
+    const envProxyUrl = this.configService
+      .get<string>("CODEX_PROXY_URL", "")
+      .trim()
 
     // WebSocket transport preference
     const wsEnv = this.configService
@@ -118,68 +186,130 @@ export class CodexService implements OnModuleInit {
       .toLowerCase()
     this.useWebSocket = wsEnv === "true" || wsEnv === "1"
 
-    if (!this.baseUrl) {
-      this.baseUrl = DEFAULT_BASE_URL
-    }
+    // 1. Load all accounts from codex-accounts.json
+    const fileAccounts = this.loadAllCodexAccountsFromFile()
 
-    // Load persisted tokens FIRST — they survive restarts and may contain
-    // rotated refresh tokens that the env vars do not have.
+    // 2. Load persisted tokens (for legacy single-account mode)
     const persisted = this.authService.loadPersistedTokens()
 
-    if (persisted?.refreshToken) {
-      // Persisted token file exists and has a refresh token.
-      // Use it regardless of whether CODEX_ACCESS_TOKEN env var is set;
-      // this is the primary path for OAuth setups surviving restarts.
-      this.logger.log(
-        "Using persisted Codex tokens (with rotated refresh token)"
-      )
-      this.authService.setTokenData(persisted)
-      // Ensure isAvailable() returns true even without the env var
-      if (!this.accessToken && persisted.accessToken) {
-        this.accessToken = persisted.accessToken
+    // 3. Add env-var account as first slot if it has credentials
+    if (envApiKey || envAccessToken || persisted?.refreshToken) {
+      const envSlot: CodexAccountSlot = {
+        label: "env",
+        apiKey: envApiKey || undefined,
+        accessToken: envAccessToken || undefined,
+        baseUrl: envBaseUrl,
+        proxyUrl: envProxyUrl || undefined,
+        source: "env",
+        tokenData: null,
+        cooldownUntil: 0,
+        modelStates: new Map(),
       }
-    } else if (this.accessToken) {
-      // No persisted tokens — fall back to env-var-based initialization
-      this.authService.setTokenData({
-        idToken: this.configService.get<string>("CODEX_ID_TOKEN", "").trim(),
-        accessToken: this.accessToken,
-        refreshToken: this.configService
-          .get<string>("CODEX_REFRESH_TOKEN", "")
-          .trim(),
-        accountId: this.configService
-          .get<string>("CODEX_ACCOUNT_ID", "")
-          .trim(),
-        email: "",
-        expire: new Date(Date.now() + 3600 * 1000).toISOString(),
-      })
+
+      if (persisted?.refreshToken) {
+        this.applyTokenDataToSlot(envSlot, persisted)
+      } else if (envAccessToken || envRefreshToken || envIdToken) {
+        this.applyTokenDataToSlot(
+          envSlot,
+          this.hydrateTokenData({
+            idToken: envIdToken,
+            accessToken: envAccessToken,
+            refreshToken: envRefreshToken,
+            accountId: envAccountId,
+            email: "",
+          })
+        )
+      }
+
+      if (envPlanType) {
+        envSlot.planType = envPlanType
+      }
+
+      // Only add if not duplicated in file accounts
+      const isDuplicate = fileAccounts.some(
+        (a) =>
+          (a.apiKey && a.apiKey === envSlot.apiKey) ||
+          ((a.email || a.accountId) &&
+            a.email === envSlot.email &&
+            (a.accountId || "") === (envSlot.accountId || ""))
+      )
+      if (!isDuplicate) {
+        this.accounts.unshift(envSlot)
+      }
+    }
+
+    // 4. Add file accounts
+    for (const fa of fileAccounts) {
+      const slot: CodexAccountSlot = {
+        label: fa.label || fa.email || undefined,
+        apiKey: fa.apiKey || undefined,
+        accessToken: fa.accessToken || undefined,
+        refreshToken: fa.refreshToken || undefined,
+        accountId: fa.accountId || undefined,
+        email: fa.email || undefined,
+        planType: normalizeCodexModelTier(fa.planType) || undefined,
+        baseUrl: fa.baseUrl || envBaseUrl,
+        proxyUrl: fa.proxyUrl || envProxyUrl || undefined,
+        source: "file",
+        tokenData: null,
+        cooldownUntil: 0,
+        modelStates: new Map(),
+        persistedMatch: {
+          apiKey: fa.apiKey || undefined,
+          email: fa.email || undefined,
+          accountId: fa.accountId || undefined,
+          accessToken: fa.accessToken || undefined,
+          refreshToken: fa.refreshToken || undefined,
+        },
+      }
+
+      if (fa.accessToken || fa.refreshToken || fa.idToken) {
+        this.applyTokenDataToSlot(
+          slot,
+          this.hydrateTokenData({
+            idToken: fa.idToken || "",
+            accessToken: fa.accessToken || "",
+            refreshToken: fa.refreshToken || "",
+            accountId: fa.accountId || "",
+            email: fa.email || "",
+            expire: fa.expire || "",
+          })
+        )
+      }
+
+      this.accounts.push(slot)
     }
 
     this.configuredModelTier = this.resolveConfiguredModelTier()
 
-    const hasCredentials = !!(this.apiKey || this.accessToken)
     this.logger.log(
-      `Codex backend initialized: baseUrl=${this.baseUrl}, ` +
-        `hasApiKey=${!!this.apiKey}, hasAccessToken=${!!this.accessToken}, ` +
-        `hasProxy=${!!this.proxyUrl}, useWebSocket=${this.useWebSocket}, ` +
+      `Codex backend initialized: ${this.accounts.length} account(s), ` +
+        `defaultBaseUrl=${envBaseUrl}, useWebSocket=${this.useWebSocket}, ` +
         `modelTier=${this.configuredModelTier || "unknown"}`
     )
-    if (!hasCredentials) {
+    for (const acct of this.accounts) {
+      this.logger.log(
+        `  → ${acct.label || acct.email || "unnamed"}: ` +
+          `${acct.apiKey ? "api-key" : "oauth"} @ ${acct.baseUrl}`
+      )
+    }
+    if (this.accounts.length === 0) {
       this.logger.warn(
-        "No Codex credentials configured (CODEX_API_KEY or CODEX_ACCESS_TOKEN or persisted tokens). " +
+        "No Codex credentials configured. " +
           "GPT/O-series models will not be available."
       )
     }
   }
 
   /**
-   * Check if Codex backend is available (has credentials configured).
+   * Check if Codex backend is available (has at least one account).
    */
   isAvailable(): boolean {
-    return !!(this.apiKey || this.accessToken)
+    return this.accounts.length > 0
   }
 
   getModelTier(): CodexModelTier | null {
-    return this.authService.getPlanType() || this.configuredModelTier
+    return this.getHighestLoadedModelTier() || this.configuredModelTier
   }
 
   private resolveConfiguredModelTier(): CodexModelTier | null {
@@ -188,11 +318,6 @@ export class CodexService implements OnModuleInit {
     )
     if (envTier) {
       return envTier
-    }
-
-    const tokenTier = this.authService.getPlanType()
-    if (tokenTier) {
-      return tokenTier
     }
 
     return this.readModelTierFromLocalAuthFile()
@@ -225,58 +350,341 @@ export class CodexService implements OnModuleInit {
   }
 
   /**
+   * Load all Codex accounts from codex-accounts.json.
+   */
+  private loadAllCodexAccountsFromFile(): PersistedCodexAccountRecord[] {
+    for (const configPath of CODEX_ACCOUNTS_CONFIG_PATHS) {
+      if (!fs.existsSync(configPath)) continue
+
+      try {
+        const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
+          accounts?: PersistedCodexAccountRecord[]
+        }
+        if (Array.isArray(data.accounts) && data.accounts.length > 0) {
+          this.accountsFilePath = configPath
+          this.logger.log(
+            `Loaded ${data.accounts.length} Codex account(s) from ${configPath}`
+          )
+          return data.accounts
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Failed to parse ${configPath}: ${(err as Error).message}`
+        )
+      }
+    }
+
+    return []
+  }
+
+  /**
+   * Derive per-slot token metadata from persisted or env-backed credentials.
+   */
+  private hydrateTokenData(tokenData: Partial<CodexTokenData>): CodexTokenData {
+    const idToken = tokenData.idToken?.trim() || ""
+    const accessToken = tokenData.accessToken?.trim() || ""
+
+    return {
+      idToken,
+      accessToken,
+      refreshToken: tokenData.refreshToken?.trim() || "",
+      accountId:
+        tokenData.accountId?.trim() ||
+        this.authService.getAccountIdFromIdToken(idToken),
+      email: tokenData.email?.trim() || "",
+      expire:
+        tokenData.expire?.trim() || this.inferTokenExpiry(accessToken, idToken),
+    }
+  }
+
+  private inferTokenExpiry(...tokens: Array<string | undefined>): string {
+    for (const token of tokens) {
+      if (!token) continue
+      const expire = this.authService.getTokenExpiryFromJwt(token)
+      if (expire) {
+        return expire
+      }
+    }
+
+    return new Date(Date.now() + 3600 * 1000).toISOString()
+  }
+
+  private applyTokenDataToSlot(
+    slot: CodexAccountSlot,
+    tokenData: CodexTokenData
+  ): void {
+    slot.tokenData = tokenData
+    slot.accessToken = tokenData.accessToken || slot.accessToken
+    slot.refreshToken = tokenData.refreshToken || slot.refreshToken
+    slot.accountId =
+      tokenData.accountId ||
+      slot.accountId ||
+      this.authService.getAccountIdFromIdToken(tokenData.idToken)
+    slot.email = tokenData.email || slot.email
+    slot.planType =
+      this.authService.getPlanTypeFromTokenData(tokenData) || slot.planType
+  }
+
+  private getSlotPlanType(slot: CodexAccountSlot): CodexModelTier | null {
+    return (
+      slot.planType || this.authService.getPlanTypeFromTokenData(slot.tokenData)
+    )
+  }
+
+  private getHighestLoadedModelTier(): CodexModelTier | null {
+    let highest: CodexModelTier | null = null
+
+    for (const slot of this.accounts) {
+      const tier = this.getSlotPlanType(slot)
+      if (!tier) continue
+      if (
+        !highest ||
+        CODEX_MODEL_TIER_ORDER.indexOf(tier) >
+          CODEX_MODEL_TIER_ORDER.indexOf(highest)
+      ) {
+        highest = tier
+      }
+    }
+
+    return highest
+  }
+
+  private getSlotAccountId(slot: CodexAccountSlot): string {
+    return (
+      this.authService.getAccountIdFromTokenData(slot.tokenData) ||
+      slot.accountId ||
+      ""
+    )
+  }
+
+  private getAccountLabel(slot: CodexAccountSlot): string {
+    return slot.label || slot.email || "slot"
+  }
+
+  /**
+   * Round-robin: pick the next available account, respecting cooldowns.
+   *
+   * @param model - The model being requested (for per-model cooldown checks)
+   * @returns The slot, or null if all accounts are in cooldown
+   */
+  private pickNextAvailableAccount(model: string): CodexAccountSlot | null {
+    const result = pickAvailableAccount(this.accounts, model, this.accountIndex)
+
+    if (!result) {
+      // All accounts in cooldown
+      this.logger.warn(
+        `[Codex] All ${this.accounts.length} account(s) are in cooldown for model=${model}`
+      )
+      return null
+    }
+
+    const slot = result.account
+    this.accountIndex = (result.index + 1) % this.accounts.length
+    return slot
+  }
+
+  /**
+   * Persist refreshed OAuth metadata to the appropriate backing store.
+   */
+  private persistSlotTokens(slot: CodexAccountSlot): void {
+    if (!slot.tokenData) return
+
+    if (slot.source === "env") {
+      this.authService.persistTokenData(slot.tokenData)
+      return
+    }
+
+    this.persistFileBackedAccount(slot)
+  }
+
+  /**
+   * Persist a refreshed file-backed OAuth slot back into codex-accounts.json.
+   */
+  private persistFileBackedAccount(slot: CodexAccountSlot): void {
+    if (!slot.tokenData) return
+
+    try {
+      const filePath = this.accountsFilePath || CODEX_ACCOUNTS_DEFAULT_PATH
+      const payload: { accounts: PersistedCodexAccountRecord[] } = {
+        accounts: [],
+      }
+
+      if (fs.existsSync(filePath)) {
+        const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as {
+          accounts?: PersistedCodexAccountRecord[]
+        }
+        payload.accounts = Array.isArray(parsed.accounts) ? parsed.accounts : []
+      }
+
+      const existingIndex = payload.accounts.findIndex((account) => {
+        if (
+          slot.persistedMatch?.apiKey &&
+          account.apiKey === slot.persistedMatch.apiKey
+        ) {
+          return true
+        }
+        if (
+          slot.persistedMatch?.refreshToken &&
+          account.refreshToken === slot.persistedMatch.refreshToken
+        ) {
+          return true
+        }
+        if (
+          slot.persistedMatch?.accessToken &&
+          account.accessToken === slot.persistedMatch.accessToken
+        ) {
+          return true
+        }
+
+        const matchEmail = slot.persistedMatch?.email || slot.email || ""
+        const matchAccountId =
+          slot.persistedMatch?.accountId || slot.accountId || ""
+        return (
+          (account.email || "") === matchEmail &&
+          (account.accountId || "") === matchAccountId
+        )
+      })
+
+      const currentRecord: PersistedCodexAccountRecord = {
+        ...(existingIndex >= 0 ? payload.accounts[existingIndex] : {}),
+        ...(slot.label ? { label: slot.label } : {}),
+        ...(slot.apiKey ? { apiKey: slot.apiKey } : {}),
+        ...(slot.email ? { email: slot.email } : {}),
+        ...(slot.baseUrl ? { baseUrl: slot.baseUrl } : {}),
+        ...(slot.proxyUrl ? { proxyUrl: slot.proxyUrl } : {}),
+        accessToken: slot.tokenData.accessToken,
+        refreshToken: slot.tokenData.refreshToken,
+        idToken: slot.tokenData.idToken,
+        accountId: this.getSlotAccountId(slot) || undefined,
+        planType: this.getSlotPlanType(slot) || undefined,
+        expire: slot.tokenData.expire || undefined,
+      }
+
+      Object.keys(currentRecord).forEach((key) => {
+        const typedKey = key as keyof PersistedCodexAccountRecord
+        if (!currentRecord[typedKey]) {
+          delete currentRecord[typedKey]
+        }
+      })
+
+      if (existingIndex >= 0) {
+        payload.accounts[existingIndex] = currentRecord
+      } else {
+        payload.accounts.push(currentRecord)
+      }
+
+      fs.mkdirSync(path.dirname(filePath), { recursive: true })
+      fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8")
+      slot.persistedMatch = {
+        apiKey: slot.apiKey,
+        email: slot.email,
+        accountId: slot.accountId,
+        accessToken: slot.accessToken,
+        refreshToken: slot.refreshToken,
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Failed to persist Codex account to ${this.accountsFilePath}: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+
+  /**
    * Get the bearer token for authentication.
-   * Prefers API key over access token.
-   * For access token mode, ensures token is valid (refreshes if needed).
+   * Refreshes OAuth credentials per slot without mutating singleton service state.
    */
-  private async getBearerToken(): Promise<string> {
-    if (this.apiKey) return this.apiKey
+  private async getBearerToken(slot: CodexAccountSlot): Promise<string> {
+    if (slot.apiKey) return slot.apiKey
 
-    // Try to get a valid access token (with auto-refresh)
-    const token = await this.authService.ensureValidToken()
-    if (token) return token
+    if (slot.tokenData) {
+      const tokenData = await this.ensureFreshTokenData(slot)
+      if (tokenData?.accessToken) {
+        return tokenData.accessToken
+      }
+    }
 
-    // Fallback to static access token
-    return this.accessToken
+    return slot.accessToken || ""
   }
 
   /**
-   * Get bearer token synchronously (for non-async contexts).
+   * Refresh an OAuth slot once, sharing the in-flight refresh per slot.
    */
-  private getBearerTokenSync(): string {
-    if (this.apiKey) return this.apiKey
-    const tokenData = this.authService.getTokenData()
-    return tokenData?.accessToken || this.accessToken
+  private async ensureFreshTokenData(
+    slot: CodexAccountSlot
+  ): Promise<CodexTokenData | null> {
+    if (!slot.tokenData) {
+      return null
+    }
+
+    if (!this.authService.isTokenExpired(slot.tokenData)) {
+      return slot.tokenData
+    }
+
+    if (!slot.tokenData.refreshToken) {
+      return slot.tokenData
+    }
+
+    if (!slot.refreshPromise) {
+      slot.refreshPromise = (async () => {
+        this.logger.log(
+          `[Codex] Refreshing token for ${this.getAccountLabel(slot)}`
+        )
+        try {
+          const refreshed = await this.authService.refreshTokensWithRetry(
+            slot.tokenData?.refreshToken || "",
+            3,
+            { persist: false, updateState: false }
+          )
+          this.applyTokenDataToSlot(slot, refreshed)
+          this.persistSlotTokens(slot)
+          return slot.tokenData
+        } catch (error) {
+          this.logger.error(
+            `[Codex] Token refresh failed for ${this.getAccountLabel(slot)}: ${error instanceof Error ? error.message : String(error)}`
+          )
+          return null
+        } finally {
+          slot.refreshPromise = undefined
+        }
+      })()
+    }
+
+    const refreshed = await slot.refreshPromise
+    return refreshed || slot.tokenData
   }
 
   /**
-   * Determine if we're using an API key (vs OAuth access token).
+   * Determine if the slot is using an API key (vs OAuth access token).
    */
-  private isApiKeyMode(): boolean {
-    return !!this.apiKey
+  private isApiKeyMode(slot: CodexAccountSlot): boolean {
+    return !!slot.apiKey
   }
 
   /**
    * Build the fetch agent for proxy support.
+   * Uses the selected slot's proxyUrl.
    */
-  private buildProxyAgent():
+  private buildProxyAgent(
+    slot: CodexAccountSlot
+  ):
     | HttpProxyAgent<string>
     | HttpsProxyAgent<string>
     | SocksProxyAgent
     | undefined {
-    if (!this.proxyUrl) return undefined
+    const proxyUrl = slot.proxyUrl
+    if (!proxyUrl) return undefined
 
     try {
-      const url = new URL(this.proxyUrl)
+      const url = new URL(proxyUrl)
       switch (url.protocol) {
         case "http:":
-          return new HttpProxyAgent(this.proxyUrl)
+          return new HttpProxyAgent(proxyUrl)
         case "https:":
-          return new HttpsProxyAgent(this.proxyUrl)
+          return new HttpsProxyAgent(proxyUrl)
         case "socks5:":
         case "socks5h:":
         case "socks4:":
-          return new SocksProxyAgent(this.proxyUrl)
+          return new SocksProxyAgent(proxyUrl)
         default:
           this.logger.error(`Unsupported proxy scheme: ${url.protocol}`)
           return undefined
@@ -292,6 +700,7 @@ export class CodexService implements OnModuleInit {
    * Ported from: codex_executor.go applyCodexHeaders()
    */
   private buildHeaders(
+    slot: CodexAccountSlot,
     token: string,
     stream: boolean,
     cacheHeaders?: Record<string, string>
@@ -307,11 +716,11 @@ export class CodexService implements OnModuleInit {
     }
 
     // Non-API-key mode: add Originator header (OAuth/access token mode)
-    if (!this.isApiKeyMode()) {
+    if (!this.isApiKeyMode(slot)) {
       headers["Originator"] = "codex_cli_rs"
 
       // Add account ID if available
-      const accountId = this.authService.getAccountId()
+      const accountId = this.getSlotAccountId(slot)
       if (accountId) {
         headers["Chatgpt-Account-Id"] = accountId
       }
@@ -413,15 +822,20 @@ export class CodexService implements OnModuleInit {
 
   /**
    * Build the Codex request URL.
+   * Uses the selected slot's baseUrl.
    */
-  private buildUrl(endpoint: string = "responses"): string {
-    return `${this.baseUrl.replace(/\/+$/, "")}/${endpoint}`
+  private buildUrl(
+    slot: CodexAccountSlot,
+    endpoint: string = "responses"
+  ): string {
+    const baseUrl = slot.baseUrl || DEFAULT_BASE_URL
+    return `${baseUrl.replace(/\/+$/, "")}/${endpoint}`
   }
 
   /**
    * Get cache ID for the current request.
    */
-  private getCacheId(dto: CreateMessageDto): string {
+  private getCacheId(dto: CreateMessageDto, slot: CodexAccountSlot): string {
     // Extract user ID from metadata if available
     const metadata = dto as unknown as {
       metadata?: { user_id?: string }
@@ -433,11 +847,35 @@ export class CodexService implements OnModuleInit {
     }
 
     // Fallback: use API key-based cache
-    if (this.apiKey) {
-      return this.cacheService.getCacheIdFromApiKey(this.apiKey)
+    if (slot.apiKey) {
+      return this.cacheService.getCacheIdFromApiKey(slot.apiKey)
     }
 
     return ""
+  }
+
+  private createAllAccountsRateLimitedError(modelName: string): CodexApiError {
+    const info = getEarliestRecovery(this.accounts, modelName)
+    const retrySeconds = info ? Math.ceil(info.retryAfterMs / 1000) : 60
+    return new CodexApiError(
+      429,
+      `All Codex accounts are rate-limited for model ${modelName}. ` +
+        `Retry after ${retrySeconds} seconds.`,
+      retrySeconds
+    )
+  }
+
+  private selectRequestSlot(modelName: string): CodexAccountSlot {
+    if (this.accounts.length === 0) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+    const slot = this.pickNextAvailableAccount(modelName)
+    if (!slot) {
+      throw this.createAllAccountsRateLimitedError(modelName)
+    }
+    return slot
   }
 
   // ── Non-streaming ────────────────────────────────────────────────────
@@ -446,73 +884,128 @@ export class CodexService implements OnModuleInit {
    * Send a non-streaming message through Codex.
    */
   async sendClaudeMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
-    const token = await this.getBearerToken()
+    return this.executeWithCooldownRetry(dto, false)
+  }
+
+  /**
+   * Core execution logic with cooldown-aware account selection and
+   * automatic retry on 429 (switches to next available account).
+   */
+  private async executeWithCooldownRetry(
+    dto: CreateMessageDto,
+    isRetry: boolean,
+    slot: CodexAccountSlot = this.selectRequestSlot(dto.model)
+  ): Promise<AnthropicResponse> {
+    const modelName = dto.model
+    const token = await this.getBearerToken(slot)
     if (!token) {
       throw new Error(
         "Codex backend not configured: no API key or access token"
       )
     }
 
-    const modelName = dto.model
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
-
-    // Translate request
     let codexRequest = translateClaudeToCodex(dto, modelName) as Record<
       string,
       unknown
     >
 
-    // Apply prompt cache
-    const cacheId = this.getCacheId(dto)
+    const cacheId = this.getCacheId(dto, slot)
     if (cacheId) {
       codexRequest = this.cacheService.injectCacheKey(codexRequest, cacheId)
     }
 
-    // Try WebSocket transport first (if enabled and not rejected)
-    if (
-      this.useWebSocket &&
-      !this.webSocketRejected &&
-      this.wsService.isWebSocketAvailable()
-    ) {
-      try {
-        return await this.sendViaWebSocket(
+    try {
+      let result: AnthropicResponse
+
+      // Try WebSocket transport first (if enabled and not rejected)
+      if (
+        this.useWebSocket &&
+        !this.webSocketRejected &&
+        this.wsService.isWebSocketAvailable()
+      ) {
+        try {
+          result = await this.sendViaWebSocket(
+            slot,
+            token,
+            codexRequest,
+            modelName,
+            reverseToolMap,
+            cacheId
+          )
+        } catch (e) {
+          if (e instanceof CodexWebSocketUpgradeError) {
+            if (e.shouldFallbackToHttp()) {
+              this.logger.warn(
+                "WebSocket upgrade rejected, falling back to HTTP"
+              )
+              this.webSocketRejected = true
+            } else {
+              throw this.createCodexApiError(
+                e.statusCode || 502,
+                e.body || e.message
+              )
+            }
+          } else {
+            throw e
+          }
+          // Fallback to HTTP after WebSocket rejection
+          result = await this.sendViaHttp(
+            slot,
+            token,
+            codexRequest,
+            modelName,
+            reverseToolMap,
+            cacheId
+          )
+        }
+      } else {
+        result = await this.sendViaHttp(
+          slot,
           token,
           codexRequest,
           modelName,
           reverseToolMap,
           cacheId
         )
-      } catch (e) {
-        if (e instanceof CodexWebSocketUpgradeError) {
-          if (e.shouldFallbackToHttp()) {
-            this.logger.warn("WebSocket upgrade rejected, falling back to HTTP")
-            this.webSocketRejected = true
-          } else {
-            throw this.createCodexApiError(
-              e.statusCode || 502,
-              e.body || e.message
+      }
+
+      // Success — clear any cooldown on this slot
+      markAccountSuccess(slot, modelName)
+      return result
+    } catch (e) {
+      // Handle rate-limit errors with automatic retry
+      if (e instanceof CodexApiError) {
+        const statusCode = e.getStatus()
+        const retryAfterHeader = e.retryAfterSeconds?.toString()
+        markAccountCooldown(
+          slot,
+          statusCode,
+          modelName,
+          retryAfterHeader,
+          this.getAccountLabel(slot)
+        )
+
+        // Auto-retry once on 429 if another account is available
+        if (statusCode === 429 && !isRetry && this.accounts.length > 1) {
+          const nextSlot = this.pickNextAvailableAccount(modelName)
+          if (nextSlot && nextSlot !== slot) {
+            this.logger.log(
+              `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying with ${this.getAccountLabel(nextSlot)}`
             )
+            return this.executeWithCooldownRetry(dto, true, nextSlot)
           }
-        } else {
-          throw e
         }
       }
+      throw e
     }
-
-    // HTTP transport
-    return this.sendViaHttp(
-      token,
-      codexRequest,
-      modelName,
-      reverseToolMap,
-      cacheId
-    )
   }
 
   /**
    * Send non-streaming via HTTP.
    */
   private async sendViaHttp(
+    slot: CodexAccountSlot,
     token: string,
     codexRequest: Record<string, unknown>,
     modelName: string,
@@ -520,9 +1013,9 @@ export class CodexService implements OnModuleInit {
     cacheId: string
   ): Promise<AnthropicResponse> {
     const requestBody = JSON.stringify(codexRequest)
-    const url = this.buildUrl("responses")
+    const url = this.buildUrl(slot, "responses")
     const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
-    const headers = this.buildHeaders(token, true, cacheHeaders)
+    const headers = this.buildHeaders(slot, token, true, cacheHeaders)
 
     this.logger.log(
       `[Codex] Non-stream request: model=${modelName}, url=${url}`
@@ -535,7 +1028,7 @@ export class CodexService implements OnModuleInit {
       signal: AbortSignal.timeout(300_000),
     }
 
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgent(slot)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -585,19 +1078,20 @@ export class CodexService implements OnModuleInit {
    * Send non-streaming via WebSocket.
    */
   private async sendViaWebSocket(
+    slot: CodexAccountSlot,
     token: string,
     codexRequest: Record<string, unknown>,
     modelName: string,
     reverseToolMap: Map<string, string>,
     cacheId: string
   ): Promise<AnthropicResponse> {
-    const httpUrl = this.buildUrl("responses")
+    const httpUrl = this.buildUrl(slot, "responses")
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
     const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
-      this.isApiKeyMode(),
-      this.authService.getAccountId(),
+      this.isApiKeyMode(slot),
+      this.getSlotAccountId(slot),
       cacheHeaders
     )
 
@@ -608,7 +1102,7 @@ export class CodexService implements OnModuleInit {
     const ws = await this.wsService.connect(
       wsUrl,
       wsHeaders,
-      this.proxyUrl || undefined
+      slot.proxyUrl || undefined
     )
 
     try {
@@ -641,76 +1135,123 @@ export class CodexService implements OnModuleInit {
   async *sendClaudeMessageStream(
     dto: CreateMessageDto
   ): AsyncGenerator<string, void, unknown> {
-    const token = await this.getBearerToken()
+    yield* this.executeStreamWithCooldownRetry(dto, false)
+  }
+
+  private async *executeStreamWithCooldownRetry(
+    dto: CreateMessageDto,
+    isRetry: boolean,
+    slot: CodexAccountSlot = this.selectRequestSlot(dto.model)
+  ): AsyncGenerator<string, void, unknown> {
+    const modelName = dto.model
+    const token = await this.getBearerToken(slot)
     if (!token) {
       throw new Error(
         "Codex backend not configured: no API key or access token"
       )
     }
 
-    const modelName = dto.model
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
-
-    // Translate request
     let codexRequest = translateClaudeToCodex(dto, modelName) as Record<
       string,
       unknown
     >
 
-    // Apply prompt cache
-    const cacheId = this.getCacheId(dto)
+    const cacheId = this.getCacheId(dto, slot)
     if (cacheId) {
       codexRequest = this.cacheService.injectCacheKey(codexRequest, cacheId)
     }
 
-    // Try WebSocket transport first (if enabled and not rejected)
-    if (
-      this.useWebSocket &&
-      !this.webSocketRejected &&
-      this.wsService.isWebSocketAvailable()
-    ) {
-      try {
-        yield* this.streamViaWebSocket(
-          token,
-          codexRequest,
-          modelName,
-          reverseToolMap,
-          cacheId
-        )
-        return
-      } catch (e) {
-        if (e instanceof CodexWebSocketUpgradeError) {
-          if (e.shouldFallbackToHttp()) {
-            this.logger.warn(
-              "WebSocket upgrade rejected, falling back to HTTP for streaming"
-            )
-            this.webSocketRejected = true
-          } else {
-            throw this.createCodexApiError(
-              e.statusCode || 502,
-              e.body || e.message
-            )
+    let emittedEvents = false
+
+    try {
+      // Try WebSocket transport first (if enabled and not rejected)
+      if (
+        this.useWebSocket &&
+        !this.webSocketRejected &&
+        this.wsService.isWebSocketAvailable()
+      ) {
+        try {
+          for await (const event of this.streamViaWebSocket(
+            slot,
+            token,
+            codexRequest,
+            modelName,
+            reverseToolMap,
+            cacheId
+          )) {
+            emittedEvents = true
+            yield event
           }
-        } else {
-          throw e
+          markAccountSuccess(slot, modelName)
+          return
+        } catch (e) {
+          if (e instanceof CodexWebSocketUpgradeError) {
+            if (e.shouldFallbackToHttp()) {
+              this.logger.warn(
+                "WebSocket upgrade rejected, falling back to HTTP for streaming"
+              )
+              this.webSocketRejected = true
+            } else {
+              throw this.createCodexApiError(
+                e.statusCode || 502,
+                e.body || e.message
+              )
+            }
+          } else {
+            throw e
+          }
         }
       }
-    }
 
-    // HTTP transport
-    yield* this.streamViaHttp(
-      token,
-      codexRequest,
-      modelName,
-      reverseToolMap,
-      cacheId
-    )
+      for await (const event of this.streamViaHttp(
+        slot,
+        token,
+        codexRequest,
+        modelName,
+        reverseToolMap,
+        cacheId
+      )) {
+        emittedEvents = true
+        yield event
+      }
+      markAccountSuccess(slot, modelName)
+    } catch (e) {
+      if (e instanceof CodexApiError) {
+        const statusCode = e.getStatus()
+        markAccountCooldown(
+          slot,
+          statusCode,
+          modelName,
+          e.retryAfterSeconds?.toString(),
+          this.getAccountLabel(slot)
+        )
+
+        if (
+          statusCode === 429 &&
+          !isRetry &&
+          !emittedEvents &&
+          this.accounts.length > 1
+        ) {
+          const nextSlot = this.pickNextAvailableAccount(modelName)
+          if (nextSlot && nextSlot !== slot) {
+            this.logger.log(
+              `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying streamed request with ${this.getAccountLabel(nextSlot)}`
+            )
+            yield* this.executeStreamWithCooldownRetry(dto, true, nextSlot)
+            return
+          }
+        }
+      }
+      throw e
+    }
   }
 
   /**
    * Stream via HTTP SSE transport.
    */
   private async *streamViaHttp(
+    slot: CodexAccountSlot,
     token: string,
     codexRequest: Record<string, unknown>,
     modelName: string,
@@ -718,9 +1259,9 @@ export class CodexService implements OnModuleInit {
     cacheId: string
   ): AsyncGenerator<string, void, unknown> {
     const requestBody = JSON.stringify(codexRequest)
-    const url = this.buildUrl("responses")
+    const url = this.buildUrl(slot, "responses")
     const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
-    const headers = this.buildHeaders(token, true, cacheHeaders)
+    const headers = this.buildHeaders(slot, token, true, cacheHeaders)
 
     this.logger.log(`[Codex] Stream request: model=${modelName}, url=${url}`)
 
@@ -731,7 +1272,7 @@ export class CodexService implements OnModuleInit {
       signal: AbortSignal.timeout(600_000),
     }
 
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgent(slot)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -808,19 +1349,20 @@ export class CodexService implements OnModuleInit {
    * existing response translator.
    */
   private async *streamViaWebSocket(
+    slot: CodexAccountSlot,
     token: string,
     codexRequest: Record<string, unknown>,
     modelName: string,
     reverseToolMap: Map<string, string>,
     cacheId: string
   ): AsyncGenerator<string, void, unknown> {
-    const httpUrl = this.buildUrl("responses")
+    const httpUrl = this.buildUrl(slot, "responses")
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
     const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
-      this.isApiKeyMode(),
-      this.authService.getAccountId(),
+      this.isApiKeyMode(slot),
+      this.getSlotAccountId(slot),
       cacheHeaders
     )
 
@@ -831,7 +1373,7 @@ export class CodexService implements OnModuleInit {
     const ws = await this.wsService.connect(
       wsUrl,
       wsHeaders,
-      this.proxyUrl || undefined
+      slot.proxyUrl || undefined
     )
 
     const state = createStreamState()

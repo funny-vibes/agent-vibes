@@ -170,12 +170,14 @@ function collectEnvironment() {
     )
   )
 
-  // Try to detect Cursor version
+  // Try to detect Cursor version (cross-platform)
   let cursorVersion = "N/A"
   try {
     const platform = require(path.join(ROOT, "scripts", "lib", "platform"))
     const binaryPath = platform.cursorBinaryPath()
+
     if (process.platform === "darwin") {
+      // macOS: read Info.plist CFBundleShortVersionString
       const plistPath = path.join(path.dirname(binaryPath), "..", "Info.plist")
       if (fs.existsSync(plistPath)) {
         const plist = fs.readFileSync(plistPath, "utf-8")
@@ -183,6 +185,59 @@ function collectEnvironment() {
           /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/
         )
         if (match) cursorVersion = match[1]
+      }
+    }
+
+    // Cross-platform fallback: try cursor --version CLI
+    if (cursorVersion === "N/A" && binaryPath) {
+      const ver = safeExec(`"${binaryPath}" --version`, "")
+      if (ver) {
+        // cursor --version returns multi-line: version on first line
+        const firstLine = ver.split("\n")[0].trim()
+        if (firstLine) cursorVersion = firstLine
+      }
+    }
+
+    // Last resort: read package.json from resources/app/
+    if (cursorVersion === "N/A" && binaryPath) {
+      const resourcePkgCandidates =
+        process.platform === "darwin"
+          ? [
+              path.join(
+                path.dirname(binaryPath),
+                "..",
+                "Resources",
+                "app",
+                "package.json"
+              ),
+            ]
+          : [
+              path.join(
+                path.dirname(binaryPath),
+                "resources",
+                "app",
+                "package.json"
+              ),
+              path.join(
+                path.dirname(binaryPath),
+                "..",
+                "resources",
+                "app",
+                "package.json"
+              ),
+            ]
+      for (const pkgPath of resourcePkgCandidates) {
+        if (fs.existsSync(pkgPath)) {
+          try {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"))
+            if (pkg.version) {
+              cursorVersion = pkg.version
+              break
+            }
+          } catch {
+            /* ignore */
+          }
+        }
       }
     }
   } catch {

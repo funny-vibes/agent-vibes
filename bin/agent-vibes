@@ -6,6 +6,7 @@
  *   agent-vibes                     Start the gateway server
  *   agent-vibes sync --ide|--tools  Sync Antigravity credentials
  *   agent-vibes sync --codex        Sync Codex credentials
+ *   agent-vibes sync --deploy       Deploy credentials to GitHub Secrets
  *   agent-vibes cert                Generate SSL certificates (requires mkcert)
  *   agent-vibes patch               Patch Cursor binary
  *   agent-vibes patch --restore     Restore Cursor binary
@@ -52,6 +53,8 @@ Usage:
   agent-vibes sync --ide              Sync credentials from Antigravity IDE
   agent-vibes sync --tools            Sync credentials from Antigravity Manager
   agent-vibes sync --codex            Sync credentials from Codex CLI auth.json
+  agent-vibes sync --deploy           Deploy credentials to GitHub Secrets
+  agent-vibes sync --deploy --run     Deploy + trigger CI/CD workflow
   agent-vibes cert                    Generate SSL certificates (requires mkcert)
   agent-vibes patch                   Patch Cursor binary for proxy
   agent-vibes patch --restore         Restore original Cursor binary
@@ -60,6 +63,9 @@ Usage:
   agent-vibes forward off             Disable port forwarding (requires sudo)
   agent-vibes forward status          Show forwarding status
   agent-vibes forward hosts           Print /etc/hosts entries
+  agent-vibes capture start           Start traffic capture (Clash + mitmdump)
+  agent-vibes capture stop            Stop traffic capture
+  agent-vibes capture status          Show capture status
   agent-vibes issues                  Collect diagnostics for bug reports
   agent-vibes --version               Show version
   agent-vibes --help                  Show help
@@ -103,7 +109,9 @@ function tsxScript(scriptPath, scriptArgs = [], opts = {}) {
 }
 
 if (command === "sync") {
-  if (args.includes("--codex")) {
+  if (args.includes("--deploy")) {
+    nodeScript("scripts/accounts/sync-deploy.js", args.slice(1))
+  } else if (args.includes("--codex")) {
     nodeScript("scripts/accounts/sync-codex-account.js")
   } else {
     nodeScript("scripts/accounts/sync-antigravity-accounts.js", args.slice(1))
@@ -111,6 +119,26 @@ if (command === "sync") {
 }
 
 if (command === "cert") {
+  // Verify mkcert is available
+  const mkcertCheck = spawnSync(
+    process.platform === "win32" ? "where" : "which",
+    ["mkcert"],
+    { encoding: "utf-8", stdio: "pipe" }
+  )
+  if (mkcertCheck.status !== 0) {
+    console.error("Error: mkcert is not installed or not in PATH.\n")
+    if (process.platform === "darwin") {
+      console.error("  Install with: brew install mkcert && mkcert -install")
+    } else if (process.platform === "win32") {
+      console.error("  Install with: choco install mkcert  (or scoop install mkcert)")
+      console.error("  Then run: mkcert -install")
+    } else {
+      console.error("  Install with: sudo apt install mkcert  (or see https://github.com/FiloSottile/mkcert)")
+      console.error("  Then run: mkcert -install")
+    }
+    process.exit(1)
+  }
+
   const certDir = path.join(ROOT, "apps", "protocol-bridge", "certs")
   if (!fs.existsSync(certDir)) {
     fs.mkdirSync(certDir, { recursive: true })
@@ -187,6 +215,16 @@ if (command === "forward") {
 
 if (command === "issues") {
   nodeScript("scripts/diagnostics/collect-issue-logs.js", args.slice(1))
+}
+
+if (command === "capture") {
+  const subCmd = args[1] || "status"
+  if (process.platform === "win32") {
+    // Windows: no sudo, scripts check elevation internally
+    nodeScript("scripts/capture/capture.js", [subCmd])
+  } else {
+    run("sudo", [process.execPath, path.join(ROOT, "scripts/capture/capture.js"), subCmd])
+  }
 }
 
 // Default: start server

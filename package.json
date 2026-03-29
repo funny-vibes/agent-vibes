@@ -31,7 +31,7 @@
   "scripts": {
     "prepare": "husky",
     "dev": "turbo run dev",
-    "release": "git pull && git push origin dev && git checkout main && git pull && git merge dev --no-edit && git push origin main && git checkout dev && echo '' && echo 'Released! Check Actions for deployment status.'",
+    "release": "git pull && git push origin dev && git checkout main && git pull && git merge dev --no-edit && git push origin main && git checkout dev && echo . && echo Released! Check Actions for deployment status.",
     "build": "turbo run build",
     "start": "turbo run start",
     "start:debug": "turbo run start:debug",
@@ -53,10 +53,11 @@
     "cursor:forward:status": "node bin/agent-vibes forward status",
     "antigravity:sync": "node bin/agent-vibes sync",
     "codex:sync": "node bin/agent-vibes sync --codex",
-    "antigravity:capture:start": "sudo node scripts/capture/capture.js start",
-    "antigravity:capture:stop": "sudo node scripts/capture/capture.js stop",
-    "antigravity:capture:status": "sudo node scripts/capture/capture.js status",
-    "issues": "node bin/agent-vibes issues"
+    "antigravity:capture:start": "node bin/agent-vibes capture start",
+    "antigravity:capture:stop": "node bin/agent-vibes capture stop",
+    "antigravity:capture:status": "node bin/agent-vibes capture status",
+    "issues": "node bin/agent-vibes issues",
+    "deploy:sync": "node bin/agent-vibes sync --deploy"
   },
   "devDependencies": {
     "@commitlint/cli": "^20.1.0",

@@ -59,6 +59,7 @@ export interface CodexAuthBundle {
 }
 
 interface JWTClaims {
+  exp?: number
   sub?: string
   email?: string
   organizations?: Array<{ id: string; is_default?: boolean }>
@@ -259,9 +260,12 @@ export class CodexAuthService {
    */
   async refreshTokensWithRetry(
     refreshToken: string,
-    maxRetries: number = 3
+    maxRetries: number = 3,
+    options?: { persist?: boolean; updateState?: boolean }
   ): Promise<CodexTokenData> {
     let lastError: Error | null = null
+    const persist = options?.persist ?? true
+    const updateState = options?.updateState ?? true
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (attempt > 0) {
@@ -270,9 +274,17 @@ export class CodexAuthService {
 
       try {
         const tokenData = await this.refreshTokens(refreshToken)
-        this.tokenData = tokenData
-        this.lastRefresh = new Date().toISOString()
-        this.persistTokens()
+        const refreshedAt = new Date().toISOString()
+        if (updateState) {
+          this.tokenData = tokenData
+          this.lastRefresh = refreshedAt
+        }
+        if (persist) {
+          this.persistTokens(
+            tokenData,
+            updateState ? this.lastRefresh : refreshedAt
+          )
+        }
         return tokenData
       } catch (e) {
         lastError = e as Error
@@ -354,10 +366,24 @@ export class CodexAuthService {
     return this.tokenData
   }
 
-  isTokenExpired(): boolean {
-    if (!this.tokenData?.expire) return true
+  getTokenExpiryFromJwt(token: string): string | null {
+    const claims = this.parseJWTToken(token)
+    if (!claims) {
+      return null
+    }
+
+    const exp = claims.exp
+    if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= 0) {
+      return null
+    }
+
+    return new Date(exp * 1000).toISOString()
+  }
+
+  isTokenExpired(tokenData: CodexTokenData | null = this.tokenData): boolean {
+    if (!tokenData?.expire) return true
     try {
-      const expireDate = new Date(this.tokenData.expire)
+      const expireDate = new Date(tokenData.expire)
       return Date.now() > expireDate.getTime() - 30_000
     } catch {
       return true
@@ -368,8 +394,18 @@ export class CodexAuthService {
     return this.tokenData?.accountId || ""
   }
 
+  getAccountIdFromTokenData(tokenData: CodexTokenData | null): string {
+    return tokenData?.accountId || ""
+  }
+
   getPlanType(): CodexModelTier | null {
-    return this.getPlanTypeFromIdToken(this.tokenData?.idToken || "")
+    return this.getPlanTypeFromTokenData(this.tokenData)
+  }
+
+  getPlanTypeFromTokenData(
+    tokenData: CodexTokenData | null
+  ): CodexModelTier | null {
+    return this.getPlanTypeFromIdToken(tokenData?.idToken || "")
   }
 
   getPlanTypeFromIdToken(idToken: string): CodexModelTier | null {
@@ -397,13 +433,17 @@ export class CodexAuthService {
     this.lastRefresh = new Date().toISOString()
   }
 
+  persistTokenData(tokenData: CodexTokenData, lastRefresh?: string): void {
+    this.persistTokens(tokenData, lastRefresh || new Date().toISOString())
+  }
+
   /**
    * Ensure we have a valid access token, refreshing if needed.
    */
   async ensureValidToken(): Promise<string | null> {
     if (!this.tokenData) return null
 
-    if (this.isTokenExpired() && this.tokenData.refreshToken) {
+    if (this.isTokenExpired(this.tokenData) && this.tokenData.refreshToken) {
       this.logger.log("Access token expired, refreshing...")
       try {
         await this.refreshTokensWithRetry(this.tokenData.refreshToken)
@@ -423,8 +463,11 @@ export class CodexAuthService {
    * Persist current token data to disk so it survives process restarts.
    * Ported from: internal/auth/codex/token.go SaveTokenToFile()
    */
-  private persistTokens(): void {
-    if (!this.tokenData) return
+  private persistTokens(
+    tokenData: CodexTokenData | null = this.tokenData,
+    lastRefresh: string = this.lastRefresh
+  ): void {
+    if (!tokenData) return
 
     try {
       const dir = path.dirname(TOKEN_FILE_PATH)
@@ -432,13 +475,13 @@ export class CodexAuthService {
 
       const payload = {
         type: "codex",
-        id_token: this.tokenData.idToken,
-        access_token: this.tokenData.accessToken,
-        refresh_token: this.tokenData.refreshToken,
-        account_id: this.tokenData.accountId,
-        email: this.tokenData.email,
-        expire: this.tokenData.expire,
-        last_refresh: this.lastRefresh,
+        id_token: tokenData.idToken,
+        access_token: tokenData.accessToken,
+        refresh_token: tokenData.refreshToken,
+        account_id: tokenData.accountId,
+        email: tokenData.email,
+        expire: tokenData.expire,
+        last_refresh: lastRefresh,
       }
 
       // Atomic write: write to .tmp then rename to prevent partial writes

@@ -150,13 +150,7 @@ Verify everything is working:
 agent-vibes forward status
 ```
 
-> **Tip:** When Cursor is using GPT / O-series / Codex models through the
-> Codex backend, normal thinking loads the standard reasoning tier. To load
-> the highest Codex tier, enable `Thinking` and `Max mode` together.
-
 ### Environment Variables
-
-Zero-config for local dev. For server deployment, configure in `apps/protocol-bridge/.env.local`:
 
 | Variable               | Default              | Description                      |
 | ---------------------- | -------------------- | -------------------------------- |
@@ -167,50 +161,41 @@ Zero-config for local dev. For server deployment, configure in `apps/protocol-br
 
 ## Codex Backend (GPT / O-series Models)
 
-Use this when you want GPT, O-series, or Codex models.
-
-You can connect the Codex backend in three ways:
-
-- Sync local Codex CLI / ChatGPT auth
-- Set an official OpenAI API key directly
-- Set a third-party Codex-compatible API key with a custom base URL
-
-**Option 1: sync Codex CLI auth**
-
 ```bash
+# Login and sync (supports multiple accounts / team workspaces, sync after each login to add)
+codex --login
 agent-vibes sync --codex
-# or
-npm run codex:sync
-```
 
-**Option 2: set an API key directly**
-
-Set `CODEX_API_KEY` in `apps/protocol-bridge/.env.local`.
-
-**Option 3: use a third-party Codex-compatible key**
-
-Set both `CODEX_BASE_URL` and `CODEX_API_KEY` in `apps/protocol-bridge/.env.local`:
-
-```dotenv
-CODEX_BASE_URL=https://example.com/codex
-CODEX_API_KEY=sk-xxx
-```
-
-`CODEX_BASE_URL` should point to the parent Codex / Responses path. Do not include `/responses` at the end, because Agent Vibes appends it automatically.
-
-> **Note:** If `OPENAI_COMPAT_BASE_URL` and `OPENAI_COMPAT_API_KEY` are also
-> configured, GPT / O-series requests are routed to the OpenAI-compatible
-> backend first. Otherwise they use the Codex backend.
-
-Then start the proxy:
-
-```bash
+# Start proxy
 agent-vibes
 ```
 
-After that, select any GPT / O-series / Codex model from Claude Code CLI or Cursor.
+Multiple accounts are automatically rotated. When quota is exhausted, the system automatically switches to the next available account.
 
-In Cursor, the highest Codex reasoning tier is loaded through `Thinking + Max mode`.
+## OpenAI-Compatible Backend (Third-party GPT APIs)
+
+Add accounts to `apps/protocol-bridge/data/openai-compat-accounts.json` (supports multi-account rotation):
+
+```json
+{
+  "accounts": [
+    {
+      "label": "provider-1",
+      "baseUrl": "https://a.example.com/v1",
+      "apiKey": "sk-xxx"
+    },
+    {
+      "label": "provider-2",
+      "baseUrl": "https://b.example.com/v1",
+      "apiKey": "sk-yyy"
+    }
+  ]
+}
+```
+
+When both OpenAI-compatible and Codex backends are configured,
+GPT / O-series requests are routed to the OpenAI-compatible backend first.
+When quota is exhausted, the system automatically switches to the next available account.
 
 ## Project Structure
 
@@ -264,7 +249,7 @@ agent-vibes/
 │       │   └── gen/                           # Auto-generated protobuf (DO NOT edit)
 │       │
 │       ├── proto/                             # Protobuf definitions (protocol-compatible, local only)
-│       └── data/                              # Antigravity OAuth accounts
+│       └── data/                              # Per-backend credential pools (JSON)
 ├── packages/
 │   ├── eslint-config/                         # Shared ESLint config
 │   ├── prettier-config/                       # Shared Prettier config
@@ -317,12 +302,14 @@ npm run cursor:forward:status  # Show forwarding status
 
 If Cursor is installed in a non-standard location, set `CURSOR_BINARY_PATH`, `CURSOR_WORKBENCH_PATH`, or `CURSOR_APP_ROOT` for the tooling scripts.
 
-### Deployment
+### Credential Sync & Deployment
 
 ```bash
+npm run antigravity:sync       # Sync Antigravity accounts → data/antigravity-accounts.json
+npm run codex:sync             # Sync Codex CLI auth → data/codex-accounts.json
+npm run deploy:sync            # Upload all credentials to GitHub Secrets
+npm run deploy:sync -- --run   # Upload + trigger CI/CD deployment
 npm run release                # Merge dev → main → push (triggers CI deploy)
-npm run antigravity:sync       # Sync Antigravity OAuth accounts to ANTIGRAVITY_STORAGE
-npm run codex:sync             # Sync Codex CLI auth.json into CODEX_* env vars
 ```
 
 ### Diagnostics

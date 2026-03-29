@@ -24,6 +24,24 @@ jobs:
         working-directory: apps/protocol-bridge
         run: npm install --ignore-scripts
 
+      - name: Restore credentials from secrets
+        working-directory: apps/protocol-bridge
+        run: |
+          mkdir -p data
+          if [ -n "$ANTIGRAVITY_ACCOUNTS" ]; then
+            printf "%s" "$ANTIGRAVITY_ACCOUNTS" > data/antigravity-accounts.json
+          fi
+          if [ -n "$CODEX_ACCOUNTS" ]; then
+            printf "%s" "$CODEX_ACCOUNTS" > data/codex-accounts.json
+          fi
+          if [ -n "$OPENAI_COMPAT_ACCOUNTS" ]; then
+            printf "%s" "$OPENAI_COMPAT_ACCOUNTS" > data/openai-compat-accounts.json
+          fi
+        env:
+          ANTIGRAVITY_ACCOUNTS: ${{ secrets.ANTIGRAVITY_ACCOUNTS }}
+          CODEX_ACCOUNTS: ${{ secrets.CODEX_ACCOUNTS }}
+          OPENAI_COMPAT_ACCOUNTS: ${{ secrets.OPENAI_COMPAT_ACCOUNTS }}
+
       - name: Build
         working-directory: apps/protocol-bridge
         run: npm run build

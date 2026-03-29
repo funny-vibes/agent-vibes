@@ -60,15 +60,15 @@ function cursorWorkbenchPath() {
     candidates.push(
       path.join("/usr/share/cursor", suffix),
       path.join("/opt/cursor", suffix),
-      path.join(os.homedir(), ".local/share/cursor", suffix),
+      path.join(os.homedir(), ".local", "share", "cursor", suffix),
       // Snap / Flatpak / AppImage extracted
       path.join("/snap/cursor/current", suffix)
     )
   } else if (PLATFORM === "win32") {
     const localAppData =
-      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData/Local")
+      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local")
     candidates.push(
-      path.join(localAppData, "Programs/cursor", suffix),
+      path.join(localAppData, "Programs", "cursor", suffix),
       path.join(localAppData, "cursor", suffix)
     )
   }
@@ -94,7 +94,9 @@ function cursorBinaryPath() {
         os.homedir(),
         "Applications",
         "Cursor.app",
-        "Contents/MacOS/Cursor"
+        "Contents",
+        "MacOS",
+        "Cursor"
       ),
     ]
     return firstExistingPath(candidates) || candidates[0]
@@ -105,9 +107,9 @@ function cursorBinaryPath() {
   }
   if (PLATFORM === "win32") {
     const localAppData =
-      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData/Local")
+      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local")
     const candidates = [
-      path.join(localAppData, "Programs/cursor/Cursor.exe"),
+      path.join(localAppData, "Programs", "cursor", "Cursor.exe"),
       path.join(localAppData, "cursor", "Cursor.exe"),
     ]
     return firstExistingPath(candidates) || candidates[0]
@@ -126,18 +128,34 @@ function ideDataDir() {
   if (PLATFORM === "darwin") {
     return path.join(
       os.homedir(),
-      "Library/Application Support/Antigravity/User/globalStorage"
+      "Library",
+      "Application Support",
+      "Antigravity",
+      "User",
+      "globalStorage"
     )
   }
   if (PLATFORM === "linux") {
-    return path.join(os.homedir(), ".config/Antigravity/User/globalStorage")
+    return path.join(
+      os.homedir(),
+      ".config",
+      "Antigravity",
+      "User",
+      "globalStorage"
+    )
   }
   if (PLATFORM === "win32") {
     const appData =
-      process.env.APPDATA || path.join(os.homedir(), "AppData/Roaming")
-    return path.join(appData, "Antigravity/User/globalStorage")
+      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+    return path.join(appData, "Antigravity", "User", "globalStorage")
   }
-  return path.join(os.homedir(), ".config/Antigravity/User/globalStorage")
+  return path.join(
+    os.homedir(),
+    ".config",
+    "Antigravity",
+    "User",
+    "globalStorage"
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -151,14 +169,14 @@ function clashConfigDir() {
   const dirName = "io.github.clash-verge-rev.clash-verge-rev"
 
   if (PLATFORM === "darwin") {
-    return path.join(os.homedir(), "Library/Application Support", dirName)
+    return path.join(os.homedir(), "Library", "Application Support", dirName)
   }
   if (PLATFORM === "linux") {
     return path.join(os.homedir(), ".config", dirName)
   }
   if (PLATFORM === "win32") {
     const appData =
-      process.env.APPDATA || path.join(os.homedir(), "AppData/Roaming")
+      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
     return path.join(appData, dirName)
   }
   return path.join(os.homedir(), ".config", dirName)
@@ -224,9 +242,9 @@ function mitmdumpCandidates() {
   }
   if (PLATFORM === "win32") {
     const localAppData =
-      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData/Local")
+      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local")
     return [
-      path.join(localAppData, "Programs/Python/Scripts/mitmdump.exe"),
+      path.join(localAppData, "Programs", "Python", "Scripts", "mitmdump.exe"),
       "C:\\Python312\\Scripts\\mitmdump.exe",
       "C:\\Python311\\Scripts\\mitmdump.exe",
     ]

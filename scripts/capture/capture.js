@@ -17,7 +17,7 @@
 const fs = require("node:fs")
 const path = require("node:path")
 const http = require("node:http")
-const { spawnSync } = require("node:child_process")
+const { spawn, spawnSync } = require("node:child_process")
 
 const SCRIPT_DIR = __dirname
 const MITM_PORT = 10444
@@ -34,10 +34,44 @@ const CLASH_SOCKET_DEFAULT = "/tmp/verge/verge-mihomo.sock"
 
 let mitmdumpBin = null
 
-function runBash(cmd, ok = false) {
-  const r = spawnSync("bash", ["-lc", cmd], { stdio: "inherit" })
+/**
+ * Cross-platform shell command executor.
+ * Uses bash on Unix, cmd on Windows.
+ */
+function runShell(cmd, ok = false) {
+  const isWin = platform.PLATFORM === "win32"
+  const shell = isWin ? "cmd" : "bash"
+  const shellArgs = isWin ? ["/c", cmd] : ["-lc", cmd]
+  const r = spawnSync(shell, shellArgs, { stdio: "inherit" })
   if (r.status !== 0 && !ok) process.exit(r.status ?? 1)
   return r
+}
+
+/**
+ * Cross-platform shell command executor that captures output.
+ */
+function runShellCapture(cmd, ok = false) {
+  const isWin = platform.PLATFORM === "win32"
+  const shell = isWin ? "cmd" : "bash"
+  const shellArgs = isWin ? ["/c", cmd] : ["-lc", cmd]
+  const r = spawnSync(shell, shellArgs, { encoding: "utf-8", stdio: "pipe" })
+  if (r.status !== 0 && !ok) process.exit(r.status ?? 1)
+  return (r.stdout || "").trim()
+}
+
+function runCapture(command, args, ok = false) {
+  const r = spawnSync(command, args, { encoding: "utf-8", stdio: "pipe" })
+  if (r.error && !ok) {
+    console.error(r.error.message)
+    process.exit(1)
+  }
+  if ((r.status ?? 1) !== 0 && !ok) process.exit(r.status ?? 1)
+  return {
+    error: r.error,
+    status: r.status ?? (r.error ? 1 : 0),
+    stdout: (r.stdout || "").trim(),
+    stderr: (r.stderr || "").trim(),
+  }
 }
 
 /**
@@ -59,6 +93,7 @@ function readClashSecret() {
 
 /**
  * Resolve the Clash external controller Unix socket path from config.yaml.
+ * Used on macOS/Linux. Falls back to CLASH_SOCKET_DEFAULT.
  */
 function readClashSocket() {
   try {
@@ -75,83 +110,142 @@ function readClashSocket() {
 }
 
 /**
- * Reload Clash config via external controller API (Unix socket).
- * PUT /configs?force=true triggers a full profile reload.
+ * Resolve the Clash external controller TCP address from config.yaml.
+ * Used on Windows, or as fallback on other platforms.
+ * Returns { host, port } or null.
  */
-function reloadClash() {
-  const configPath = path.join(CLASH_DIR, "config.yaml")
+function readClashTcpController() {
+  try {
+    const configPath = path.join(CLASH_DIR, "config.yaml")
+    const content = fs.readFileSync(configPath, "utf-8")
+    for (const line of content.split("\n")) {
+      const m = line.match(/^external-controller:\s*(.+)/)
+      if (m) {
+        const addr = m[1].trim().replace(/^['"]|['"]$/g, "")
+        if (!addr) continue
+        // Parse host:port (e.g., "127.0.0.1:9097" or ":9090")
+        const colonIdx = addr.lastIndexOf(":")
+        if (colonIdx === -1) continue
+        const host = addr.slice(0, colonIdx) || "127.0.0.1"
+        const port = parseInt(addr.slice(colonIdx + 1), 10)
+        if (!isNaN(port)) return { host, port }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null
+}
+
+/**
+ * Make an HTTP request to the Clash API.
+ * On macOS/Linux: prefers Unix socket, falls back to TCP.
+ * On Windows: uses TCP only.
+ */
+function clashApiRequest(method, apiPath, body = null) {
   const secret = readClashSecret()
-  const socketPath = readClashSocket()
-  const body = JSON.stringify({ path: configPath })
+  const headers = { "Content-Type": "application/json" }
+  if (secret) headers["Authorization"] = `Bearer ${secret}`
 
   return new Promise((resolve) => {
-    const headers = { "Content-Type": "application/json" }
-    if (secret) headers["Authorization"] = `Bearer ${secret}`
+    function doRequest(opts) {
+      const req = http.request(opts, (res) => {
+        let data = ""
+        res.on("data", (chunk) => (data += chunk))
+        res.on("end", () => resolve({ statusCode: res.statusCode, data }))
+      })
+      req.on("error", (err) => resolve({ statusCode: 0, error: err.message }))
+      if (body)
+        req.write(typeof body === "string" ? body : JSON.stringify(body))
+      req.end()
+    }
 
-    const req = http.request(
-      {
-        socketPath,
-        path: "/configs?force=true",
-        method: "PUT",
+    // Windows: TCP only
+    if (platform.PLATFORM === "win32") {
+      const tcp = readClashTcpController()
+      if (!tcp) {
+        resolve({
+          statusCode: 0,
+          error: "No TCP external-controller configured",
+        })
+        return
+      }
+      doRequest({
+        hostname: tcp.host,
+        port: tcp.port,
+        path: apiPath,
+        method,
         headers,
-      },
+      })
+      return
+    }
+
+    // macOS/Linux: try Unix socket first, fall back to TCP
+    const socketPath = readClashSocket()
+    const socketReq = http.request(
+      { socketPath, path: apiPath, method, headers },
       (res) => {
         let data = ""
         res.on("data", (chunk) => (data += chunk))
-        res.on("end", () => {
-          if (res.statusCode === 204 || res.statusCode === 200) {
-            console.log("✓ Clash config reloaded via API")
-          } else {
-            console.log(
-              `⚠ Clash API returned ${res.statusCode}: ${data.trim() || "(empty)"}`
-            )
-            console.log("  Please restart Clash Verge manually.")
-          }
-          resolve()
-        })
+        res.on("end", () => resolve({ statusCode: res.statusCode, data }))
       }
     )
-    req.on("error", (err) => {
-      console.log(`⚠ Cannot reach Clash API: ${err.message}`)
-      console.log("  Please restart Clash Verge manually.")
-      resolve()
+    socketReq.on("error", () => {
+      // Socket failed, try TCP fallback
+      const tcp = readClashTcpController()
+      if (!tcp) {
+        resolve({
+          statusCode: 0,
+          error: "Cannot reach Clash API (no socket or TCP controller)",
+        })
+        return
+      }
+      doRequest({
+        hostname: tcp.host,
+        port: tcp.port,
+        path: apiPath,
+        method,
+        headers,
+      })
     })
-    req.write(body)
-    req.end()
+    if (body)
+      socketReq.write(typeof body === "string" ? body : JSON.stringify(body))
+    socketReq.end()
   })
 }
 
 /**
- * Fetch Clash runtime rules via API (Unix socket).
+ * Reload Clash config via external controller API.
+ */
+function reloadClash() {
+  const configPath = path.join(CLASH_DIR, "config.yaml")
+  return clashApiRequest("PUT", "/configs?force=true", {
+    path: configPath,
+  }).then((res) => {
+    if (res.statusCode === 204 || res.statusCode === 200) {
+      console.log("✓ Clash config reloaded via API")
+    } else if (res.error) {
+      console.log(`⚠ Cannot reach Clash API: ${res.error}`)
+      console.log("  Please restart Clash Verge manually.")
+    } else {
+      console.log(
+        `⚠ Clash API returned ${res.statusCode}: ${(res.data || "").trim() || "(empty)"}`
+      )
+      console.log("  Please restart Clash Verge manually.")
+    }
+  })
+}
+
+/**
+ * Fetch Clash runtime rules via API.
  */
 function fetchClashRules() {
-  const secret = readClashSecret()
-  const socketPath = readClashSocket()
-  return new Promise((resolve) => {
-    const headers = {}
-    if (secret) headers["Authorization"] = `Bearer ${secret}`
-
-    const req = http.request(
-      {
-        socketPath,
-        path: "/rules",
-        method: "GET",
-        headers,
-      },
-      (res) => {
-        let data = ""
-        res.on("data", (chunk) => (data += chunk))
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data))
-          } catch {
-            resolve(null)
-          }
-        })
-      }
-    )
-    req.on("error", () => resolve(null))
-    req.end()
+  return clashApiRequest("GET", "/rules").then((res) => {
+    try {
+      return JSON.parse(res.data || "null")
+    } catch {
+      return null
+    }
   })
 }
 
@@ -177,6 +271,54 @@ function resolveMitmdump() {
   }
   console.error("mitmdump not found. Install mitmproxy for your platform.")
   process.exit(1)
+}
+
+function parseWindowsProcessList(raw) {
+  return raw
+    .split(/\r?\n\r?\n+/)
+    .map((block) => {
+      const fields = {}
+      for (const line of block.split(/\r?\n/)) {
+        const trimmed = line.trim()
+        if (!trimmed || !trimmed.includes("=")) continue
+        const idx = trimmed.indexOf("=")
+        fields[trimmed.slice(0, idx)] = trimmed.slice(idx + 1).trim()
+      }
+      const pid = parseInt(fields.ProcessId, 10)
+      if (isNaN(pid)) return null
+      return {
+        Name: fields.Name || "unknown",
+        ProcessId: pid,
+      }
+    })
+    .filter(Boolean)
+}
+
+function queryWindowsProcesses(whereClause) {
+  if (platform.PLATFORM !== "win32") return []
+  const result = runCapture(
+    "wmic",
+    ["process", "where", whereClause, "get", "ProcessId,Name", "/format:list"],
+    true
+  )
+  if (result.error || result.status !== 0) return []
+  return parseWindowsProcessList(result.stdout)
+}
+
+function getManagedWindowsMitmdumpProcesses() {
+  return queryWindowsProcesses("CommandLine like '%mitmdump%capture-traffic%'")
+}
+
+function printWindowsProcessStatus(label, processes) {
+  if (processes.length === 0) {
+    console.log(`  ${label}: not running`)
+    return
+  }
+
+  console.log(`  ${label}:`)
+  for (const proc of processes) {
+    console.log(`    ${proc.Name} (pid ${proc.ProcessId})`)
+  }
 }
 
 /**
@@ -332,7 +474,6 @@ async function cmdStart() {
   console.log("")
   console.log("Starting mitmdump on port " + MITM_PORT + "...")
 
-  const { spawn } = require("node:child_process")
   const mitmProc = spawn(
     mitmdump,
     [
@@ -406,8 +547,15 @@ async function cmdStart() {
 }
 
 async function cmdStop() {
-  // Kill mitmdump
-  runBash('pkill -f "mitmdump.*capture-traffic" 2>/dev/null', true)
+  // Kill mitmdump (cross-platform)
+  if (platform.PLATFORM === "win32") {
+    const processes = getManagedWindowsMitmdumpProcesses()
+    for (const proc of processes) {
+      runShell(`taskkill /F /PID ${proc.ProcessId} >nul 2>&1`, true)
+    }
+  } else {
+    runShell('pkill -f "mitmdump.*capture-traffic" 2>/dev/null', true)
+  }
 
   // Restore original script
   const scriptPath = findScriptFile()
@@ -459,24 +607,43 @@ async function cmdStatus() {
   }
 
   console.log("\nProcesses:")
-  runBash(
-    "echo -n '  mitmdump: '; pgrep -fl 'mitmdump.*capture-traffic' || echo 'not running'",
-    true
-  )
-  runBash(
-    "echo -n '  clash:    '; pgrep -fl 'verge-mihomo|mihomo' | head -1 || echo 'not running'",
-    true
-  )
+  if (platform.PLATFORM === "win32") {
+    printWindowsProcessStatus("mitmdump", getManagedWindowsMitmdumpProcesses())
+    printWindowsProcessStatus(
+      "clash",
+      queryWindowsProcesses("Name like '%mihomo%'")
+    )
+  } else {
+    runShell(
+      "echo -n '  mitmdump: '; pgrep -fl 'mitmdump.*capture-traffic' || echo 'not running'",
+      true
+    )
+    runShell(
+      "echo -n '  clash:    '; pgrep -fl 'verge-mihomo|mihomo' | head -1 || echo 'not running'",
+      true
+    )
+  }
 
   console.log("\nPorts:")
-  runBash(
-    "echo -n '  " +
-      MITM_PORT +
-      " (mitm):  '; lsof -nP -iTCP:" +
-      MITM_PORT +
-      " -sTCP:LISTEN 2>/dev/null | tail -1 || echo '-'",
-    true
-  )
+  if (platform.PLATFORM === "win32") {
+    runShell(
+      "echo   " +
+        MITM_PORT +
+        ' (mitm):  & (netstat -an | findstr ":' +
+        MITM_PORT +
+        '.*LISTENING" || echo -)',
+      true
+    )
+  } else {
+    runShell(
+      "echo -n '  " +
+        MITM_PORT +
+        " (mitm):  '; lsof -nP -iTCP:" +
+        MITM_PORT +
+        " -sTCP:LISTEN 2>/dev/null | tail -1 || echo '-'",
+      true
+    )
+  }
 }
 
 switch (process.argv[2]) {

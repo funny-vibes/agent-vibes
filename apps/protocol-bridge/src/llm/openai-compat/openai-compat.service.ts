@@ -13,6 +13,8 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
+import * as fs from "fs"
+import * as path from "path"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import { translateClaudeToCodex } from "../codex/codex-request-translator"
@@ -22,6 +24,13 @@ import {
   translateCodexToClaudeNonStream,
 } from "../codex/codex-response-translator"
 import { buildReverseMapFromClaudeTools } from "../codex/tool-name-shortener"
+import {
+  type CooldownableAccount,
+  markAccountCooldown,
+  markAccountSuccess,
+  pickAvailableAccount,
+  getEarliestRecovery,
+} from "../shared/account-cooldown"
 
 // ── Types for OpenAI Chat Completions API ──────────────────────────────
 
@@ -349,13 +358,21 @@ function formatSseEvent(event: string, data: Record<string, unknown>): string {
 
 // ── Service ────────────────────────────────────────────────────────────
 
+interface OpenaiCompatAccount extends CooldownableAccount {
+  label?: string
+  apiKey: string
+  baseUrl: string
+  proxyUrl?: string
+}
+
 @Injectable()
 export class OpenaiCompatService implements OnModuleInit {
   private readonly logger = new Logger(OpenaiCompatService.name)
 
-  private apiKey = ""
-  private baseUrl = ""
-  private proxyUrl = ""
+  /** All loaded accounts (round-robin pool) */
+  private accounts: OpenaiCompatAccount[] = []
+  /** Round-robin counter */
+  private accountIndex = 0
 
   /**
    * Responses API routing mode:
@@ -379,15 +396,39 @@ export class OpenaiCompatService implements OnModuleInit {
   constructor(private readonly configService: ConfigService) {}
 
   onModuleInit() {
-    this.apiKey = this.configService
+    // 1. Load from JSON file (all accounts)
+    const fileAccounts = this.loadAllAccountsFromFile()
+    if (fileAccounts.length > 0) {
+      this.accounts = fileAccounts
+    }
+
+    // 2. Env vars as fallback / additional account
+    const envApiKey = this.configService
       .get<string>("OPENAI_COMPAT_API_KEY", "")
       .trim()
-    this.baseUrl = this.configService
+    const envBaseUrl = this.configService
       .get<string>("OPENAI_COMPAT_BASE_URL", "")
       .trim()
-    this.proxyUrl = this.configService
+    const envProxyUrl = this.configService
       .get<string>("OPENAI_COMPAT_PROXY_URL", "")
       .trim()
+
+    if (envApiKey && envBaseUrl) {
+      // Only add env account if it's not already in the list
+      const alreadyExists = this.accounts.some(
+        (a) => a.apiKey === envApiKey && a.baseUrl === envBaseUrl
+      )
+      if (!alreadyExists) {
+        this.accounts.unshift({
+          label: "env",
+          apiKey: envApiKey,
+          baseUrl: envBaseUrl,
+          proxyUrl: envProxyUrl || undefined,
+          cooldownUntil: 0,
+          modelStates: new Map(),
+        })
+      }
+    }
 
     // Responses API routing mode
     const responsesApiEnv = this.configService
@@ -410,25 +451,109 @@ export class OpenaiCompatService implements OnModuleInit {
       this.responsesApiMode = "auto"
     }
 
-    const hasCredentials = !!(this.apiKey && this.baseUrl)
     this.logger.log(
-      `OpenAI-compatible backend initialized: baseUrl=${this.baseUrl || "(none)"}, ` +
-        `hasApiKey=${!!this.apiKey}, hasProxy=${!!this.proxyUrl}, ` +
+      `OpenAI-compatible backend initialized: ${this.accounts.length} account(s), ` +
         `responsesApiMode=${this.responsesApiMode}`
     )
-    if (!hasCredentials) {
+    for (const acct of this.accounts) {
+      this.logger.log(
+        `  → ${acct.label || "unnamed"}: ${acct.baseUrl} (key: ${acct.apiKey.substring(0, 8)}...)`
+      )
+    }
+    if (this.accounts.length === 0) {
       this.logger.log(
         "No OpenAI-compatible credentials configured. " +
-          "Set OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY to enable."
+          "Add entries to data/openai-compat-accounts.json to enable."
       )
     }
   }
 
   /**
-   * Check if the backend is available (has credentials configured).
+   * Load all accounts from openai-compat-accounts.json.
+   */
+  private loadAllAccountsFromFile(): OpenaiCompatAccount[] {
+    const configPaths = [
+      path.resolve("data/openai-compat-accounts.json"),
+      path.resolve("apps/protocol-bridge/data/openai-compat-accounts.json"),
+    ]
+
+    for (const configPath of configPaths) {
+      if (!fs.existsSync(configPath)) continue
+
+      try {
+        const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
+          accounts?: Array<Record<string, string>>
+        }
+        if (Array.isArray(data.accounts) && data.accounts.length > 0) {
+          this.logger.log(
+            `Loaded ${data.accounts.length} OpenAI-compat account(s) from ${configPath}`
+          )
+          return data.accounts
+            .filter(
+              (
+                a
+              ): a is Record<string, string> & {
+                apiKey: string
+                baseUrl: string
+              } =>
+                typeof a.apiKey === "string" &&
+                !!a.apiKey &&
+                typeof a.baseUrl === "string" &&
+                !!a.baseUrl
+            )
+            .map((a) => ({
+              label: a.label,
+              apiKey: a.apiKey,
+              baseUrl: a.baseUrl,
+              proxyUrl: a.proxyUrl,
+              cooldownUntil: 0,
+              modelStates: new Map(),
+            }))
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Failed to parse ${configPath}: ${(err as Error).message}`
+        )
+      }
+    }
+
+    return []
+  }
+
+  /**
+   * Round-robin: pick the next available account, respecting cooldowns.
+   * Falls back to blind round-robin if no model is provided or only 1 account.
+   * Throws when all accounts are in cooldown (prevents retrying known-bad accounts).
+   */
+  private nextAccount(model?: string): OpenaiCompatAccount {
+    if (model && this.accounts.length > 1) {
+      const result = pickAvailableAccount(
+        this.accounts,
+        model,
+        this.accountIndex
+      )
+      if (result) {
+        this.accountIndex = (result.index + 1) % this.accounts.length
+        return result.account
+      }
+      // All accounts in cooldown — fail fast instead of hitting a known-bad account
+      const info = getEarliestRecovery(this.accounts, model)
+      const retrySeconds = info ? Math.ceil(info.retryAfterMs / 1000) : 60
+      throw new Error(
+        `All OpenAI-compat accounts are rate-limited for model ${model}. ` +
+          `Retry after ${retrySeconds} seconds.`
+      )
+    }
+    const acct = this.accounts[this.accountIndex % this.accounts.length]!
+    this.accountIndex = (this.accountIndex + 1) % this.accounts.length
+    return acct
+  }
+
+  /**
+   * Check if the backend is available (has at least one account configured).
    */
   isAvailable(): boolean {
-    return !!(this.apiKey && this.baseUrl)
+    return this.accounts.length > 0
   }
 
   /**
@@ -440,15 +565,16 @@ export class OpenaiCompatService implements OnModuleInit {
 
   // ── Proxy agent ──────────────────────────────────────────────────────
 
-  private buildProxyAgent(): import("undici").ProxyAgent | undefined {
-    if (!this.proxyUrl) return undefined
+  private buildProxyAgentForAccount(
+    account: OpenaiCompatAccount
+  ): import("undici").ProxyAgent | undefined {
+    if (!account.proxyUrl) return undefined
 
     try {
-      // Validate the URL
-      new URL(this.proxyUrl)
+      new URL(account.proxyUrl)
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { ProxyAgent } = require("undici") as typeof import("undici")
-      return new ProxyAgent(this.proxyUrl)
+      return new ProxyAgent(account.proxyUrl)
     } catch (e) {
       this.logger.error(`Failed to create proxy agent: ${(e as Error).message}`)
       return undefined
@@ -774,8 +900,9 @@ export class OpenaiCompatService implements OnModuleInit {
       throw new Error("OpenAI-compatible backend not configured")
     }
 
-    const url = this.buildUrl()
-    const headers = this.buildHeaders(true)
+    const account = this.nextAccount(model)
+    const url = this.buildUrlForAccount(account)
+    const headers = this.buildHeadersForAccount(account, true)
     const body: ChatCompletionRequest = {
       model,
       messages,
@@ -790,7 +917,7 @@ export class OpenaiCompatService implements OnModuleInit {
       headers,
       body: JSON.stringify(body),
     }
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgentForAccount(account)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -846,12 +973,12 @@ export class OpenaiCompatService implements OnModuleInit {
 
   // ── URL builder ──────────────────────────────────────────────────────
 
-  private buildUrl(): string {
-    return `${this.baseUrl.replace(/\/+$/, "")}/chat/completions`
+  private buildUrlForAccount(account: OpenaiCompatAccount): string {
+    return `${account.baseUrl.replace(/\/+$/, "")}/chat/completions`
   }
 
-  private buildResponsesUrl(): string {
-    return `${this.baseUrl.replace(/\/+$/, "")}/responses`
+  private buildResponsesUrlForAccount(account: OpenaiCompatAccount): string {
+    return `${account.baseUrl.replace(/\/+$/, "")}/responses`
   }
 
   /**
@@ -927,10 +1054,13 @@ export class OpenaiCompatService implements OnModuleInit {
 
   // ── Headers ──────────────────────────────────────────────────────────
 
-  private buildHeaders(stream: boolean): Record<string, string> {
+  private buildHeadersForAccount(
+    account: OpenaiCompatAccount,
+    stream: boolean
+  ): Record<string, string> {
     return {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${this.apiKey}`,
+      Authorization: `Bearer ${account.apiKey}`,
       Accept: stream ? "text/event-stream" : "application/json",
       "User-Agent":
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -950,10 +1080,15 @@ export class OpenaiCompatService implements OnModuleInit {
     }
 
     const endpoint = this.resolveEndpoint(dto.model)
+    const account = this.nextAccount(dto.model)
 
     if (endpoint === "responses") {
       try {
-        const result = await this.sendClaudeMessageViaResponses(dto)
+        const result = await this.sendClaudeMessageViaResponses(
+          dto,
+          account,
+          this.responsesApiMode !== "always"
+        )
         this.recordEndpointSuccess(dto.model, "responses")
         return result
       } catch (e) {
@@ -967,7 +1102,11 @@ export class OpenaiCompatService implements OnModuleInit {
 
     // Try Chat Completions
     try {
-      const result = await this.sendClaudeMessageViaChatCompletions(dto)
+      const result = await this.sendClaudeMessageViaChatCompletions(
+        dto,
+        account,
+        endpoint !== "responses"
+      )
       this.recordEndpointSuccess(dto.model, "chat-completions")
       return result
     } catch (e) {
@@ -983,7 +1122,7 @@ export class OpenaiCompatService implements OnModuleInit {
         this.logger.warn(
           `[OpenAI-Compat] Chat Completions returned ${status} for ${dto.model}, falling back to Responses API`
         )
-        const result = await this.sendClaudeMessageViaResponses(dto)
+        const result = await this.sendClaudeMessageViaResponses(dto, account)
         this.recordEndpointSuccess(dto.model, "responses")
         return result
       }
@@ -995,11 +1134,13 @@ export class OpenaiCompatService implements OnModuleInit {
    * Non-streaming via Chat Completions endpoint.
    */
   private async sendClaudeMessageViaChatCompletions(
-    dto: CreateMessageDto
+    dto: CreateMessageDto,
+    account: OpenaiCompatAccount = this.nextAccount(dto.model),
+    suppressCooldownForResponsesFallback: boolean = false
   ): Promise<AnthropicResponse> {
     const request = this.translateRequest(dto, false)
-    const url = this.buildUrl()
-    const headers = this.buildHeaders(false)
+    const url = this.buildUrlForAccount(account)
+    const headers = this.buildHeadersForAccount(account, false)
 
     this.logger.log(
       `[OpenAI-Compat] Non-stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}`
@@ -1012,7 +1153,7 @@ export class OpenaiCompatService implements OnModuleInit {
       signal: AbortSignal.timeout(300_000),
     }
 
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgentForAccount(account)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -1024,12 +1165,31 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(
         `[OpenAI-Compat] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
+      if (
+        !(
+          suppressCooldownForResponsesFallback &&
+          this.shouldFallbackToResponsesApi(
+            response.status,
+            errorBody,
+            request.model
+          )
+        )
+      ) {
+        markAccountCooldown(
+          account,
+          response.status,
+          request.model,
+          response.headers.get("retry-after") || undefined,
+          account.label
+        )
+      }
       throw new Error(
         `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
       )
     }
 
     const result = (await response.json()) as Record<string, unknown>
+    markAccountSuccess(account, request.model)
     return this.translateNonStreamResponse(result)
   }
 
@@ -1137,12 +1297,15 @@ export class OpenaiCompatService implements OnModuleInit {
     }
 
     const endpoint = this.resolveEndpoint(dto.model)
+    const account = this.nextAccount(dto.model)
 
     if (endpoint === "responses") {
       let emittedResponsesEvents = false
       try {
         for await (const event of this.sendClaudeMessageStreamViaResponses(
-          dto
+          dto,
+          account,
+          this.responsesApiMode !== "always"
         )) {
           emittedResponsesEvents = true
           yield event
@@ -1163,7 +1326,9 @@ export class OpenaiCompatService implements OnModuleInit {
     let emittedChatEvents = false
     try {
       for await (const event of this.sendClaudeMessageStreamViaChatCompletions(
-        dto
+        dto,
+        account,
+        endpoint !== "responses"
       )) {
         emittedChatEvents = true
         yield event
@@ -1182,7 +1347,7 @@ export class OpenaiCompatService implements OnModuleInit {
         this.logger.warn(
           `[OpenAI-Compat] Chat Completions stream returned ${status} for ${dto.model}, falling back to Responses API`
         )
-        yield* this.sendClaudeMessageStreamViaResponses(dto)
+        yield* this.sendClaudeMessageStreamViaResponses(dto, account)
         this.recordEndpointSuccess(dto.model, "responses")
         return
       }
@@ -1194,11 +1359,13 @@ export class OpenaiCompatService implements OnModuleInit {
    * Stream via Chat Completions endpoint.
    */
   private async *sendClaudeMessageStreamViaChatCompletions(
-    dto: CreateMessageDto
+    dto: CreateMessageDto,
+    account: OpenaiCompatAccount = this.nextAccount(dto.model),
+    suppressCooldownForResponsesFallback: boolean = false
   ): AsyncGenerator<string, void, unknown> {
     const request = this.translateRequest(dto, true)
-    const url = this.buildUrl()
-    const headers = this.buildHeaders(true)
+    const url = this.buildUrlForAccount(account)
+    const headers = this.buildHeadersForAccount(account, true)
 
     this.logger.log(
       `[OpenAI-Compat] Stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}`
@@ -1211,7 +1378,7 @@ export class OpenaiCompatService implements OnModuleInit {
       signal: AbortSignal.timeout(600_000),
     }
 
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgentForAccount(account)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -1223,6 +1390,24 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(
         `[OpenAI-Compat] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
+      if (
+        !(
+          suppressCooldownForResponsesFallback &&
+          this.shouldFallbackToResponsesApi(
+            response.status,
+            errorBody,
+            request.model
+          )
+        )
+      ) {
+        markAccountCooldown(
+          account,
+          response.status,
+          request.model,
+          response.headers.get("retry-after") || undefined,
+          account.label
+        )
+      }
       throw new Error(
         `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
       )
@@ -1797,7 +1982,9 @@ export class OpenaiCompatService implements OnModuleInit {
    * sends to /responses, and translates Codex SSE → Claude SSE.
    */
   private async *sendClaudeMessageStreamViaResponses(
-    dto: CreateMessageDto
+    dto: CreateMessageDto,
+    account: OpenaiCompatAccount = this.nextAccount(dto.model),
+    suppressCooldownForChatFallback: boolean = false
   ): AsyncGenerator<string, void, unknown> {
     const modelName = dto.model
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
@@ -1807,9 +1994,8 @@ export class OpenaiCompatService implements OnModuleInit {
       string,
       unknown
     >
-
-    const url = this.buildResponsesUrl()
-    const headers = this.buildHeaders(true)
+    const url = this.buildResponsesUrlForAccount(account)
+    const headers = this.buildHeadersForAccount(account, true)
     const requestBody = JSON.stringify(codexRequest)
 
     this.logger.log(
@@ -1823,7 +2009,7 @@ export class OpenaiCompatService implements OnModuleInit {
       signal: AbortSignal.timeout(600_000),
     }
 
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgentForAccount(account)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -1835,6 +2021,15 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(
         `[OpenAI-Compat/Responses] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
+      if (!suppressCooldownForChatFallback) {
+        markAccountCooldown(
+          account,
+          response.status,
+          modelName,
+          response.headers.get("retry-after") || undefined,
+          account.label
+        )
+      }
       throw new Error(
         `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
       )
@@ -1922,7 +2117,9 @@ export class OpenaiCompatService implements OnModuleInit {
    * and translates the completed event back to Claude format.
    */
   private async sendClaudeMessageViaResponses(
-    dto: CreateMessageDto
+    dto: CreateMessageDto,
+    account: OpenaiCompatAccount = this.nextAccount(dto.model),
+    suppressCooldownForChatFallback: boolean = false
   ): Promise<AnthropicResponse> {
     const modelName = dto.model
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
@@ -1932,9 +2129,8 @@ export class OpenaiCompatService implements OnModuleInit {
       string,
       unknown
     >
-
-    const url = this.buildResponsesUrl()
-    const headers = this.buildHeaders(true) // Responses API always streams
+    const url = this.buildResponsesUrlForAccount(account)
+    const headers = this.buildHeadersForAccount(account, true) // Responses API always streams
     const requestBody = JSON.stringify(codexRequest)
 
     this.logger.log(
@@ -1948,7 +2144,7 @@ export class OpenaiCompatService implements OnModuleInit {
       signal: AbortSignal.timeout(300_000),
     }
 
-    const agent = this.buildProxyAgent()
+    const agent = this.buildProxyAgentForAccount(account)
     if (agent) {
       fetchOptions.dispatcher = agent
     }
@@ -1960,6 +2156,15 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(
         `[OpenAI-Compat/Responses] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
+      if (!suppressCooldownForChatFallback) {
+        markAccountCooldown(
+          account,
+          response.status,
+          modelName,
+          response.headers.get("retry-after") || undefined,
+          account.label
+        )
+      }
       throw new Error(
         `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
       )

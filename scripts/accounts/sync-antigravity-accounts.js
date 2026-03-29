@@ -38,7 +38,7 @@ if (!mode) {
 const PROJECT_ROOT = path.resolve(__dirname, "../..")
 const DEST_FILE = path.join(
   PROJECT_ROOT,
-  "apps/protocol-bridge/data/accounts.json"
+  "apps/protocol-bridge/data/antigravity-accounts.json"
 )
 
 // ---------------------------------------------------------------------------

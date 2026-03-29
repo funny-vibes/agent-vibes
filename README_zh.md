@@ -139,11 +139,7 @@ agent-vibes
 agent-vibes forward status
 ```
 
-> **提示：** 当 Cursor 通过 Codex 后端使用 GPT / O 系列 / Codex 模型时，普通 Thinking 对应标准推理档位。若要加载 Codex 最高推理档位，需要同时开启 `Thinking` 与 `Max mode`。
-
 ### 环境变量
-
-本地开发默认可零配置启动。部署到服务器时，请在 `apps/protocol-bridge/.env.local` 中配置：
 
 | 变量                   | 默认值               | 说明                        |
 | ---------------------- | -------------------- | --------------------------- |
@@ -154,48 +150,39 @@ agent-vibes forward status
 
 ## Codex 后端（GPT / O 系列模型）
 
-如果你需要使用 GPT、O 系列或 Codex 模型，可以这样配置：
-
-目前 Codex 后端支持三种接入方式：
-
-- 同步本地 Codex CLI / ChatGPT 登录态
-- 直接填写官方 OpenAI API Key
-- 填写第三方 Codex-compatible Key，并指定自定义 Base URL
-
-**方式 1：同步 Codex CLI 登录态**
-
 ```bash
+# 登录并同步（支持多账号 / 多 team 空间，每次 login 切换后 sync 即可追加）
+codex --login
 agent-vibes sync --codex
-# or
-npm run codex:sync
-```
 
-**方式 2：直接填写 API Key**
-
-在 `apps/protocol-bridge/.env.local` 中设置 `CODEX_API_KEY`。
-
-**方式 3：使用第三方 Codex-compatible Key**
-
-在 `apps/protocol-bridge/.env.local` 中同时设置 `CODEX_BASE_URL` 和 `CODEX_API_KEY`：
-
-```dotenv
-CODEX_BASE_URL=https://example.com/codex
-CODEX_API_KEY=sk-xxx
-```
-
-`CODEX_BASE_URL` 需要填写 Codex / Responses 接口的父路径，不要带末尾的 `/responses`，因为 Agent Vibes 会自动拼接。
-
-> **说明：** 如果同时配置了 `OPENAI_COMPAT_BASE_URL` + `OPENAI_COMPAT_API_KEY` 和 `CODEX_*`，那么 GPT / O 系列请求会优先走 OpenAI-compatible 后端；否则走 Codex 后端。
-
-然后启动代理：
-
-```bash
+# 启动代理
 agent-vibes
 ```
 
-之后就可以在 Claude Code CLI 或 Cursor 中直接选择 GPT / O 系列 / Codex 模型。
+多账号会自动轮转，额度耗尽时自动切换到下一个可用账号。
 
-在 Cursor 中，Codex 的最高推理档位通过 `Thinking + Max mode` 加载。
+## OpenAI 兼容后端（第三方 GPT API）
+
+在 `apps/protocol-bridge/data/openai-compat-accounts.json` 中添加账号，支持多账号轮转：
+
+```json
+{
+  "accounts": [
+    {
+      "label": "provider-1",
+      "baseUrl": "https://a.example.com/v1",
+      "apiKey": "sk-xxx"
+    },
+    {
+      "label": "provider-2",
+      "baseUrl": "https://b.example.com/v1",
+      "apiKey": "sk-yyy"
+    }
+  ]
+}
+```
+
+同时配置 OpenAI 兼容后端和 Codex 后端时，GPT / O 系列请求优先走 OpenAI 兼容后端。额度耗尽时自动切换到下一个可用账号。
 
 ## 项目结构
 
@@ -249,7 +236,7 @@ agent-vibes/
 │       │   └── gen/                           # 自动生成的 protobuf（不要手改）
 │       │
 │       ├── proto/                             # Protobuf 定义（协议兼容，仅本地）
-│       └── data/                              # Antigravity OAuth 账号数据
+│       └── data/                              # 各后端凭据池（JSON）
 ├── packages/
 │   ├── eslint-config/                         # 共享 ESLint 配置
 │   ├── prettier-config/                       # 共享 Prettier 配置
@@ -303,12 +290,14 @@ npm run cursor:forward:status  # 查看转发状态
 
 如果 Cursor 安装在非默认位置，可为这些工具脚本设置 `CURSOR_BINARY_PATH`、`CURSOR_WORKBENCH_PATH` 或 `CURSOR_APP_ROOT`。
 
-### 部署
+### 凭据同步与部署
 
 ```bash
+npm run antigravity:sync       # 同步 Antigravity 账号 → data/antigravity-accounts.json
+npm run codex:sync             # 同步 Codex CLI 登录态 → data/codex-accounts.json
+npm run deploy:sync            # 上传所有凭据到 GitHub Secrets
+npm run deploy:sync -- --run   # 上传 + 触发 CI/CD 部署
 npm run release                # 合并 dev → main → push（触发 CI 部署）
-npm run antigravity:sync       # 同步 Antigravity OAuth 账号到 ANTIGRAVITY_STORAGE
-npm run codex:sync             # 将 Codex CLI auth.json 同步到 CODEX_* 环境变量
 ```
 
 ### 诊断

@@ -6,11 +6,18 @@
 const net = require("net")
 const fs = require("fs")
 
+const os = require("os")
+const path = require("path")
+
 const LISTEN_IP = process.argv[2] || "127.0.0.2"
 const LISTEN_PORT = parseInt(process.argv[3] || "443")
 const TARGET_IP = process.argv[4] || "127.0.0.1"
 const TARGET_PORT = parseInt(process.argv[5] || "8000")
-const PID_FILE = process.argv[6] || "/tmp/cursor-proxy-relay.pid"
+const PID_FILE =
+  process.argv[6] ||
+  (process.platform === "win32"
+    ? path.join(os.tmpdir(), "cursor-proxy-relay.pid")
+    : "/tmp/cursor-proxy-relay.pid")
 
 fs.writeFileSync(PID_FILE, String(process.pid))
 

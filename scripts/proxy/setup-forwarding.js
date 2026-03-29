@@ -21,6 +21,7 @@
 
 const { execSync } = require("child_process")
 const fs = require("fs")
+const os = require("os")
 const platform = require("../lib/platform")
 
 const LOOPBACK_IP = "127.0.0.2"
@@ -46,6 +47,14 @@ const YELLOW = "\x1b[1;33m"
 const CYAN = "\x1b[0;36m"
 const NC = "\x1b[0m"
 
+// Entries to add to macOS proxy bypass list so Cursor domains bypass
+// system proxy (Clash/V2Ray) and honor /etc/hosts → 127.0.0.2 instead.
+// We add each HOST_DOMAIN + its *.subdomain wildcard + the loopback alias.
+const PROXY_BYPASS_ENTRIES = [
+  LOOPBACK_IP,
+  ...HOST_DOMAINS.flatMap((d) => [d, `*.${d}`]),
+]
+
 const HOSTS_BEGIN = "# BEGIN Cursor proxy forwarding"
 const HOSTS_END = "# END Cursor proxy forwarding"
 
@@ -60,6 +69,10 @@ function run(cmd, ignoreError = false) {
     if (!ignoreError) throw e
     return ""
   }
+}
+
+function shellEscape(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'"
 }
 
 function parseMacProxyConfig() {
@@ -78,7 +91,10 @@ function parseMacProxyConfig() {
     (match) => match[1].trim()
   )
 
+  const socksEnabled = /\bSOCKSEnable\s*:\s*1\b/.test(raw)
+
   return {
+    socksEnabled,
     enabled,
     exceptions,
     raw,
@@ -113,7 +129,9 @@ function addHostsEntries() {
   const entries = getHostEntries()
   const block = `\n${HOSTS_BEGIN}\n${entries.join("\n")}\n${HOSTS_END}\n`
   fs.writeFileSync(hostsPath, content.trimEnd() + block)
-  console.log(`${GREEN}\u2713${NC} Updated ${hostsPath} (${entries.length} entries)`)
+  console.log(
+    `${GREEN}\u2713${NC} Updated ${hostsPath} (${entries.length} entries)`
+  )
 }
 
 function removeHostsEntries() {
@@ -126,11 +144,280 @@ function removeHostsEntries() {
   }
 
   const cleaned = content.replace(
-    new RegExp(`\\n?${HOSTS_BEGIN.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}[\\s\\S]*?${HOSTS_END.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\n?`),
+    new RegExp(
+      `\\n?${HOSTS_BEGIN.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}[\\s\\S]*?${HOSTS_END.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\n?`
+    ),
     "\n"
   )
   fs.writeFileSync(hostsPath, cleaned)
   console.log(`${GREEN}\u2713${NC} Removed managed entries from ${hostsPath}`)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-platform proxy bypass management
+// ---------------------------------------------------------------------------
+
+// ── macOS: networksetup ──
+
+function getActiveNetworkServices() {
+  const output = run("networksetup -listallnetworkservices", true)
+  if (!output) return []
+  return output
+    .split("\n")
+    .filter(
+      (line) =>
+        line.trim() && !line.startsWith("An asterisk") && !line.startsWith("*")
+    )
+}
+
+function parseMacBypassDomains(raw) {
+  return raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(
+      (line) =>
+        line &&
+        !/^There (?:aren't|are not) any bypass domains set on .+\.$/.test(line)
+    )
+}
+
+function macAddBypass() {
+  const services = getActiveNetworkServices()
+  for (const svc of services) {
+    const current = run(`networksetup -getproxybypassdomains "${svc}"`, true)
+    const existing = parseMacBypassDomains(current)
+    const toAdd = PROXY_BYPASS_ENTRIES.filter((e) => !existing.includes(e))
+    if (toAdd.length === 0) {
+      console.log(
+        `${YELLOW}\u2298${NC} Proxy bypass already configured for ${svc}`
+      )
+      continue
+    }
+    const merged = [...existing, ...toAdd]
+    run(
+      `networksetup -setproxybypassdomains "${svc}" ${merged.map((e) => `"${e}"`).join(" ")}`
+    )
+    console.log(
+      `${GREEN}\u2713${NC} Added ${toAdd.length} bypass entries to ${svc}`
+    )
+  }
+}
+
+function macRemoveBypass() {
+  const services = getActiveNetworkServices()
+  for (const svc of services) {
+    const current = run(`networksetup -getproxybypassdomains "${svc}"`, true)
+    const existing = parseMacBypassDomains(current)
+    const bypassSet = new Set(PROXY_BYPASS_ENTRIES)
+    const cleaned = existing.filter((e) => !bypassSet.has(e))
+    if (cleaned.length === existing.length) {
+      console.log(
+        `${YELLOW}\u2298${NC} No managed bypass entries found in ${svc}`
+      )
+      continue
+    }
+    if (cleaned.length === 0) {
+      run(`networksetup -setproxybypassdomains "${svc}" "Empty"`)
+    } else {
+      run(
+        `networksetup -setproxybypassdomains "${svc}" ${cleaned.map((e) => `"${e}"`).join(" ")}`
+      )
+    }
+    console.log(
+      `${GREEN}\u2713${NC} Removed ${existing.length - cleaned.length} bypass entries from ${svc}`
+    )
+  }
+}
+
+function macGetBypassExceptions() {
+  const svc = getActiveNetworkServices()[0]
+  if (!svc) return []
+  return parseMacBypassDomains(
+    run(`networksetup -getproxybypassdomains "${svc}"`, true)
+  )
+}
+
+// ── Windows: registry ProxyOverride ──
+
+const WIN_REG_KEY =
+  "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+
+function winGetBypassList() {
+  const raw = run(`reg query "${WIN_REG_KEY}" /v ProxyOverride`, true)
+  const match = raw.match(/ProxyOverride\s+REG_SZ\s+(.+)/)
+  if (!match) return []
+  return match[1]
+    .split(";")
+    .map((e) => e.trim())
+    .filter(Boolean)
+}
+
+function winAddBypass() {
+  const existing = winGetBypassList()
+  const toAdd = PROXY_BYPASS_ENTRIES.filter((e) => !existing.includes(e))
+  if (toAdd.length === 0) {
+    console.log(
+      `${YELLOW}\u2298${NC} Proxy bypass already configured in registry`
+    )
+    return
+  }
+  const merged = [...existing, ...toAdd].join(";")
+  run(`reg add "${WIN_REG_KEY}" /v ProxyOverride /t REG_SZ /d "${merged}" /f`)
+  console.log(
+    `${GREEN}\u2713${NC} Added ${toAdd.length} bypass entries to registry`
+  )
+}
+
+function winRemoveBypass() {
+  const existing = winGetBypassList()
+  const bypassSet = new Set(PROXY_BYPASS_ENTRIES)
+  const cleaned = existing.filter((e) => !bypassSet.has(e))
+  if (cleaned.length === existing.length) {
+    console.log(
+      `${YELLOW}\u2298${NC} No managed bypass entries found in registry`
+    )
+    return
+  }
+  if (cleaned.length === 0) {
+    run(`reg delete "${WIN_REG_KEY}" /v ProxyOverride /f`, true)
+  } else {
+    run(
+      `reg add "${WIN_REG_KEY}" /v ProxyOverride /t REG_SZ /d "${cleaned.join(";")}" /f`
+    )
+  }
+  console.log(
+    `${GREEN}\u2713${NC} Removed ${existing.length - cleaned.length} bypass entries from registry`
+  )
+}
+
+// ── Linux: GNOME gsettings (best-effort) ──
+
+function linuxHasGsettings() {
+  return !!run("which gsettings", true)
+}
+
+function linuxResolveSessionUser() {
+  const candidates = [
+    process.env.SUDO_USER,
+    process.env.SUDO_UID
+      ? run(`id -nu ${shellEscape(process.env.SUDO_UID)}`, true)
+      : "",
+    run("logname", true),
+  ]
+  const seen = new Set()
+
+  for (const rawCandidate of candidates) {
+    const candidate = (rawCandidate || "").trim()
+    if (!candidate || candidate === "root" || seen.has(candidate)) continue
+    seen.add(candidate)
+
+    const uid = run(`id -u ${shellEscape(candidate)}`, true)
+    if (!uid) continue
+
+    return {
+      user: candidate,
+      uid,
+      runtimeDir: `/run/user/${uid}`,
+      dbusAddress: `unix:path=/run/user/${uid}/bus`,
+    }
+  }
+
+  return null
+}
+
+function linuxRunGsettings(args, ignoreError = false) {
+  if (!linuxHasGsettings()) return ""
+  if (!platform.isElevated()) return run(`gsettings ${args}`, ignoreError)
+
+  // Elevated forwarding runs under sudo/root, but GNOME proxy settings live in
+  // the desktop user's dconf session.
+  const sessionUser = linuxResolveSessionUser()
+  if (!sessionUser) return run(`gsettings ${args}`, ignoreError)
+
+  return run(
+    [
+      "sudo",
+      "-H",
+      "-u",
+      shellEscape(sessionUser.user),
+      "env",
+      `XDG_RUNTIME_DIR=${shellEscape(sessionUser.runtimeDir)}`,
+      `DBUS_SESSION_BUS_ADDRESS=${shellEscape(sessionUser.dbusAddress)}`,
+      `gsettings ${args}`,
+    ].join(" "),
+    ignoreError
+  )
+}
+
+function linuxGetBypassList() {
+  if (!linuxHasGsettings()) return null
+  const raw = linuxRunGsettings("get org.gnome.system.proxy ignore-hosts", true)
+  if (!raw || raw === "@as []") return []
+  // Format: ['host1', 'host2']
+  const match = raw.match(/\[([^\]]*)\]/)
+  if (!match) return []
+  return match[1]
+    .split(",")
+    .map((e) => e.trim().replace(/^'|'$/g, ""))
+    .filter(Boolean)
+}
+
+function linuxAddBypass() {
+  if (!linuxHasGsettings()) {
+    console.log(
+      `${YELLOW}\u2298${NC} gsettings not found, set NO_PROXY manually for non-GNOME desktops`
+    )
+    return
+  }
+  const existing = linuxGetBypassList() || []
+  const toAdd = PROXY_BYPASS_ENTRIES.filter((e) => !existing.includes(e))
+  if (toAdd.length === 0) {
+    console.log(
+      `${YELLOW}\u2298${NC} Proxy bypass already configured in gsettings`
+    )
+    return
+  }
+  const merged = [...existing, ...toAdd]
+  const value = "[" + merged.map((e) => `'${e}'`).join(", ") + "]"
+  linuxRunGsettings(`set org.gnome.system.proxy ignore-hosts "${value}"`)
+  console.log(
+    `${GREEN}\u2713${NC} Added ${toAdd.length} bypass entries to gsettings`
+  )
+}
+
+function linuxRemoveBypass() {
+  if (!linuxHasGsettings()) return
+  const existing = linuxGetBypassList() || []
+  const bypassSet = new Set(PROXY_BYPASS_ENTRIES)
+  const cleaned = existing.filter((e) => !bypassSet.has(e))
+  if (cleaned.length === existing.length) {
+    console.log(
+      `${YELLOW}\u2298${NC} No managed bypass entries found in gsettings`
+    )
+    return
+  }
+  const value =
+    cleaned.length === 0
+      ? "@as []"
+      : "[" + cleaned.map((e) => `'${e}'`).join(", ") + "]"
+  linuxRunGsettings(`set org.gnome.system.proxy ignore-hosts "${value}"`)
+  console.log(
+    `${GREEN}\u2713${NC} Removed ${existing.length - cleaned.length} bypass entries from gsettings`
+  )
+}
+
+// ── Cross-platform dispatchers ──
+
+function addProxyBypass() {
+  if (platform.PLATFORM === "darwin") macAddBypass()
+  else if (platform.PLATFORM === "win32") winAddBypass()
+  else if (platform.PLATFORM === "linux") linuxAddBypass()
+}
+
+function removeProxyBypass() {
+  if (platform.PLATFORM === "darwin") macRemoveBypass()
+  else if (platform.PLATFORM === "win32") winRemoveBypass()
+  else if (platform.PLATFORM === "linux") linuxRemoveBypass()
 }
 
 function checkElevated() {
@@ -180,7 +467,11 @@ const path = require("path")
 const { spawn } = require("child_process")
 
 const RELAY_SCRIPT = path.join(__dirname, "tcp-relay.js")
-const PID_FILE = "/tmp/cursor-proxy-relay.pid"
+// /tmp is stable across sudo/non-sudo on Unix; Windows uses per-user temp
+const PID_FILE =
+  platform.PLATFORM === "win32"
+    ? path.join(os.tmpdir(), "cursor-proxy-relay.pid")
+    : "/tmp/cursor-proxy-relay.pid"
 
 function getRelayPid() {
   try {
@@ -214,12 +505,21 @@ function pfEnable() {
   // 2. Start TCP relay (replaces pf rdr — avoids macOS 26 lo0 TCP breakage)
   const existingPid = getRelayPid()
   if (existingPid) {
-    try { process.kill(existingPid) } catch {}
+    try {
+      process.kill(existingPid)
+    } catch {}
   }
 
   const child = spawn(
     process.execPath,
-    [RELAY_SCRIPT, LOOPBACK_IP, String(FROM_PORT), "127.0.0.1", String(TO_PORT), PID_FILE],
+    [
+      RELAY_SCRIPT,
+      LOOPBACK_IP,
+      String(FROM_PORT),
+      "127.0.0.1",
+      String(TO_PORT),
+      PID_FILE,
+    ],
     {
       detached: true,
       stdio: "ignore",
@@ -246,6 +546,9 @@ function pfEnable() {
 
   // 3. Update /etc/hosts
   addHostsEntries()
+
+  // 4. Add proxy bypass entries (so system proxy doesn't intercept cursor domains)
+  addProxyBypass()
 
   console.log("")
   console.log(`${GREEN}Forwarding enabled!${NC}`)
@@ -294,6 +597,9 @@ function pfDisable() {
   // 4. Clean /etc/hosts
   removeHostsEntries()
 
+  // 5. Remove proxy bypass entries
+  removeProxyBypass()
+
   console.log("")
   console.log(`${GREEN}Forwarding disabled!${NC}`)
 }
@@ -320,6 +626,7 @@ function pfStatus() {
     console.log(`${RED}✗ not running${NC}`)
   }
 
+  macBypassStatus()
   proxyConnectivityCheck()
 }
 
@@ -358,6 +665,9 @@ function iptablesEnable() {
   // 3. Update /etc/hosts
   addHostsEntries()
 
+  // 4. Add proxy bypass entries
+  addProxyBypass()
+
   console.log("")
   console.log(`${GREEN}Forwarding enabled!${NC}`)
 }
@@ -378,6 +688,9 @@ function iptablesDisable() {
 
   // 3. Clean /etc/hosts
   removeHostsEntries()
+
+  // 4. Remove proxy bypass entries
+  removeProxyBypass()
 
   console.log("")
   console.log(`${GREEN}Forwarding disabled!${NC}`)
@@ -405,6 +718,7 @@ function iptablesStatus() {
     console.log(`${RED}✗ not loaded${NC}`)
   }
 
+  linuxBypassStatus()
   proxyConnectivityCheck()
 }
 
@@ -438,6 +752,9 @@ function netshEnable() {
   // 3. Update hosts file
   addHostsEntries()
 
+  // 4. Add proxy bypass entries
+  addProxyBypass()
+
   console.log("")
   console.log(`${GREEN}Forwarding enabled!${NC}`)
 }
@@ -459,6 +776,9 @@ function netshDisable() {
   // 3. Clean hosts file
   removeHostsEntries()
 
+  // 4. Remove proxy bypass entries
+  removeProxyBypass()
+
   console.log("")
   console.log(`${GREEN}Forwarding disabled!${NC}`)
 }
@@ -476,6 +796,7 @@ function netshStatus() {
     console.log(`${RED}✗ not configured${NC}`)
   }
 
+  winBypassStatus()
   proxyConnectivityCheck()
 }
 
@@ -561,29 +882,77 @@ async function proxyConnectivityCheck() {
     console.log(`${RED}✗ forwarding failed${NC}`)
   }
 
-  const macProxy = parseMacProxyConfig()
-  if (macProxy?.enabled) {
-    const hasLoopbackBypass = macProxy.exceptions.some((entry) =>
-      ["127.0.0.2", LOOPBACK_IP].includes(entry)
-    )
-    const hasCursorBypass = macProxy.exceptions.some(
-      (entry) => entry === "*.cursor.sh" || entry === "api2.cursor.sh"
-    )
+  console.log("")
+}
 
-    process.stdout.write("  macOS system proxy bypass: ")
-    if (hasLoopbackBypass || hasCursorBypass) {
-      console.log(`${GREEN}✓ proxy enabled, bypass present${NC}`)
-    } else {
-      console.log(
-        `${YELLOW}⚠ proxy enabled without ${LOOPBACK_IP} or *.cursor.sh bypass${NC}`
-      )
-      console.log(
-        `    Cursor may hit your upstream proxy instead of the local relay and fail TLS verification.`
-      )
-    }
+// ---------------------------------------------------------------------------
+// Per-platform bypass status checks (called from *Status functions)
+// ---------------------------------------------------------------------------
+
+function macBypassStatus() {
+  const macProxy = parseMacProxyConfig()
+  if (!macProxy?.enabled) return
+
+  const exceptions = macGetBypassExceptions()
+  const missing = PROXY_BYPASS_ENTRIES.filter((e) => !exceptions.includes(e))
+
+  process.stdout.write("  macOS proxy bypass: ")
+  if (missing.length === 0) {
+    console.log(
+      `${GREEN}✓ all ${PROXY_BYPASS_ENTRIES.length} entries present${NC}`
+    )
+  } else {
+    console.log(`${YELLOW}⚠ ${missing.length} bypass entries missing${NC}`)
+    console.log(
+      `    Run 'agent-vibes forward on' to fix, or Cursor traffic will go through the system proxy and fail TLS.`
+    )
+  }
+}
+
+function winBypassStatus() {
+  const existing = winGetBypassList()
+  if (
+    existing.length === 0 &&
+    !run(`reg query "${WIN_REG_KEY}" /v ProxyEnable`, true).includes("0x1")
+  ) {
+    return // No system proxy enabled
   }
 
-  console.log("")
+  const missing = PROXY_BYPASS_ENTRIES.filter((e) => !existing.includes(e))
+
+  process.stdout.write("  Windows proxy bypass: ")
+  if (missing.length === 0) {
+    console.log(
+      `${GREEN}✓ all ${PROXY_BYPASS_ENTRIES.length} entries present${NC}`
+    )
+  } else {
+    console.log(`${YELLOW}⚠ ${missing.length} bypass entries missing${NC}`)
+    console.log(
+      `    Run 'agent-vibes forward on' to fix, or Cursor traffic will go through the system proxy and fail TLS.`
+    )
+  }
+}
+
+function linuxBypassStatus() {
+  if (!linuxHasGsettings()) return
+
+  const mode = linuxRunGsettings("get org.gnome.system.proxy mode", true)
+  if (mode !== "'manual'") return // No manual proxy configured
+
+  const existing = linuxGetBypassList() || []
+  const missing = PROXY_BYPASS_ENTRIES.filter((e) => !existing.includes(e))
+
+  process.stdout.write("  GNOME proxy bypass: ")
+  if (missing.length === 0) {
+    console.log(
+      `${GREEN}✓ all ${PROXY_BYPASS_ENTRIES.length} entries present${NC}`
+    )
+  } else {
+    console.log(`${YELLOW}⚠ ${missing.length} bypass entries missing${NC}`)
+    console.log(
+      `    Run 'agent-vibes forward on' to fix, or Cursor traffic will go through the system proxy and fail TLS.`
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------

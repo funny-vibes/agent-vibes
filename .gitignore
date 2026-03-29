@@ -22,6 +22,9 @@ apps/protocol-bridge/.env.*
 !apps/protocol-bridge/.env.example
 apps/protocol-bridge/data/accounts.json
 apps/protocol-bridge/data/accounts.local.json
+apps/protocol-bridge/data/antigravity-accounts.json
+apps/protocol-bridge/data/codex-accounts.json
+apps/protocol-bridge/data/openai-compat-accounts.json
 apps/protocol-bridge/proto/
 scripts/cursor/
 backups/
