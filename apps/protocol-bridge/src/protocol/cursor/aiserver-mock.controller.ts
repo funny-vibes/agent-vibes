@@ -37,11 +37,16 @@ import {
   KnowledgeBaseRemoveResponseSchema,
 } from "../../gen/aiserver/v1_pb"
 import { CodexService } from "../../llm/codex/codex.service"
+import { ClaudeApiService } from "../../llm/claude-api/claude-api.service"
+import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../llm/google/google.service"
+import { ModelRouterService } from "../../llm/model-router.service"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import {
+  canPublicClaudeModelUseGoogle,
   DEFAULT_GEMINI_MODEL,
   getCursorDisplayModels,
+  resolveCloudCodeModel,
 } from "../../llm/model-registry"
 
 /**
@@ -83,9 +88,37 @@ export class AiserverMockController {
 
   constructor(
     private readonly googleService: GoogleService,
+    private readonly googleModelCache: GoogleModelCacheService,
     private readonly codexService: CodexService,
+    private readonly claudeApiService: ClaudeApiService,
+    private readonly modelRouter: ModelRouterService,
     private readonly knowledgeBaseService: KnowledgeBaseService
   ) {}
+
+  private isCursorModelCurrentlyRoutable(modelId: string): boolean {
+    const resolved = resolveCloudCodeModel(modelId)
+    if (!resolved) {
+      return false
+    }
+
+    if (resolved.family === "gpt") {
+      return this.codexService.isAvailable()
+    }
+
+    if (resolved.family === "gemini") {
+      return (
+        this.modelRouter.isGoogleAvailable &&
+        this.googleModelCache.isValidModel(resolved.cloudCodeId)
+      )
+    }
+
+    return (
+      this.claudeApiService.supportsModel(modelId) ||
+      (this.modelRouter.isGoogleAvailable &&
+        canPublicClaudeModelUseGoogle(modelId) &&
+        this.googleModelCache.isValidModel(resolved.cloudCodeId))
+    )
+  }
 
   private buildCursorModels(req?: FastifyRequest) {
     let excludeMaxNamedModels = false
@@ -109,7 +142,13 @@ export class AiserverMockController {
       includeCodex: this.codexService.isAvailable(),
       codexModelTier: this.codexService.getModelTier(),
       excludeMaxNamedModels,
-    })
+    }).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
+  }
+
+  private logModelNames(label: string, modelNames: string[]): void {
+    this.logger.debug(
+      `${label}: ${modelNames.length} model(s) -> ${modelNames.join(", ")}`
+    )
   }
 
   // ── NetworkService ──
@@ -281,6 +320,10 @@ export class AiserverMockController {
       const buf = Buffer.from(toBinary(AvailableModelsResponseSchema, response))
       this.logger.log(
         `AvailableModels: ${allModels.length} models (${buf.length} bytes)`
+      )
+      this.logModelNames(
+        "AiService.AvailableModels response",
+        response.modelNames
       )
       res.header("Content-Type", "application/proto")
       res.header("Connect-Protocol-Version", "1")
@@ -656,6 +699,7 @@ export class AiserverMockController {
       models,
       defaultModel: DEFAULT_GEMINI_MODEL,
     })
+    this.logModelNames("CppService.AvailableModels response", models)
     this.sendProto(res, AvailableCppModelsResponseSchema, response)
   }
 

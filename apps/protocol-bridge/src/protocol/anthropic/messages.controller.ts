@@ -29,6 +29,43 @@ import { MessagesService } from "./messages.service"
 export class MessagesController {
   constructor(private readonly messagesService: MessagesService) {}
 
+  private pickForwardHeaders(
+    headers?: Record<string, string | string[] | undefined>
+  ): Record<string, string> {
+    if (!headers) return {}
+
+    const allowedHeaders = [
+      "anthropic-version",
+      "anthropic-beta",
+      "anthropic-dangerous-direct-browser-access",
+      "x-app",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-lang",
+      "x-stainless-timeout",
+      "x-cpa-claude-1m",
+      "user-agent",
+    ]
+
+    const out: Record<string, string> = {}
+    for (const key of allowedHeaders) {
+      const value = headers[key]
+      if (typeof value === "string" && value.trim() !== "") {
+        out[key] = value.trim()
+      } else if (Array.isArray(value) && value.length > 0) {
+        const merged = value
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+          .join(",")
+        if (merged) {
+          out[key] = merged
+        }
+      }
+    }
+
+    return out
+  }
+
   private getRetryAfterSeconds(error: unknown): number | null {
     const retryAfterSeconds = (
       error as { retryAfterSeconds?: unknown } | null | undefined
@@ -90,11 +127,20 @@ export class MessagesController {
     @Body() createMessageDto: CreateMessageDto,
     @Headers("x-api-key") apiKey?: string,
     @Headers("anthropic-version") version?: string,
+    @Headers()
+    headers?: Record<string, string | string[] | undefined>,
     @Res({ passthrough: true }) res?: FastifyReply
   ) {
+    void apiKey
+    void version
+    const forwardHeaders = this.pickForwardHeaders(headers)
+
     // Handle streaming mode
     if (createMessageDto.stream && res) {
-      const stream = this.messagesService.createMessageStream(createMessageDto)
+      const stream = this.messagesService.createMessageStream(
+        createMessageDto,
+        forwardHeaders
+      )
       let headersWritten = false
       const ensureHeaders = () => {
         if (headersWritten) return
@@ -128,7 +174,10 @@ export class MessagesController {
 
     // Non-streaming mode
     try {
-      return await this.messagesService.createMessage(createMessageDto)
+      return await this.messagesService.createMessage(
+        createMessageDto,
+        forwardHeaders
+      )
     } catch (error) {
       const retryAfterSeconds = this.getRetryAfterSeconds(error)
       if (res && retryAfterSeconds != null) {

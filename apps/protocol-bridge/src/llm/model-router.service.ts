@@ -1,9 +1,14 @@
-import { Injectable, Logger } from "@nestjs/common"
+import { HttpException, Injectable, Logger } from "@nestjs/common"
 import {
+  canPublicClaudeModelUseGoogle,
   detectModelFamily,
   isOpusModel,
   resolveCloudCodeModel,
 } from "./model-registry"
+import {
+  BackendAccountPoolUnavailableError,
+  BackendApiError,
+} from "./shared/backend-errors"
 
 function isGptThinkingModel(model: string): boolean {
   const normalized = model.toLowerCase().trim()
@@ -21,8 +26,14 @@ function isGptThinkingModel(model: string): boolean {
  * - google-claude: Claude family models served by Google Cloud Code
  * - codex: OpenAI GPT/O-series models via Codex reverse proxy
  * - openai-compat: Third-party OpenAI-compatible API (Chat Completions)
+ * - claude-api: Anthropic-compatible Claude API with third-party key/account pool
  */
-export type BackendType = "google" | "google-claude" | "codex" | "openai-compat"
+export type BackendType =
+  | "google"
+  | "google-claude"
+  | "codex"
+  | "openai-compat"
+  | "claude-api"
 
 /**
  * Model routing result
@@ -45,6 +56,10 @@ export class ModelRouterService {
   private googleAvailable = false
   private codexAvailable = false
   private openaiCompatAvailable = false
+  private claudeApiAvailable = false
+  private codexAvailabilityProvider?: () => boolean
+  private openaiCompatAvailabilityProvider?: () => boolean
+  private claudeApiAvailabilityProvider?: (model: string) => boolean
 
   /**
    * Keep availability check so startup behavior remains explicit.
@@ -52,7 +67,8 @@ export class ModelRouterService {
   async initializeRouting(
     googleCheck: () => Promise<boolean>,
     codexCheck?: () => Promise<boolean>,
-    openaiCompatCheck?: () => Promise<boolean>
+    openaiCompatCheck?: () => Promise<boolean>,
+    claudeApiCheck?: () => Promise<boolean>
   ): Promise<void> {
     this.logger.log("=== Testing Backend APIs ===")
 
@@ -79,14 +95,33 @@ export class ModelRouterService {
       })
     }
 
+    if (claudeApiCheck) {
+      this.claudeApiAvailable = await claudeApiCheck().catch((e) => {
+        this.logger.error(`Claude API check error: ${(e as Error).message}`)
+        return false
+      })
+    }
+
     this.logger.log("=== Backend Availability ===")
     this.logger.log(`  Google Cloud Code: ${this.googleAvailable ? "✓" : "✗"}`)
     this.logger.log(`  Codex (OpenAI):    ${this.codexAvailable ? "✓" : "✗"}`)
     this.logger.log(
       `  OpenAI-Compat:     ${this.openaiCompatAvailable ? "✓" : "✗"}`
     )
+    this.logger.log(
+      `  Claude API:        ${this.claudeApiAvailable ? "✓" : "✗"}`
+    )
     this.logger.log("=== Routing Decision ===")
-    this.logger.log("  Gemini/Claude models -> Google backend")
+    this.logger.log("  Gemini models       -> Google backend")
+    if (this.claudeApiAvailable && this.googleAvailable) {
+      this.logger.log(
+        "  Claude models       -> Capability-based routing (Claude API or Google)"
+      )
+    } else if (this.claudeApiAvailable) {
+      this.logger.log("  Claude models       -> Claude API backend")
+    } else {
+      this.logger.log("  Claude models       -> Google backend")
+    }
     if (this.openaiCompatAvailable && this.codexAvailable) {
       this.logger.log(
         "  GPT/O-series models  -> OpenAI-compatible backend (priority, Codex fallback)"
@@ -115,14 +150,49 @@ export class ModelRouterService {
   get isOpenaiCompatAvailable(): boolean {
     return this.openaiCompatAvailable
   }
+  get isClaudeApiAvailable(): boolean {
+    return this.claudeApiAvailable
+  }
+
+  setGptAvailabilityProviders(providers: {
+    codex?: () => boolean
+    openaiCompat?: () => boolean
+  }): void {
+    this.codexAvailabilityProvider = providers.codex
+    this.openaiCompatAvailabilityProvider = providers.openaiCompat
+  }
+
+  setClaudeAvailabilityProvider(provider?: (model: string) => boolean): void {
+    this.claudeApiAvailabilityProvider = provider
+  }
+
+  private getCodexAvailability(): boolean {
+    return this.codexAvailabilityProvider
+      ? this.codexAvailabilityProvider()
+      : this.codexAvailable
+  }
+
+  private getOpenaiCompatAvailability(): boolean {
+    return this.openaiCompatAvailabilityProvider
+      ? this.openaiCompatAvailabilityProvider()
+      : this.openaiCompatAvailable
+  }
+
+  private getClaudeApiAvailability(model: string): boolean {
+    return this.claudeApiAvailabilityProvider
+      ? this.claudeApiAvailabilityProvider(model)
+      : this.claudeApiAvailable
+  }
 
   private buildGptBackendCandidatesFromTarget(target: {
     model: string
     isThinking: boolean
   }): GptBackendCandidates | null {
     const candidates: ModelRouteResult[] = []
+    const openaiCompatAvailable = this.getOpenaiCompatAvailability()
+    const codexAvailable = this.getCodexAvailability()
 
-    if (this.openaiCompatAvailable) {
+    if (openaiCompatAvailable) {
       candidates.push({
         backend: "openai-compat",
         model: target.model,
@@ -130,7 +200,7 @@ export class ModelRouterService {
       })
     }
 
-    if (this.codexAvailable) {
+    if (codexAvailable) {
       candidates.push({
         backend: "codex",
         model: target.model,
@@ -180,11 +250,71 @@ export class ModelRouterService {
     return this.buildGptBackendCandidatesFromTarget(target)
   }
 
+  private buildClaudeBackendCandidates(
+    cursorModel: string
+  ): GptBackendCandidates | null {
+    const normalized = cursorModel.toLowerCase().trim()
+    const family = detectModelFamily(normalized)
+    const claudeApiAvailable = this.getClaudeApiAvailability(cursorModel)
+    const hasExplicitClaudeMapping =
+      this.claudeApiAvailabilityProvider != null && claudeApiAvailable
+
+    if (!hasExplicitClaudeMapping && family !== "claude") {
+      return null
+    }
+
+    const candidates: ModelRouteResult[] = []
+    const entry = resolveCloudCodeModel(normalized)
+
+    // Claude API can expose aliases such as "latest" that do not match
+    // the registry/family heuristics, so honor explicit support first.
+    if (claudeApiAvailable) {
+      candidates.push({
+        backend: "claude-api",
+        model: normalized,
+        isThinking: entry?.isThinking ?? normalized.includes("thinking"),
+      })
+    }
+
+    if (this.googleAvailable) {
+      if (
+        entry?.family === "claude" &&
+        canPublicClaudeModelUseGoogle(normalized)
+      ) {
+        candidates.push({
+          backend: "google-claude",
+          model: entry.cloudCodeId,
+          isThinking: entry.isThinking,
+        })
+      } else if (
+        isOpusModel(normalized) &&
+        canPublicClaudeModelUseGoogle(normalized)
+      ) {
+        candidates.push({
+          backend: "google-claude",
+          model: "claude-opus-4-6-thinking",
+          isThinking: true,
+        })
+      }
+    }
+
+    if (candidates.length === 0) {
+      return null
+    }
+
+    return {
+      primary: candidates[0]!,
+      fallbacks: candidates.slice(1),
+    }
+  }
+
   getFallbackRoute(
     cursorModel: string,
     currentBackend: BackendType
   ): ModelRouteResult | null {
-    const candidates = this.getGptBackendCandidates(cursorModel)
+    const candidates =
+      this.getGptBackendCandidates(cursorModel) ||
+      this.buildClaudeBackendCandidates(cursorModel)
     if (!candidates) {
       return null
     }
@@ -196,6 +326,14 @@ export class ModelRouterService {
   }
 
   private parseBackendErrorStatus(error: unknown): number | null {
+    if (error instanceof HttpException) {
+      return error.getStatus()
+    }
+
+    if (error instanceof BackendApiError) {
+      return typeof error.statusCode === "number" ? error.statusCode : null
+    }
+
     const message =
       error instanceof Error
         ? error.message
@@ -224,7 +362,13 @@ export class ModelRouterService {
       (currentBackend !== "openai-compat" && currentBackend !== "codex") ||
       (fallbackBackend !== "openai-compat" && fallbackBackend !== "codex")
     ) {
-      return false
+      const claudePair =
+        (currentBackend === "claude-api" &&
+          fallbackBackend === "google-claude") ||
+        (currentBackend === "google-claude" && fallbackBackend === "claude-api")
+      if (!claudePair) {
+        return false
+      }
     }
 
     const message =
@@ -234,6 +378,10 @@ export class ModelRouterService {
           ? error.toLowerCase()
           : ""
     const status = this.parseBackendErrorStatus(error)
+
+    if (error instanceof BackendAccountPoolUnavailableError) {
+      return true
+    }
 
     if (status != null) {
       if ([401, 403, 404, 408, 409, 429, 500, 502, 503, 504].includes(status)) {
@@ -251,7 +399,7 @@ export class ModelRouterService {
       }
     }
 
-    return /timeout|timed out|fetch failed|socket hang up|econn|enotfound|eai_again|network|html page|anti-bot|captcha|blocked|not configured|missing api key|missing base url|no available providers|temporarily unavailable|service unavailable|quota|rate limit/.test(
+    return /timeout|timed out|fetch failed|socket hang up|econn|enotfound|eai_again|network|html page|anti-bot|captcha|blocked|not configured|missing api key|missing base url|no available providers|temporarily unavailable|service unavailable|quota|rate(?:-| )limit(?:ed)?|retry after|all openai-compat accounts|all claude api accounts|anthropic/.test(
       message
     )
   }
@@ -265,6 +413,7 @@ export class ModelRouterService {
     const family = detectModelFamily(normalized)
     const entry = resolveCloudCodeModel(normalized)
     const gptCandidates = this.getGptBackendCandidates(cursorModel)
+    const claudeCandidates = this.buildClaudeBackendCandidates(cursorModel)
 
     // 1. Known model with registry entry
     if (entry) {
@@ -287,7 +436,26 @@ export class ModelRouterService {
         )
       }
 
-      // Claude/Gemini → Google backend
+      // Claude → Claude API (priority) or Google
+      if (entry.family === "claude") {
+        if (claudeCandidates) {
+          const route = claudeCandidates.primary
+          const fallbackSuffix = claudeCandidates.fallbacks.length
+            ? ` | fallback=${claudeCandidates.fallbacks.map((candidate) => candidate.backend).join(",")}`
+            : ""
+          this.logger.log(
+            `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
+          )
+          return route
+        }
+
+        throw new Error(
+          `No Claude backend available for model ${cursorModel}. ` +
+            `Configure CLAUDE_API_KEY or keep Google Cloud Code available.`
+        )
+      }
+
+      // Gemini → Google backend
       const backend: BackendType = entry.isClaudeThroughGoogle
         ? "google-claude"
         : "google"
@@ -301,16 +469,16 @@ export class ModelRouterService {
       }
     }
 
-    // 2. Claude Opus not in registry -> default Opus
-    if (isOpusModel(normalized)) {
+    // 2. Claude model supported by third-party backend even if not in registry
+    if (claudeCandidates) {
+      const route = claudeCandidates.primary
+      const fallbackSuffix = claudeCandidates.fallbacks.length
+        ? ` | fallback=${claudeCandidates.fallbacks.map((candidate) => candidate.backend).join(",")}`
+        : ""
       this.logger.log(
-        `[ROUTE] ${cursorModel} -> Google Cloud Code Claude | claude-opus-4-6-thinking`
+        `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
       )
-      return {
-        backend: "google-claude",
-        model: "claude-opus-4-6-thinking",
-        isThinking: true,
-      }
+      return route
     }
 
     // 3. GPT family -> openai-compat > codex
@@ -335,8 +503,8 @@ export class ModelRouterService {
     // 4. Unknown Claude variant not in registry
     if (family === "claude") {
       throw new Error(
-        `Unknown Claude model ${cursorModel} not in registry. ` +
-          `Supported Claude models are resolved via model-registry.`
+        `Unknown Claude model ${cursorModel}. ` +
+          `Add a Claude API account model alias mapping or use a registry-supported Claude model.`
       )
     }
 

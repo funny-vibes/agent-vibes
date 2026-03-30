@@ -37,10 +37,14 @@ jobs:
           if [ -n "$OPENAI_COMPAT_ACCOUNTS" ]; then
             printf "%s" "$OPENAI_COMPAT_ACCOUNTS" > data/openai-compat-accounts.json
           fi
+          if [ -n "$CLAUDE_API_ACCOUNTS" ]; then
+            printf "%s" "$CLAUDE_API_ACCOUNTS" > data/claude-api-accounts.json
+          fi
         env:
           ANTIGRAVITY_ACCOUNTS: ${{ secrets.ANTIGRAVITY_ACCOUNTS }}
           CODEX_ACCOUNTS: ${{ secrets.CODEX_ACCOUNTS }}
           OPENAI_COMPAT_ACCOUNTS: ${{ secrets.OPENAI_COMPAT_ACCOUNTS }}
+          CLAUDE_API_ACCOUNTS: ${{ secrets.CLAUDE_API_ACCOUNTS }}
 
       - name: Build
         working-directory: apps/protocol-bridge
@@ -75,9 +79,20 @@ jobs:
             else
               cp .env.production.example .env
             fi
+            # Ensure Node.js 24 is installed
+            if ! node --version 2>/dev/null | grep -q '^v24'; then
+              curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+              apt-get install -y nodejs
+            fi
             npm install --production --ignore-scripts
             # Setup SSL certificates for HTTPS/HTTP2
             mkdir -p /opt/protocol-bridge/certs
             ln -sf /etc/letsencrypt/live/$DEPLOY_DOMAIN/fullchain.pem /opt/protocol-bridge/certs/localhost.crt
             ln -sf /etc/letsencrypt/live/$DEPLOY_DOMAIN/privkey.pem /opt/protocol-bridge/certs/localhost.key
+            # Register systemd service if not exists
+            if [ ! -f /etc/systemd/system/protocol-bridge.service ]; then
+              printf '%s\n' '[Unit]' 'Description=Protocol Bridge Service' 'After=network.target' '' '[Service]' 'Type=simple' 'WorkingDirectory=/opt/protocol-bridge' 'ExecStart=/usr/bin/node dist/main' 'Restart=on-failure' 'RestartSec=5' 'EnvironmentFile=/opt/protocol-bridge/.env' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/protocol-bridge.service
+              systemctl daemon-reload
+              systemctl enable protocol-bridge
+            fi
             systemctl restart protocol-bridge

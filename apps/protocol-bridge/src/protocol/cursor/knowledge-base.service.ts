@@ -12,6 +12,14 @@ export interface KnowledgeBaseItem {
   isGenerated: boolean
 }
 
+interface KnowledgeBaseRow {
+  id: string
+  knowledge: string
+  title: string
+  created_at: string
+  is_generated: number
+}
+
 @Injectable()
 export class KnowledgeBaseService implements OnModuleDestroy {
   private readonly logger = new Logger(KnowledgeBaseService.name)
@@ -32,6 +40,16 @@ export class KnowledgeBaseService implements OnModuleDestroy {
     if (this.db) {
       this.db.close()
       this.db = null
+    }
+  }
+
+  private toKnowledgeBaseItem(row: KnowledgeBaseRow): KnowledgeBaseItem {
+    return {
+      id: row.id,
+      knowledge: row.knowledge,
+      title: row.title,
+      createdAt: row.created_at,
+      isGenerated: Boolean(row.is_generated),
     }
   }
 
@@ -63,15 +81,12 @@ export class KnowledgeBaseService implements OnModuleDestroy {
     if (!this.db) return []
     try {
       const rows = this.db
-        .prepare("SELECT * FROM knowledge_base ORDER BY created_at DESC")
-        .all() as any[]
-      return rows.map((row) => ({
-        id: row.id,
-        knowledge: row.knowledge,
-        title: row.title,
-        createdAt: row.created_at,
-        isGenerated: Boolean(row.is_generated),
-      }))
+        .prepare<
+          [],
+          KnowledgeBaseRow
+        >("SELECT * FROM knowledge_base ORDER BY created_at DESC")
+        .all()
+      return rows.map((row) => this.toKnowledgeBaseItem(row))
     } catch (error) {
       this.logger.error(`Failed to list knowledge base items: ${String(error)}`)
       return []
@@ -82,16 +97,13 @@ export class KnowledgeBaseService implements OnModuleDestroy {
     if (!this.db) return null
     try {
       const row = this.db
-        .prepare("SELECT * FROM knowledge_base WHERE id = ?")
-        .get(id) as any
+        .prepare<
+          [string],
+          KnowledgeBaseRow
+        >("SELECT * FROM knowledge_base WHERE id = ?")
+        .get(id)
       if (!row) return null
-      return {
-        id: row.id,
-        knowledge: row.knowledge,
-        title: row.title,
-        createdAt: row.created_at,
-        isGenerated: Boolean(row.is_generated),
-      }
+      return this.toKnowledgeBaseItem(row)
     } catch (error) {
       this.logger.error(
         `Failed to get knowledge base item ${id}: ${String(error)}`

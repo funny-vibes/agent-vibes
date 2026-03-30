@@ -3,9 +3,16 @@ import { Controller, Logger, Post, Req, Res } from "@nestjs/common"
 import type { CreateMessageDto } from "../anthropic/dto/create-message.dto"
 import { MessagesService } from "../anthropic/messages.service"
 import { FastifyReply, FastifyRequest } from "fastify"
+import { ClaudeApiService } from "../../llm/claude-api/claude-api.service"
 import { CodexService } from "../../llm/codex/codex.service"
+import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
+import { ModelRouterService } from "../../llm/model-router.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
-import { getCursorDisplayModels } from "../../llm/model-registry"
+import {
+  canPublicClaudeModelUseGoogle,
+  getCursorDisplayModels,
+  resolveCloudCodeModel,
+} from "../../llm/model-registry"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { connectRPCHandler } from "./connect-rpc-handler"
 import { CursorConnectStreamService } from "./cursor-connect-stream.service"
@@ -53,11 +60,123 @@ export class CursorAdapterController {
 
   constructor(
     private readonly connectStreamService: CursorConnectStreamService,
+    private readonly googleModelCache: GoogleModelCacheService,
+    private readonly claudeApiService: ClaudeApiService,
     private readonly codexService: CodexService,
+    private readonly modelRouter: ModelRouterService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly messagesService: MessagesService,
     private readonly kvStorageService: KvStorageService
   ) {}
+
+  private isCursorModelCurrentlyRoutable(modelId: string): boolean {
+    const resolved = resolveCloudCodeModel(modelId)
+    if (!resolved) {
+      return false
+    }
+
+    if (resolved.family === "gpt") {
+      return this.codexService.isAvailable()
+    }
+
+    if (resolved.family === "gemini") {
+      return (
+        this.modelRouter.isGoogleAvailable &&
+        this.googleModelCache.isValidModel(resolved.cloudCodeId)
+      )
+    }
+
+    return (
+      this.claudeApiService.supportsModel(modelId) ||
+      (this.modelRouter.isGoogleAvailable &&
+        canPublicClaudeModelUseGoogle(modelId) &&
+        this.googleModelCache.isValidModel(resolved.cloudCodeId))
+    )
+  }
+
+  private buildCursorModels() {
+    return getCursorDisplayModels({
+      includeCodex: this.codexService.isAvailable(),
+      codexModelTier: this.codexService.getModelTier(),
+    }).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
+  }
+
+  private logModelNames(label: string, modelNames: string[]): void {
+    this.logger.debug(
+      `${label}: ${modelNames.length} model(s) -> ${modelNames.join(", ")}`
+    )
+  }
+
+  private isDiffReviewBackendAvailable(): boolean {
+    return (
+      this.openaiCompatService.isAvailable() || this.codexService.isAvailable()
+    )
+  }
+
+  private buildDiffReviewRequest(
+    model: string,
+    diffText: string
+  ): CreateMessageDto {
+    return {
+      model,
+      system:
+        "You are an expert code reviewer. Review the following diff and provide concise, " +
+        "actionable feedback. Focus on: bugs, security issues, performance problems, " +
+        "code style, and naming. Use markdown formatting. Keep the review brief and to the point.",
+      messages: [
+        {
+          role: "user",
+          content: `Please review the following code changes:\n\n\`\`\`diff\n${diffText}\n\`\`\``,
+        },
+      ],
+      max_tokens: 4096,
+      temperature: 0.3,
+      stream: true,
+    }
+  }
+
+  private extractDiffReviewTextDeltas(chunk: string): string[] {
+    const deltas: string[] = []
+
+    for (const block of chunk.split("\n\n")) {
+      const trimmedBlock = block.trim()
+      if (!trimmedBlock) continue
+
+      let eventType = ""
+      const dataLines: string[] = []
+
+      for (const line of trimmedBlock.split("\n")) {
+        if (line.startsWith("event:")) {
+          eventType = line.slice("event:".length).trim()
+          continue
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice("data:".length).trimStart())
+        }
+      }
+
+      if (eventType !== "content_block_delta" || dataLines.length === 0) {
+        continue
+      }
+
+      try {
+        const payload = JSON.parse(dataLines.join("\n")) as {
+          delta?: { type?: string; text?: string }
+        }
+        if (
+          payload.delta?.type === "text_delta" &&
+          typeof payload.delta.text === "string" &&
+          payload.delta.text
+        ) {
+          deltas.push(payload.delta.text)
+        }
+      } catch {
+        // Ignore malformed SSE payloads and continue streaming.
+      }
+    }
+
+    return deltas
+  }
 
   /**
    * Main chat streaming endpoint - HTTP/2 bidirectional streaming
@@ -122,10 +241,8 @@ export class CursorAdapterController {
     this.logger.log(">>> AgentService/GetUsableModels request received")
     res.header("Content-Type", "application/proto")
     res.header("Connect-Protocol-Version", "1")
-    const models = getCursorDisplayModels({
-      includeCodex: this.codexService.isAvailable(),
-      codexModelTier: this.codexService.getModelTier(),
-    }).map((model) =>
+    const cursorModels = this.buildCursorModels()
+    const models = cursorModels.map((model) =>
       create(ModelDetailsSchema, {
         modelId: model.name,
         displayModelId: model.name,
@@ -134,6 +251,10 @@ export class CursorAdapterController {
         aliases: [],
         maxMode: model.name.includes("max"),
       })
+    )
+    this.logModelNames(
+      "AgentService.GetUsableModels response",
+      cursorModels.map((model) => model.name)
     )
     const response = create(GetUsableModelsResponseSchema, { models })
     res
@@ -211,8 +332,8 @@ export class CursorAdapterController {
   ): Promise<void> {
     this.logger.log(">>> AiService/StreamDiffReview request received")
 
-    if (!this.openaiCompatService.isAvailable()) {
-      this.logger.error("OpenAI-compat backend not configured for review")
+    if (!this.isDiffReviewBackendAvailable()) {
+      this.logger.error("No GPT review backend configured")
       res.status(500).send({ error: "Review backend not configured" })
       return
     }
@@ -229,40 +350,24 @@ export class CursorAdapterController {
 
       // 2. Build unified diff text from protobuf
       const diffText = this.buildUnifiedDiff(reviewRequest.diffs)
+      const reviewDto = this.buildDiffReviewRequest(model, diffText)
 
-      // 3. Build code review prompt
-      const messages: Array<{
-        role: "system" | "user"
-        content: string
-      }> = [
-        {
-          role: "system",
-          content:
-            "You are an expert code reviewer. Review the following diff and provide concise, " +
-            "actionable feedback. Focus on: bugs, security issues, performance problems, " +
-            "code style, and naming. Use markdown formatting. Keep the review brief and to the point.",
-        },
-        {
-          role: "user",
-          content: `Please review the following code changes:\n\n\`\`\`diff\n${diffText}\n\`\`\``,
-        },
-      ]
-
-      // 4. Setup streaming response
+      // 3. Setup streaming response
       connectRPCHandler.setupStreamingResponse(res)
 
-      // 5. Stream GPT response as StreamDiffReviewResponse frames
-      for await (const textDelta of this.openaiCompatService.streamSimpleCompletion(
-        model,
-        messages,
-        { temperature: 0.3 }
+      // 4. Stream review response through the shared backend router so
+      // openai-compat failures can transparently fall back to Codex.
+      for await (const chunk of this.messagesService.createMessageStream(
+        reviewDto
       )) {
-        const responseMsg = create(StreamDiffReviewResponseSchema, {
-          response: { case: "text", value: textDelta },
-        })
-        const binary = toBinary(StreamDiffReviewResponseSchema, responseMsg)
-        const frame = connectRPCHandler.encodeMessage(Buffer.from(binary))
-        connectRPCHandler.writeMessage(res, frame)
+        for (const textDelta of this.extractDiffReviewTextDeltas(chunk)) {
+          const responseMsg = create(StreamDiffReviewResponseSchema, {
+            response: { case: "text", value: textDelta },
+          })
+          const binary = toBinary(StreamDiffReviewResponseSchema, responseMsg)
+          const frame = connectRPCHandler.encodeMessage(Buffer.from(binary))
+          connectRPCHandler.writeMessage(res, frame)
+        }
       }
 
       connectRPCHandler.endStream(res)

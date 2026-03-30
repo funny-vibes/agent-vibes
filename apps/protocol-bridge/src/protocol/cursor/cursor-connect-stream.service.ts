@@ -24,6 +24,7 @@ import {
   type WriteResult,
 } from "../../gen/agent/v1_pb"
 import { CodexService } from "../../llm/codex/codex.service"
+import { ClaudeApiService } from "../../llm/claude-api/claude-api.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
@@ -409,6 +410,7 @@ export class CursorConnectStreamService {
     private readonly grpcService: CursorGrpcService,
     private readonly googleService: GoogleService,
     private readonly codexService: CodexService,
+    private readonly claudeApiService: ClaudeApiService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly modelRouter: ModelRouterService,
     private readonly kvStorageService: KvStorageService,
@@ -671,6 +673,21 @@ export class CursorConnectStreamService {
     }
 
     try {
+      if (route.backend === "claude-api") {
+        this.logger.log(
+          `Routing to Claude API backend for model: ${route.model}`
+        )
+        for await (const event of this.claudeApiService.sendClaudeMessageStream(
+          routedDto
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
       if (route.backend === "openai-compat") {
         this.logger.log(
           `Routing to OpenAI-compat backend for model: ${route.model}`

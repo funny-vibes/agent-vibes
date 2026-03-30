@@ -40,6 +40,11 @@ const CREDENTIAL_FILES = [
     secretName: "OPENAI_COMPAT_ACCOUNTS",
     label: "OpenAI-compat accounts",
   },
+  {
+    localPath: path.join(BRIDGE_DIR, "data/claude-api-accounts.json"),
+    secretName: "CLAUDE_API_ACCOUNTS",
+    label: "Claude API accounts",
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -155,6 +160,7 @@ if (uploadedCount === 0) {
   console.log("⚠️  No credentials were uploaded.")
   console.log("   Run sync commands first:")
   console.log("     npm run antigravity:sync -- --tools")
+  console.log("     npm run claude:sync")
   console.log("     npm run codex:sync")
   process.exit(1)
 }

@@ -1,0 +1,15 @@
+{
+  "accounts": [
+    {
+      "label": "claude-code-sync",
+      "apiKey": "sk-JskJBUEy6HjkCv3mzWdDKzxmdpDJyTtqKFyof92pApDCQCUA",
+      "baseUrl": "https://cc.v587xhy.com",
+      "stripThinking": true,
+      "models": [
+        {
+          "name": "claude-opus-4-6"
+        }
+      ]
+    }
+  ]
+}

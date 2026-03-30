@@ -1,8 +1,6 @@
 import { HttpException, HttpStatus, Injectable, Logger } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
-import * as fs from "fs"
-import * as path from "path"
 import { TokenCounterService } from "../../context/token-counter.service"
 import { normalizeToolProtocolMessages } from "../../context/tool-protocol-normalizer"
 import { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
@@ -10,6 +8,7 @@ import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import { DEFAULT_CLAUDE_MODEL, resolveCloudCodeModel } from "../model-registry"
 import { ProcessPoolService } from "../native/process-pool.service"
 import { findPendingToolUseIdsInMessages } from "../tool-continuation-policy"
+import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
 
 class FatalCloudCodeRequestError extends Error {
@@ -32,8 +31,8 @@ export class GoogleService {
   private readonly logger = new Logger(GoogleService.name)
   private readonly ANTIGRAVITY_IDE_VERSION = "1.19.6"
 
-  // Official Antigravity system prompt (loaded from data/antigravity_system_prompt.txt)
-  private readonly officialSystemPrompt: string
+  // Official Antigravity system prompt baked into source.
+  private readonly officialSystemPrompt = ANTIGRAVITY_SYSTEM_PROMPT
 
   // Stable sessionId for Cloud Code API requests.
   // Official Antigravity generates one per IDE session (a signed 64-bit integer).
@@ -789,37 +788,9 @@ export class GoogleService {
     private readonly signatureStore: ToolThoughtSignatureService,
     private readonly tokenCounter: TokenCounterService
   ) {
-    // Load system prompt: dist/data/ (via nest-cli assets) or project root data/
-    const promptPaths = [
-      path.resolve(__dirname, "../../data/antigravity_system_prompt.txt"),
-      path.resolve(process.cwd(), "data/antigravity_system_prompt.txt"),
-    ]
-    let loaded = false
-    for (const p of promptPaths) {
-      if (fs.existsSync(p)) {
-        this.officialSystemPrompt = fs.readFileSync(p, "utf-8")
-        this.logger.log(
-          `Loaded official system prompt from ${p} (${this.officialSystemPrompt.length} chars)`
-        )
-        loaded = true
-        break
-      }
-    }
-    if (!loaded) {
-      this.logger.warn(
-        "Could not find data/antigravity_system_prompt.txt - using minimal fallback"
-      )
-      this.officialSystemPrompt = [
-        "<identity>",
-        "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.",
-        "</identity>",
-        "<tooling>",
-        "When inspecting a codebase, prefer structured tools such as read_file, list_directory, grep_search, search_symbols, go_to_definition, and semantic_search before using run_terminal_command.",
-        "Use read_file in focused windows instead of reading whole large files when possible.",
-        "Only use terminal commands when the user explicitly asks for shell execution or no structured tool can express the operation.",
-        "</tooling>",
-      ].join("\n")
-    }
+    this.logger.log(
+      `Loaded built-in Antigravity system prompt (${this.officialSystemPrompt.length} chars)`
+    )
 
     // Generate a stable sessionId for this process lifetime.
     // Official Antigravity uses a signed 64-bit integer (e.g. -3750763034362895579).

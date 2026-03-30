@@ -107,7 +107,7 @@ const CLAUDE_MODELS: Record<
   "claude-opus-4-6": {
     cloudCodeId: "claude-opus-4-6-thinking",
     displayName: "Claude Opus 4.6",
-    isThinking: true,
+    isThinking: false,
   },
   "claude-opus-4-20250514": {
     cloudCodeId: "claude-opus-4-6-thinking",
@@ -122,7 +122,7 @@ const CLAUDE_MODELS: Record<
   "claude-opus-4.6": {
     cloudCodeId: "claude-opus-4-6-thinking",
     displayName: "Claude Opus 4.6",
-    isThinking: true,
+    isThinking: false,
   },
   "claude-4.6-opus": {
     cloudCodeId: "claude-opus-4-6-thinking",
@@ -415,60 +415,61 @@ const CODEX_MODELS: Record<
   },
 }
 
-const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> = {
-  free: [
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-codex-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-  ],
-  team: [
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-codex-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.3-codex",
-    "gpt-5.4",
-  ],
-  plus: [
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-codex-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-  ],
-  pro: [
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-codex-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-  ],
-}
+const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
+  {
+    free: [
+      "gpt-5",
+      "gpt-5-codex",
+      "gpt-5-codex-mini",
+      "gpt-5.1",
+      "gpt-5.1-codex",
+      "gpt-5.1-codex-mini",
+      "gpt-5.1-codex-max",
+      "gpt-5.2",
+      "gpt-5.2-codex",
+    ],
+    team: [
+      "gpt-5",
+      "gpt-5-codex",
+      "gpt-5-codex-mini",
+      "gpt-5.1",
+      "gpt-5.1-codex",
+      "gpt-5.1-codex-mini",
+      "gpt-5.1-codex-max",
+      "gpt-5.2",
+      "gpt-5.2-codex",
+      "gpt-5.3-codex",
+      "gpt-5.4",
+    ],
+    plus: [
+      "gpt-5",
+      "gpt-5-codex",
+      "gpt-5-codex-mini",
+      "gpt-5.1",
+      "gpt-5.1-codex",
+      "gpt-5.1-codex-mini",
+      "gpt-5.1-codex-max",
+      "gpt-5.2",
+      "gpt-5.2-codex",
+      "gpt-5.3-codex",
+      "gpt-5.3-codex-spark",
+      "gpt-5.4",
+    ],
+    pro: [
+      "gpt-5",
+      "gpt-5-codex",
+      "gpt-5-codex-mini",
+      "gpt-5.1",
+      "gpt-5.1-codex",
+      "gpt-5.1-codex-mini",
+      "gpt-5.1-codex-max",
+      "gpt-5.2",
+      "gpt-5.2-codex",
+      "gpt-5.3-codex",
+      "gpt-5.3-codex-spark",
+      "gpt-5.4",
+    ],
+  }
 
 const CODEX_SHARED_MODEL_IDS = [
   "gpt-4.1",
@@ -863,11 +864,11 @@ export const GEMINI_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
 
 export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   {
-    name: "claude-4.6-opus",
+    name: "claude-opus-4-6",
     displayName: "Claude Opus 4.6",
     shortName: "Opus 4.6",
     family: "claude",
-    isThinking: true,
+    isThinking: false,
   },
   {
     name: "claude-opus-4-6-thinking",
@@ -1055,6 +1056,55 @@ export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
     isThinking: true,
   },
 ]
+
+const ALL_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  ...CLAUDE_CURSOR_DISPLAY_MODELS,
+  ...GEMINI_CURSOR_DISPLAY_MODELS,
+  ...CODEX_CURSOR_DISPLAY_MODELS,
+]
+
+const CURSOR_DISPLAY_MODEL_BY_NAME = new Map(
+  ALL_CURSOR_DISPLAY_MODELS.map(
+    (model) => [model.name.toLowerCase(), model] as const
+  )
+)
+
+export function getCursorDisplayModel(
+  modelId: string
+): CursorDisplayModel | null {
+  return CURSOR_DISPLAY_MODEL_BY_NAME.get(modelId.toLowerCase().trim()) || null
+}
+
+/**
+ * Some public model IDs imply Cursor-facing thinking/max semantics even if the
+ * provider-specific upstream model name does not literally contain
+ * "thinking". When an account strips thinking fields, those public IDs should
+ * not be exposed or matched by that account.
+ */
+export function doesModelIdRequireExplicitThinkingSupport(
+  modelId: string
+): boolean {
+  const normalized = modelId.toLowerCase().trim()
+  if (!normalized) {
+    return false
+  }
+
+  if (normalized.includes("thinking")) {
+    return true
+  }
+
+  const resolved = resolveCloudCodeModel(normalized)
+  return resolved?.family === "claude" && resolved.isThinking
+}
+
+export function canPublicClaudeModelUseGoogle(modelId: string): boolean {
+  const resolved = resolveCloudCodeModel(modelId)
+  if (!resolved || resolved.family !== "claude") {
+    return false
+  }
+
+  return resolved.isThinking || !resolved.cloudCodeId.includes("thinking")
+}
 
 export function normalizeCodexModelTier(
   value?: string | null

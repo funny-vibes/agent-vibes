@@ -53,6 +53,14 @@ export interface CooldownableAccount {
   cooldownUntil: number
   /** Per-model cooldown states */
   modelStates: Map<string, ModelCooldownState>
+  /** Permanent disable timestamp; set when credentials are known-bad */
+  disabledAt?: number
+  /** Permanent disable reason */
+  disabledReason?: string
+  /** HTTP status that caused permanent disablement */
+  disabledStatusCode?: number
+  /** Last disable-related upstream message */
+  disabledMessage?: string
 }
 
 /**
@@ -105,6 +113,10 @@ export function isAccountAvailableForModel(
   model: string,
   now: number = Date.now()
 ): boolean {
+  if (isAccountDisabled(account)) {
+    return false
+  }
+
   // Check global cooldown
   if (account.cooldownUntil > now) {
     return false
@@ -227,6 +239,10 @@ export function markAccountSuccess(
   account: CooldownableAccount,
   model?: string
 ): void {
+  if (isAccountDisabled(account)) {
+    return
+  }
+
   // Clear global cooldown
   account.cooldownUntil = 0
 
@@ -282,6 +298,10 @@ export function getEarliestRecovery(
   let earliest = Infinity
 
   for (const account of accounts) {
+    if (isAccountDisabled(account)) {
+      continue
+    }
+
     // Check global cooldown
     if (account.cooldownUntil > now) {
       earliest = Math.min(earliest, account.cooldownUntil)
@@ -310,6 +330,46 @@ export function getEarliestRecovery(
 
   const retryAfterMs = Math.max(0, earliest - now)
   return { earliestRecovery: earliest, retryAfterMs }
+}
+
+export function isAccountDisabled(account: CooldownableAccount): boolean {
+  return typeof account.disabledAt === "number" && account.disabledAt > 0
+}
+
+export function disableAccount(
+  account: CooldownableAccount,
+  reason: string,
+  options?: {
+    statusCode?: number
+    message?: string
+    accountLabel?: string
+  }
+): void {
+  const label = options?.accountLabel || "unknown"
+  account.disabledAt = Date.now()
+  account.disabledReason = reason
+  account.disabledStatusCode = options?.statusCode
+  account.disabledMessage = options?.message
+  account.cooldownUntil = 0
+  account.modelStates.clear()
+
+  const statusSuffix =
+    typeof options?.statusCode === "number"
+      ? ` status=${options.statusCode}`
+      : ""
+  const detailSuffix = options?.message
+    ? ` detail=${options.message.slice(0, 200)}`
+    : ""
+  logger.warn(
+    `[${label}] permanently disabled (${reason})${statusSuffix}${detailSuffix}`
+  )
+}
+
+export function clearAccountDisablement(account: CooldownableAccount): void {
+  delete account.disabledAt
+  delete account.disabledReason
+  delete account.disabledStatusCode
+  delete account.disabledMessage
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

@@ -14,9 +14,13 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
 import * as fs from "fs"
-import * as path from "path"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
+import {
+  getAccountConfigPathCandidates,
+  resolveLegacyAccountStatePath as resolveLegacyAccountStateJsonPath,
+  resolveRuntimeDataPath,
+} from "../../shared/protocol-bridge-paths"
 import { translateClaudeToCodex } from "../codex/codex-request-translator"
 import {
   createStreamState as createCodexStreamState,
@@ -26,11 +30,27 @@ import {
 import { buildReverseMapFromClaudeTools } from "../codex/tool-name-shortener"
 import {
   type CooldownableAccount,
+  clearAccountDisablement,
+  disableAccount,
+  isAccountDisabled,
+  getEarliestRecovery,
   markAccountCooldown,
   markAccountSuccess,
   pickAvailableAccount,
-  getEarliestRecovery,
 } from "../shared/account-cooldown"
+import {
+  BACKEND_ACCOUNT_STATE_DB_FILENAME,
+  BackendAccountStateStore,
+  type PersistedBackendAccountState,
+} from "../shared/backend-account-state-store"
+import {
+  BackendAccountPoolUnavailableError,
+  BackendApiError,
+} from "../shared/backend-errors"
+import {
+  BackendPoolEntryState,
+  BackendPoolStatus,
+} from "../shared/backend-pool-status"
 
 // ── Types for OpenAI Chat Completions API ──────────────────────────────
 
@@ -363,7 +383,11 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   apiKey: string
   baseUrl: string
   proxyUrl?: string
+  source: "env" | "file"
+  stateKey: string
 }
+
+type PersistedOpenaiCompatAccountState = PersistedBackendAccountState
 
 @Injectable()
 export class OpenaiCompatService implements OnModuleInit {
@@ -373,6 +397,20 @@ export class OpenaiCompatService implements OnModuleInit {
   private accounts: OpenaiCompatAccount[] = []
   /** Round-robin counter */
   private accountIndex = 0
+  /** Resolved config file path used to load file-backed accounts */
+  private accountsConfigPath: string | null = null
+  /** Runtime account health state persistence path */
+  private accountStatePath: string = resolveRuntimeDataPath(
+    BACKEND_ACCOUNT_STATE_DB_FILENAME
+  )
+  /** Legacy JSON state file path kept only for one-time migration */
+  private legacyAccountStatePath: string = resolveLegacyAccountStateJsonPath(
+    "openai-compat-account-state.json"
+  )
+  private accountStateStore = new BackendAccountStateStore(
+    this.accountStatePath,
+    this.logger
+  )
 
   /**
    * Responses API routing mode:
@@ -394,6 +432,378 @@ export class OpenaiCompatService implements OnModuleInit {
   >()
 
   constructor(private readonly configService: ConfigService) {}
+
+  private buildAccountStateKey(apiKey: string, baseUrl: string): string {
+    return crypto
+      .createHash("sha256")
+      .update(baseUrl)
+      .update("\0")
+      .update(apiKey)
+      .digest("hex")
+  }
+
+  private resolveAccountStateDbPath(configPath?: string | null): string {
+    return resolveRuntimeDataPath(BACKEND_ACCOUNT_STATE_DB_FILENAME, configPath)
+  }
+
+  private resolveLegacyAccountStatePath(configPath?: string | null): string {
+    return resolveLegacyAccountStateJsonPath(
+      "openai-compat-account-state.json",
+      configPath
+    )
+  }
+
+  private configureAccountStateStore(configPath?: string | null): void {
+    this.accountStatePath = this.resolveAccountStateDbPath(configPath)
+    this.legacyAccountStatePath = this.resolveLegacyAccountStatePath(configPath)
+    this.accountStateStore = new BackendAccountStateStore(
+      this.accountStatePath,
+      this.logger
+    )
+  }
+
+  private buildAccountRecord(params: {
+    label?: string
+    apiKey: string
+    baseUrl: string
+    proxyUrl?: string
+    source: "env" | "file"
+  }): OpenaiCompatAccount {
+    return {
+      label: params.label,
+      apiKey: params.apiKey,
+      baseUrl: params.baseUrl,
+      proxyUrl: params.proxyUrl,
+      source: params.source,
+      stateKey: this.buildAccountStateKey(params.apiKey, params.baseUrl),
+      cooldownUntil: 0,
+      modelStates: new Map(),
+    }
+  }
+
+  private pruneAccountState(
+    account: OpenaiCompatAccount,
+    now: number = Date.now()
+  ): void {
+    if (!isAccountDisabled(account) && account.cooldownUntil > 0) {
+      if (account.cooldownUntil <= now) {
+        account.cooldownUntil = 0
+      }
+    }
+
+    for (const [model, modelState] of account.modelStates.entries()) {
+      if (modelState.cooldownUntil <= now) {
+        account.modelStates.delete(model)
+      }
+    }
+  }
+
+  private loadPersistedAccountStates(): Map<
+    string,
+    PersistedOpenaiCompatAccountState
+  > {
+    return this.accountStateStore.loadStates(
+      "openai-compat",
+      this.legacyAccountStatePath
+    )
+  }
+
+  private applyPersistedAccountState(
+    account: OpenaiCompatAccount,
+    state?: PersistedOpenaiCompatAccountState
+  ): void {
+    if (!state) {
+      return
+    }
+
+    const now = Date.now()
+
+    if (typeof state.disabledAt === "number" && state.disabledAt > 0) {
+      account.disabledAt = state.disabledAt
+      account.disabledReason = state.disabledReason
+      account.disabledStatusCode = state.disabledStatusCode
+      account.disabledMessage = state.disabledMessage
+      account.cooldownUntil = 0
+      account.modelStates.clear()
+      this.logger.warn(
+        `[OpenAI-Compat] Restored permanently disabled account ${account.label || "unnamed"} (${account.baseUrl})`
+      )
+      return
+    }
+
+    if (typeof state.cooldownUntil === "number" && state.cooldownUntil > now) {
+      account.cooldownUntil = state.cooldownUntil
+    }
+
+    if (Array.isArray(state.modelStates)) {
+      for (const modelState of state.modelStates) {
+        if (
+          !modelState ||
+          typeof modelState.model !== "string" ||
+          !modelState.model ||
+          typeof modelState.cooldownUntil !== "number" ||
+          modelState.cooldownUntil <= now
+        ) {
+          continue
+        }
+
+        account.modelStates.set(modelState.model, {
+          cooldownUntil: modelState.cooldownUntil,
+          quotaExhausted: !!modelState.quotaExhausted,
+          backoffLevel:
+            typeof modelState.backoffLevel === "number"
+              ? modelState.backoffLevel
+              : 0,
+        })
+      }
+    }
+
+    this.pruneAccountState(account, now)
+  }
+
+  private hasPersistableAccountState(account: OpenaiCompatAccount): boolean {
+    this.pruneAccountState(account)
+    return (
+      isAccountDisabled(account) ||
+      account.cooldownUntil > 0 ||
+      account.modelStates.size > 0
+    )
+  }
+
+  private serializeAccountState(
+    account: OpenaiCompatAccount
+  ): PersistedOpenaiCompatAccountState | null {
+    this.pruneAccountState(account)
+
+    if (!this.hasPersistableAccountState(account)) {
+      return null
+    }
+
+    const record: PersistedOpenaiCompatAccountState = {
+      stateKey: account.stateKey,
+      label: account.label,
+      updatedAt: Date.now(),
+    }
+
+    if (isAccountDisabled(account)) {
+      record.disabledAt = account.disabledAt
+      record.disabledReason = account.disabledReason
+      record.disabledStatusCode = account.disabledStatusCode
+      record.disabledMessage = account.disabledMessage
+      return record
+    }
+
+    if (account.cooldownUntil > 0) {
+      record.cooldownUntil = account.cooldownUntil
+    }
+
+    if (account.modelStates.size > 0) {
+      record.modelStates = Array.from(account.modelStates.entries()).map(
+        ([model, modelState]) => ({
+          model,
+          cooldownUntil: modelState.cooldownUntil,
+          quotaExhausted: modelState.quotaExhausted,
+          backoffLevel: modelState.backoffLevel,
+        })
+      )
+    }
+
+    return record
+  }
+
+  private persistAccountStates(): void {
+    this.accountStateStore.replaceStates(
+      "openai-compat",
+      this.accounts
+        .map((account) => this.serializeAccountState(account))
+        .filter(
+          (account): account is PersistedOpenaiCompatAccountState =>
+            account != null
+        )
+    )
+  }
+
+  private buildErrorPreview(detail: string, maxLength: number = 200): string {
+    return detail.length > maxLength ? detail.slice(0, maxLength) : detail
+  }
+
+  private shouldDisableAccountPermanently(
+    statusCode: number,
+    detail: string
+  ): boolean {
+    if (statusCode === 401) {
+      return true
+    }
+
+    if (statusCode !== 403) {
+      return false
+    }
+
+    const normalized = detail.toLowerCase()
+    return /invalid[_ -]?api[_ -]?key|api key.*(?:invalid|deleted|disabled|expired|not exist)|provided api key|invalid credentials|authentication|unauthorized|credential/.test(
+      normalized
+    )
+  }
+
+  private disableAccountPermanently(
+    account: OpenaiCompatAccount,
+    statusCode: number,
+    detail: string
+  ): void {
+    disableAccount(account, "invalid_credentials", {
+      statusCode,
+      message: this.buildErrorPreview(detail, 500),
+      accountLabel: account.label,
+    })
+    this.persistAccountStates()
+  }
+
+  private markAccountTemporaryFailure(
+    account: OpenaiCompatAccount,
+    statusCode: number,
+    model?: string,
+    retryAfterHeader?: string
+  ): void {
+    if (isAccountDisabled(account)) {
+      return
+    }
+
+    markAccountCooldown(
+      account,
+      statusCode,
+      model,
+      retryAfterHeader,
+      account.label
+    )
+    this.persistAccountStates()
+  }
+
+  private markAccountHealthy(
+    account: OpenaiCompatAccount,
+    model?: string
+  ): void {
+    if (!this.hasPersistableAccountState(account)) {
+      return
+    }
+
+    clearAccountDisablement(account)
+    markAccountSuccess(account, model)
+    this.persistAccountStates()
+  }
+
+  private buildHttpFailureError(
+    account: OpenaiCompatAccount,
+    statusCode: number,
+    detail: string,
+    model?: string,
+    retryAfterHeader?: string,
+    suppressTemporaryState: boolean = false
+  ): BackendApiError {
+    const permanent = this.shouldDisableAccountPermanently(statusCode, detail)
+    if (permanent) {
+      this.disableAccountPermanently(account, statusCode, detail)
+    } else if (!suppressTemporaryState) {
+      this.markAccountTemporaryFailure(
+        account,
+        statusCode,
+        model,
+        retryAfterHeader
+      )
+    }
+
+    return new BackendApiError(
+      `OpenAI-compatible API error ${statusCode}: ${this.buildErrorPreview(detail)}`,
+      {
+        backend: "openai-compat",
+        statusCode,
+        permanent,
+      }
+    )
+  }
+
+  private buildTransientFailureError(
+    account: OpenaiCompatAccount,
+    statusCode: number,
+    message: string,
+    model?: string
+  ): BackendApiError {
+    this.markAccountTemporaryFailure(account, statusCode, model)
+    return new BackendApiError(message, {
+      backend: "openai-compat",
+      statusCode,
+    })
+  }
+
+  private parsePositiveTimeoutMs(envName: string, fallbackMs: number): number {
+    const raw = this.configService.get<string>(envName, "").trim()
+    if (!raw) return fallbackMs
+
+    const parsed = Number.parseInt(raw, 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs
+  }
+
+  private getStreamResponseHeadersTimeoutMs(): number {
+    return this.parsePositiveTimeoutMs(
+      "OPENAI_COMPAT_STREAM_HEADERS_TIMEOUT_MS",
+      15_000
+    )
+  }
+
+  private getStreamFirstChunkTimeoutMs(): number {
+    return this.parsePositiveTimeoutMs(
+      "OPENAI_COMPAT_STREAM_FIRST_CHUNK_TIMEOUT_MS",
+      15_000
+    )
+  }
+
+  private getStreamIdleTimeoutMs(): number {
+    return this.parsePositiveTimeoutMs(
+      "OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS",
+      60_000
+    )
+  }
+
+  private async fetchWithResponseHeadersTimeout(
+    url: string,
+    options: RequestInit & { dispatcher?: unknown },
+    timeoutMs: number,
+    timeoutMessage: string
+  ): Promise<Response> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+    try {
+      return await fetch(url, { ...options, signal: controller.signal })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(timeoutMessage)
+      }
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private async readStreamChunkWithTimeout(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    timeoutMs: number,
+    timeoutMessage: string
+  ): Promise<ReadableStreamReadResult<Uint8Array>> {
+    let timer: NodeJS.Timeout | undefined
+
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+        }),
+      ])
+    } finally {
+      if (timer) {
+        clearTimeout(timer)
+      }
+    }
+  }
 
   onModuleInit() {
     // 1. Load from JSON file (all accounts)
@@ -419,16 +829,27 @@ export class OpenaiCompatService implements OnModuleInit {
         (a) => a.apiKey === envApiKey && a.baseUrl === envBaseUrl
       )
       if (!alreadyExists) {
-        this.accounts.unshift({
-          label: "env",
-          apiKey: envApiKey,
-          baseUrl: envBaseUrl,
-          proxyUrl: envProxyUrl || undefined,
-          cooldownUntil: 0,
-          modelStates: new Map(),
-        })
+        this.accounts.unshift(
+          this.buildAccountRecord({
+            label: "env",
+            apiKey: envApiKey,
+            baseUrl: envBaseUrl,
+            proxyUrl: envProxyUrl || undefined,
+            source: "env",
+          })
+        )
       }
     }
+
+    this.configureAccountStateStore(this.accountsConfigPath)
+    const persistedStates = this.loadPersistedAccountStates()
+    for (const account of this.accounts) {
+      this.applyPersistedAccountState(
+        account,
+        persistedStates.get(account.stateKey)
+      )
+    }
+    this.persistAccountStates()
 
     // Responses API routing mode
     const responsesApiEnv = this.configService
@@ -456,8 +877,13 @@ export class OpenaiCompatService implements OnModuleInit {
         `responsesApiMode=${this.responsesApiMode}`
     )
     for (const acct of this.accounts) {
+      const stateSummary = isAccountDisabled(acct)
+        ? `disabled (${acct.disabledReason || "permanent"})`
+        : this.hasPersistableAccountState(acct)
+          ? "cooldown"
+          : "ready"
       this.logger.log(
-        `  → ${acct.label || "unnamed"}: ${acct.baseUrl} (key: ${acct.apiKey.substring(0, 8)}...)`
+        `  → ${acct.label || "unnamed"} [${acct.source}]: ${acct.baseUrl} (key: ${acct.apiKey.substring(0, 8)}..., state=${stateSummary})`
       )
     }
     if (this.accounts.length === 0) {
@@ -472,10 +898,9 @@ export class OpenaiCompatService implements OnModuleInit {
    * Load all accounts from openai-compat-accounts.json.
    */
   private loadAllAccountsFromFile(): OpenaiCompatAccount[] {
-    const configPaths = [
-      path.resolve("data/openai-compat-accounts.json"),
-      path.resolve("apps/protocol-bridge/data/openai-compat-accounts.json"),
-    ]
+    const configPaths = getAccountConfigPathCandidates(
+      "openai-compat-accounts.json"
+    )
 
     for (const configPath of configPaths) {
       if (!fs.existsSync(configPath)) continue
@@ -485,6 +910,8 @@ export class OpenaiCompatService implements OnModuleInit {
           accounts?: Array<Record<string, string>>
         }
         if (Array.isArray(data.accounts) && data.accounts.length > 0) {
+          this.accountsConfigPath = configPath
+          this.configureAccountStateStore(configPath)
           this.logger.log(
             `Loaded ${data.accounts.length} OpenAI-compat account(s) from ${configPath}`
           )
@@ -501,14 +928,15 @@ export class OpenaiCompatService implements OnModuleInit {
                 typeof a.baseUrl === "string" &&
                 !!a.baseUrl
             )
-            .map((a) => ({
-              label: a.label,
-              apiKey: a.apiKey,
-              baseUrl: a.baseUrl,
-              proxyUrl: a.proxyUrl,
-              cooldownUntil: 0,
-              modelStates: new Map(),
-            }))
+            .map((a) =>
+              this.buildAccountRecord({
+                label: a.label,
+                apiKey: a.apiKey,
+                baseUrl: a.baseUrl,
+                proxyUrl: a.proxyUrl,
+                source: "file",
+              })
+            )
         }
       } catch (err) {
         this.logger.warn(
@@ -522,38 +950,59 @@ export class OpenaiCompatService implements OnModuleInit {
 
   /**
    * Round-robin: pick the next available account, respecting cooldowns.
-   * Falls back to blind round-robin if no model is provided or only 1 account.
-   * Throws when all accounts are in cooldown (prevents retrying known-bad accounts).
+   * Skips permanently disabled accounts and throws a typed error when no account is usable.
    */
   private nextAccount(model?: string): OpenaiCompatAccount {
-    if (model && this.accounts.length > 1) {
-      const result = pickAvailableAccount(
-        this.accounts,
-        model,
-        this.accountIndex
-      )
-      if (result) {
-        this.accountIndex = (result.index + 1) % this.accounts.length
-        return result.account
-      }
-      // All accounts in cooldown — fail fast instead of hitting a known-bad account
-      const info = getEarliestRecovery(this.accounts, model)
-      const retrySeconds = info ? Math.ceil(info.retryAfterMs / 1000) : 60
-      throw new Error(
-        `All OpenAI-compat accounts are rate-limited for model ${model}. ` +
-          `Retry after ${retrySeconds} seconds.`
+    const targetModel = model || ""
+    const result = pickAvailableAccount(
+      this.accounts,
+      targetModel,
+      this.accountIndex
+    )
+    if (result) {
+      this.accountIndex = (result.index + 1) % this.accounts.length
+      return result.account
+    }
+
+    const disabledCount = this.accounts.filter((account) =>
+      isAccountDisabled(account)
+    ).length
+    const coolingCount = this.accounts.length - disabledCount
+    const info = targetModel
+      ? getEarliestRecovery(this.accounts, targetModel)
+      : getEarliestRecovery(this.accounts, "")
+
+    if (info) {
+      const retrySeconds = Math.ceil(info.retryAfterMs / 1000)
+      throw new BackendAccountPoolUnavailableError(
+        `All OpenAI-compat accounts are unavailable for model ${targetModel || "unknown"} ` +
+          `(${disabledCount} disabled, ${coolingCount} cooling down). ` +
+          `Retry after ${retrySeconds} seconds.`,
+        {
+          backend: "openai-compat",
+          retryAfterSeconds: retrySeconds,
+          disabledCount,
+          coolingCount,
+        }
       )
     }
-    const acct = this.accounts[this.accountIndex % this.accounts.length]!
-    this.accountIndex = (this.accountIndex + 1) % this.accounts.length
-    return acct
+
+    throw new BackendAccountPoolUnavailableError(
+      `All OpenAI-compat accounts are permanently disabled for model ${targetModel || "unknown"}.`,
+      {
+        backend: "openai-compat",
+        disabledCount,
+        coolingCount: 0,
+        permanent: true,
+      }
+    )
   }
 
   /**
    * Check if the backend is available (has at least one account configured).
    */
   isAvailable(): boolean {
-    return this.accounts.length > 0
+    return this.accounts.some((account) => !isAccountDisabled(account))
   }
 
   /**
@@ -561,6 +1010,44 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   checkAvailability(): Promise<boolean> {
     return Promise.resolve(this.isAvailable())
+  }
+
+  getPoolStatus(): BackendPoolStatus {
+    const now = Date.now()
+    const entries = this.accounts.map((account) => {
+      const modelCooldowns = this.getActiveModelCooldowns(account, now)
+      const state = this.getPoolEntryState(account, modelCooldowns, now)
+      return {
+        id: account.stateKey,
+        label: account.label || account.baseUrl,
+        state,
+        cooldownUntil: account.cooldownUntil,
+        disabledAt: account.disabledAt,
+        disabledReason: account.disabledReason,
+        source: account.source,
+        baseUrl: account.baseUrl,
+        proxyUrl: account.proxyUrl,
+        modelCooldowns,
+      }
+    })
+
+    return {
+      backend: "openai-compat",
+      kind: "account-pool",
+      configured: this.accounts.length > 0,
+      total: entries.length,
+      available: entries.filter(
+        (entry) => entry.state === "ready" || entry.state === "degraded"
+      ).length,
+      ready: entries.filter((entry) => entry.state === "ready").length,
+      degraded: entries.filter((entry) => entry.state === "degraded").length,
+      cooling: entries.filter((entry) => entry.state === "cooldown").length,
+      disabled: entries.filter((entry) => entry.state === "disabled").length,
+      unavailable: 0,
+      configPath: this.accountsConfigPath,
+      statePath: this.accountStatePath,
+      entries,
+    }
   }
 
   // ── Proxy agent ──────────────────────────────────────────────────────
@@ -579,6 +1066,38 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(`Failed to create proxy agent: ${(e as Error).message}`)
       return undefined
     }
+  }
+
+  private getActiveModelCooldowns(
+    account: OpenaiCompatAccount,
+    now: number
+  ): BackendPoolStatus["entries"][number]["modelCooldowns"] {
+    return Array.from(account.modelStates.entries())
+      .filter(([, state]) => state.cooldownUntil > now)
+      .map(([model, state]) => ({
+        model,
+        cooldownUntil: state.cooldownUntil,
+        quotaExhausted: state.quotaExhausted,
+        backoffLevel: state.backoffLevel,
+      }))
+      .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
+  }
+
+  private getPoolEntryState(
+    account: OpenaiCompatAccount,
+    modelCooldowns: BackendPoolStatus["entries"][number]["modelCooldowns"],
+    now: number
+  ): BackendPoolEntryState {
+    if (isAccountDisabled(account)) {
+      return "disabled"
+    }
+    if (account.cooldownUntil > now) {
+      return "cooldown"
+    }
+    if (modelCooldowns.length > 0) {
+      return "degraded"
+    }
+    return "ready"
   }
 
   // ── Request translation ──────────────────────────────────────────────
@@ -926,24 +1445,62 @@ export class OpenaiCompatService implements OnModuleInit {
       `[SimpleCompletion] Streaming request to ${url} (model=${model})`
     )
 
-    const response = await fetch(url, fetchOptions)
+    const responseHeadersTimeoutMs = this.getStreamResponseHeadersTimeoutMs()
+    let response: Response
+    try {
+      response = await this.fetchWithResponseHeadersTimeout(
+        url,
+        fetchOptions,
+        responseHeadersTimeoutMs,
+        `OpenAI-compatible stream timed out waiting for upstream response headers after ${responseHeadersTimeoutMs}ms`
+      )
+    } catch (error) {
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        model
+      )
+    }
+
     if (!response.ok) {
       const errorBody = await response.text()
-      throw new Error(
-        `OpenAI-compatible API error ${response.status}: ${errorBody}`
+      throw this.buildHttpFailureError(
+        account,
+        response.status,
+        errorBody,
+        model,
+        response.headers.get("retry-after") || undefined
       )
     }
 
     const reader = response.body?.getReader()
-    if (!reader) throw new Error("No response body reader")
+    if (!reader) {
+      throw this.buildTransientFailureError(
+        account,
+        502,
+        "OpenAI-compatible response has no body reader",
+        model
+      )
+    }
 
     const decoder = new TextDecoder()
     let buffer = ""
+    const firstChunkTimeoutMs = this.getStreamFirstChunkTimeoutMs()
+    const idleTimeoutMs = this.getStreamIdleTimeoutMs()
+    let receivedChunk = false
 
     try {
       while (true) {
-        const { done, value } = await reader.read()
+        const { done, value } = await this.readStreamChunkWithTimeout(
+          reader,
+          receivedChunk ? idleTimeoutMs : firstChunkTimeoutMs,
+          receivedChunk
+            ? "OpenAI-compatible stream timed out while waiting for the next SSE chunk"
+            : `OpenAI-compatible stream timed out waiting for the first SSE chunk after ${firstChunkTimeoutMs}ms`
+        )
         if (done) break
+        receivedChunk = true
 
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split("\n")
@@ -966,6 +1523,20 @@ export class OpenaiCompatService implements OnModuleInit {
           }
         }
       }
+      this.markAccountHealthy(account, model)
+    } catch (error) {
+      if (
+        error instanceof BackendApiError ||
+        error instanceof BackendAccountPoolUnavailableError
+      ) {
+        throw error
+      }
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        model
+      )
     } finally {
       reader.releaseLock()
     }
@@ -1052,6 +1623,46 @@ export class OpenaiCompatService implements OnModuleInit {
     return false
   }
 
+  private getBackendErrorStatus(error: unknown): number {
+    if (
+      error instanceof BackendApiError &&
+      typeof error.statusCode === "number"
+    ) {
+      return error.statusCode
+    }
+
+    const errorMsg =
+      error instanceof Error ? error.message || "" : String(error)
+    const statusMatch = errorMsg.match(/API error (\d+)/)
+    return statusMatch ? parseInt(statusMatch[1]!, 10) : 0
+  }
+
+  private shouldFallbackToChatCompletionsApi(
+    error: unknown,
+    model: string
+  ): boolean {
+    if (this.responsesApiMode === "always") return false
+    if (!this.isResponsesApiEligible(model)) return false
+    if (error instanceof BackendAccountPoolUnavailableError) return false
+    if (error instanceof BackendApiError && error.permanent) return false
+
+    const status = this.getBackendErrorStatus(error)
+    const message =
+      error instanceof Error ? error.message.toLowerCase() : String(error)
+
+    if (status === 503 || status === 501 || status === 404) return true
+    if (
+      status === 400 &&
+      /model|unsupported|unknown parameter|response format|reasoning/.test(
+        message
+      )
+    ) {
+      return true
+    }
+
+    return false
+  }
+
   // ── Headers ──────────────────────────────────────────────────────────
 
   private buildHeadersForAccount(
@@ -1092,8 +1703,9 @@ export class OpenaiCompatService implements OnModuleInit {
         this.recordEndpointSuccess(dto.model, "responses")
         return result
       } catch (e) {
-        // If forced mode, don't fallback
-        if (this.responsesApiMode === "always") throw e
+        if (!this.shouldFallbackToChatCompletionsApi(e, dto.model)) {
+          throw e
+        }
         this.logger.warn(
           `[OpenAI-Compat] Responses API failed for ${dto.model}, trying Chat Completions: ${(e as Error).message?.slice(0, 100)}`
         )
@@ -1112,8 +1724,7 @@ export class OpenaiCompatService implements OnModuleInit {
     } catch (e) {
       // Check if we should fallback to Responses API
       const errorMsg = (e as Error).message || ""
-      const statusMatch = errorMsg.match(/API error (\d+)/)
-      const status = statusMatch ? parseInt(statusMatch[1]!) : 0
+      const status = this.getBackendErrorStatus(e)
 
       if (
         endpoint !== "responses" &&
@@ -1158,38 +1769,40 @@ export class OpenaiCompatService implements OnModuleInit {
       fetchOptions.dispatcher = agent
     }
 
-    const response = await fetch(url, fetchOptions)
+    let response: Response
+    try {
+      response = await fetch(url, fetchOptions)
+    } catch (error) {
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        request.model
+      )
+    }
 
     if (!response.ok) {
       const errorBody = await response.text()
       this.logger.error(
         `[OpenAI-Compat] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
-      if (
-        !(
-          suppressCooldownForResponsesFallback &&
+      throw this.buildHttpFailureError(
+        account,
+        response.status,
+        errorBody,
+        request.model,
+        response.headers.get("retry-after") || undefined,
+        suppressCooldownForResponsesFallback &&
           this.shouldFallbackToResponsesApi(
             response.status,
             errorBody,
             request.model
           )
-        )
-      ) {
-        markAccountCooldown(
-          account,
-          response.status,
-          request.model,
-          response.headers.get("retry-after") || undefined,
-          account.label
-        )
-      }
-      throw new Error(
-        `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
       )
     }
 
     const result = (await response.json()) as Record<string, unknown>
-    markAccountSuccess(account, request.model)
+    this.markAccountHealthy(account, request.model)
     return this.translateNonStreamResponse(result)
   }
 
@@ -1313,7 +1926,10 @@ export class OpenaiCompatService implements OnModuleInit {
         this.recordEndpointSuccess(dto.model, "responses")
         return
       } catch (e) {
-        if (this.responsesApiMode === "always" || emittedResponsesEvents) {
+        if (
+          emittedResponsesEvents ||
+          !this.shouldFallbackToChatCompletionsApi(e, dto.model)
+        ) {
           throw e
         }
         this.logger.warn(
@@ -1336,8 +1952,7 @@ export class OpenaiCompatService implements OnModuleInit {
       this.recordEndpointSuccess(dto.model, "chat-completions")
     } catch (e) {
       const errorMsg = (e as Error).message || ""
-      const statusMatch = errorMsg.match(/API error (\d+)/)
-      const status = statusMatch ? parseInt(statusMatch[1]!) : 0
+      const status = this.getBackendErrorStatus(e)
 
       if (
         !emittedChatEvents &&
@@ -1375,7 +1990,6 @@ export class OpenaiCompatService implements OnModuleInit {
       method: "POST",
       headers,
       body: JSON.stringify(request),
-      signal: AbortSignal.timeout(600_000),
     }
 
     const agent = this.buildProxyAgentForAccount(account)
@@ -1383,38 +1997,52 @@ export class OpenaiCompatService implements OnModuleInit {
       fetchOptions.dispatcher = agent
     }
 
-    const response = await fetch(url, fetchOptions)
+    const responseHeadersTimeoutMs = this.getStreamResponseHeadersTimeoutMs()
+    let response: Response
+
+    try {
+      response = await this.fetchWithResponseHeadersTimeout(
+        url,
+        fetchOptions,
+        responseHeadersTimeoutMs,
+        `OpenAI-compatible stream timed out waiting for upstream response headers after ${responseHeadersTimeoutMs}ms`
+      )
+    } catch (error) {
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        request.model
+      )
+    }
 
     if (!response.ok) {
       const errorBody = await response.text()
       this.logger.error(
         `[OpenAI-Compat] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
-      if (
-        !(
-          suppressCooldownForResponsesFallback &&
+      throw this.buildHttpFailureError(
+        account,
+        response.status,
+        errorBody,
+        request.model,
+        response.headers.get("retry-after") || undefined,
+        suppressCooldownForResponsesFallback &&
           this.shouldFallbackToResponsesApi(
             response.status,
             errorBody,
             request.model
           )
-        )
-      ) {
-        markAccountCooldown(
-          account,
-          response.status,
-          request.model,
-          response.headers.get("retry-after") || undefined,
-          account.label
-        )
-      }
-      throw new Error(
-        `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
       )
     }
 
     if (!response.body) {
-      throw new Error("OpenAI-compatible response has no body")
+      throw this.buildTransientFailureError(
+        account,
+        502,
+        "OpenAI-compatible response has no body",
+        request.model
+      )
     }
 
     // Check content-type to ensure we are actually getting a stream,
@@ -1425,8 +2053,11 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(
         `[OpenAI-Compat] Expected stream but got HTML (possible captcha/WAF block). HTML start: ${errorBodyText.slice(0, 200)}`
       )
-      throw new Error(
-        `OpenAI-compatible API returned HTML page. API may be blocked by anti-bot protection.`
+      throw this.buildTransientFailureError(
+        account,
+        503,
+        "OpenAI-compatible API returned HTML page. API may be blocked by anti-bot protection.",
+        request.model
       )
     }
 
@@ -1438,24 +2069,28 @@ export class OpenaiCompatService implements OnModuleInit {
 
     // We implement an idle timeout for reader.read(). If no chunk is received
     // within IDLE_TIMEOUT_MS, we throw an error to prevent the bridge from hanging forever.
-    const IDLE_TIMEOUT_MS = 60_000
+    const FIRST_CHUNK_TIMEOUT_MS = this.getStreamFirstChunkTimeoutMs()
+    const IDLE_TIMEOUT_MS = this.getStreamIdleTimeoutMs()
+    let receivedChunk = false
 
     try {
       while (true) {
-        // Race between reading the next chunk and the idle timeout
-        const timeoutPromise = new Promise<{ done: never; value: never }>(
-          (_, reject) => {
-            setTimeout(
-              () => reject(new Error("Timeout reading from SSE stream")),
-              IDLE_TIMEOUT_MS
-            )
-          }
-        )
+        const timeoutMs = receivedChunk
+          ? IDLE_TIMEOUT_MS
+          : FIRST_CHUNK_TIMEOUT_MS
+        const timeoutMessage = receivedChunk
+          ? "OpenAI-compatible stream timed out while waiting for the next SSE chunk"
+          : `OpenAI-compatible stream timed out waiting for the first SSE chunk after ${FIRST_CHUNK_TIMEOUT_MS}ms`
 
-        const readResult = await Promise.race([reader.read(), timeoutPromise])
+        const readResult = await this.readStreamChunkWithTimeout(
+          reader,
+          timeoutMs,
+          timeoutMessage
+        )
 
         const { done, value } = readResult
         if (done) break
+        receivedChunk = true
 
         buffer += decoder.decode(value, { stream: true })
 
@@ -1485,6 +2120,20 @@ export class OpenaiCompatService implements OnModuleInit {
       if (state.messageStartEmitted) {
         yield* this.emitStreamEnd(state)
       }
+      this.markAccountHealthy(account, request.model)
+    } catch (error) {
+      if (
+        error instanceof BackendApiError ||
+        error instanceof BackendAccountPoolUnavailableError
+      ) {
+        throw error
+      }
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        request.model
+      )
     } finally {
       reader.releaseLock()
     }
@@ -2006,7 +2655,6 @@ export class OpenaiCompatService implements OnModuleInit {
       method: "POST",
       headers,
       body: requestBody,
-      signal: AbortSignal.timeout(600_000),
     }
 
     const agent = this.buildProxyAgentForAccount(account)
@@ -2014,29 +2662,47 @@ export class OpenaiCompatService implements OnModuleInit {
       fetchOptions.dispatcher = agent
     }
 
-    const response = await fetch(url, fetchOptions)
+    const responseHeadersTimeoutMs = this.getStreamResponseHeadersTimeoutMs()
+    let response: Response
+
+    try {
+      response = await this.fetchWithResponseHeadersTimeout(
+        url,
+        fetchOptions,
+        responseHeadersTimeoutMs,
+        `OpenAI-compatible Responses stream timed out waiting for upstream response headers after ${responseHeadersTimeoutMs}ms`
+      )
+    } catch (error) {
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        modelName
+      )
+    }
 
     if (!response.ok) {
       const errorBody = await response.text()
       this.logger.error(
         `[OpenAI-Compat/Responses] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
-      if (!suppressCooldownForChatFallback) {
-        markAccountCooldown(
-          account,
-          response.status,
-          modelName,
-          response.headers.get("retry-after") || undefined,
-          account.label
-        )
-      }
-      throw new Error(
-        `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
+      throw this.buildHttpFailureError(
+        account,
+        response.status,
+        errorBody,
+        modelName,
+        response.headers.get("retry-after") || undefined,
+        suppressCooldownForChatFallback
       )
     }
 
     if (!response.body) {
-      throw new Error("OpenAI-compatible Responses API response has no body")
+      throw this.buildTransientFailureError(
+        account,
+        502,
+        "OpenAI-compatible Responses API response has no body",
+        modelName
+      )
     }
 
     // Check content-type
@@ -2046,8 +2712,11 @@ export class OpenaiCompatService implements OnModuleInit {
       this.logger.error(
         `[OpenAI-Compat/Responses] Expected stream but got HTML. HTML start: ${errorBodyText.slice(0, 200)}`
       )
-      throw new Error(
-        `OpenAI-compatible API returned HTML page. API may be blocked by anti-bot protection.`
+      throw this.buildTransientFailureError(
+        account,
+        503,
+        "OpenAI-compatible API returned HTML page. API may be blocked by anti-bot protection.",
+        modelName
       )
     }
 
@@ -2057,22 +2726,27 @@ export class OpenaiCompatService implements OnModuleInit {
     const decoder = new TextDecoder()
     let buffer = ""
 
-    const IDLE_TIMEOUT_MS = 60_000
+    const FIRST_CHUNK_TIMEOUT_MS = this.getStreamFirstChunkTimeoutMs()
+    const IDLE_TIMEOUT_MS = this.getStreamIdleTimeoutMs()
+    let receivedChunk = false
 
     try {
       while (true) {
-        const timeoutPromise = new Promise<{ done: never; value: never }>(
-          (_, reject) => {
-            setTimeout(
-              () => reject(new Error("Timeout reading from SSE stream")),
-              IDLE_TIMEOUT_MS
-            )
-          }
-        )
+        const timeoutMs = receivedChunk
+          ? IDLE_TIMEOUT_MS
+          : FIRST_CHUNK_TIMEOUT_MS
+        const timeoutMessage = receivedChunk
+          ? "OpenAI-compatible Responses stream timed out while waiting for the next SSE chunk"
+          : `OpenAI-compatible Responses stream timed out waiting for the first SSE chunk after ${FIRST_CHUNK_TIMEOUT_MS}ms`
 
-        const readResult = await Promise.race([reader.read(), timeoutPromise])
+        const readResult = await this.readStreamChunkWithTimeout(
+          reader,
+          timeoutMs,
+          timeoutMessage
+        )
         const { done, value } = readResult
         if (done) break
+        receivedChunk = true
 
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split("\n")
@@ -2101,6 +2775,20 @@ export class OpenaiCompatService implements OnModuleInit {
           yield event
         }
       }
+      this.markAccountHealthy(account, modelName)
+    } catch (error) {
+      if (
+        error instanceof BackendApiError ||
+        error instanceof BackendAccountPoolUnavailableError
+      ) {
+        throw error
+      }
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        modelName
+      )
     } finally {
       reader.releaseLock()
     }
@@ -2149,24 +2837,30 @@ export class OpenaiCompatService implements OnModuleInit {
       fetchOptions.dispatcher = agent
     }
 
-    const response = await fetch(url, fetchOptions)
+    let response: Response
+    try {
+      response = await fetch(url, fetchOptions)
+    } catch (error) {
+      throw this.buildTransientFailureError(
+        account,
+        504,
+        error instanceof Error ? error.message : String(error),
+        modelName
+      )
+    }
 
     if (!response.ok) {
       const errorBody = await response.text()
       this.logger.error(
         `[OpenAI-Compat/Responses] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
-      if (!suppressCooldownForChatFallback) {
-        markAccountCooldown(
-          account,
-          response.status,
-          modelName,
-          response.headers.get("retry-after") || undefined,
-          account.label
-        )
-      }
-      throw new Error(
-        `OpenAI-compatible API error ${response.status}: ${errorBody.slice(0, 200)}`
+      throw this.buildHttpFailureError(
+        account,
+        response.status,
+        errorBody,
+        modelName,
+        response.headers.get("retry-after") || undefined,
+        suppressCooldownForChatFallback
       )
     }
 
@@ -2186,6 +2880,7 @@ export class OpenaiCompatService implements OnModuleInit {
         if (event.type === "response.completed") {
           const result = translateCodexToClaudeNonStream(event, reverseToolMap)
           if (result) {
+            this.markAccountHealthy(account, modelName)
             this.logger.log(
               `[OpenAI-Compat/Responses] Non-stream response: model=${result.model}, stop=${result.stop_reason}`
             )
@@ -2197,8 +2892,11 @@ export class OpenaiCompatService implements OnModuleInit {
       }
     }
 
-    throw new Error(
-      "OpenAI-compatible Responses API stream ended without response.completed event"
+    throw this.buildTransientFailureError(
+      account,
+      504,
+      "OpenAI-compatible Responses API stream ended without response.completed event",
+      modelName
     )
   }
 }

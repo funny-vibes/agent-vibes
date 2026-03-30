@@ -32,7 +32,7 @@ if (!mode) {
 }
 
 // ---------------------------------------------------------------------------
-// Output path — always apps/protocol-bridge/data/accounts.json
+// Output path — always apps/protocol-bridge/data/antigravity-accounts.json
 // ---------------------------------------------------------------------------
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..")

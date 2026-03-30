@@ -130,7 +130,7 @@ function readCodexAuth() {
 }
 
 // ---------------------------------------------------------------------------
-// Write to codex-accounts.json
+// Write to data/codex-accounts.json
 // ---------------------------------------------------------------------------
 
 function writeAccountsFile(destPath, account) {

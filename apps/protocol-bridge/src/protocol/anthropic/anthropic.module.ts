@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common"
+import { ClaudeApiModule } from "../../llm/claude-api/claude-api.module"
 import { HistoryModule } from "../../context/history.module"
 import { TokenizerModule } from "../../context/tokenizer.module"
 import { CodexModule } from "../../llm/codex/codex.module"
@@ -10,6 +11,7 @@ import { MessagesService } from "./messages.service"
 
 @Module({
   imports: [
+    ClaudeApiModule,
     CodexModule,
     GoogleModule,
     HistoryModule,
@@ -19,6 +21,12 @@ import { MessagesService } from "./messages.service"
   ],
   controllers: [MessagesController],
   providers: [MessagesService],
-  exports: [MessagesService],
+  exports: [
+    ClaudeApiModule,
+    CodexModule,
+    GoogleModule,
+    MessagesService,
+    OpenaiCompatModule,
+  ],
 })
 export class AnthropicModule {}

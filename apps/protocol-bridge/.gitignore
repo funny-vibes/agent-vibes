@@ -45,8 +45,11 @@ lerna-debug.log*
 .env.local
 
 # Antigravity account credentials
+.runtime/
 data/accounts.json
 data/accounts.local.json
+data/*-accounts.json
+data/*-account-state.json
 
 # temp directory
 .temp

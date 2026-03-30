@@ -2,9 +2,11 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConversationTruncatorService, UnifiedMessage } from "../../context"
 import { TokenizerService } from "../../context/tokenizer.service"
 import { CodexService } from "../../llm/codex/codex.service"
+import { ClaudeApiService } from "../../llm/claude-api/claude-api.service"
 import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
+  canPublicClaudeModelUseGoogle,
   getCodexPublicModelIds,
   getPublicModelMetadata,
   resolveCloudCodeModel,
@@ -32,7 +34,8 @@ export class MessagesService implements OnModuleInit {
     private readonly tokenizer: TokenizerService,
     private readonly truncator: ConversationTruncatorService,
     private readonly codexService: CodexService,
-    private readonly openaiCompatService: OpenaiCompatService
+    private readonly openaiCompatService: OpenaiCompatService,
+    private readonly claudeApiService: ClaudeApiService
   ) {}
 
   /**
@@ -42,7 +45,15 @@ export class MessagesService implements OnModuleInit {
     await this.modelRouter.initializeRouting(
       () => this.googleService.checkAvailability(),
       () => this.codexService.checkAvailability(),
-      () => this.openaiCompatService.checkAvailability()
+      () => this.openaiCompatService.checkAvailability(),
+      () => this.claudeApiService.checkAvailability()
+    )
+    this.modelRouter.setGptAvailabilityProviders({
+      codex: () => this.codexService.isAvailable(),
+      openaiCompat: () => this.openaiCompatService.isAvailable(),
+    })
+    this.modelRouter.setClaudeAvailabilityProvider((model) =>
+      this.claudeApiService.supportsModel(model)
     )
     this.logger.log("Backend availability tests completed")
   }
@@ -235,12 +246,21 @@ export class MessagesService implements OnModuleInit {
   private async executeRoutedMessage(
     dto: CreateMessageDto,
     route: ModelRouteResult,
+    forwardHeaders?: Record<string, string>,
     attemptedBackends: Set<string> = new Set()
   ): Promise<AnthropicResponse> {
     attemptedBackends.add(route.backend)
     const routedDto = { ...dto, model: route.model }
 
     try {
+      if (route.backend === "claude-api") {
+        this.logger.log(`[ROUTE] Claude API backend | model: ${route.model}`)
+        return await this.claudeApiService.sendClaudeMessage(
+          routedDto,
+          forwardHeaders
+        )
+      }
+
       if (route.backend === "openai-compat") {
         this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
         return await this.openaiCompatService.sendClaudeMessage(routedDto)
@@ -275,7 +295,12 @@ export class MessagesService implements OnModuleInit {
             error
           )}; falling back to ${fallback.backend}`
         )
-        return this.executeRoutedMessage(dto, fallback, attemptedBackends)
+        return this.executeRoutedMessage(
+          dto,
+          fallback,
+          forwardHeaders,
+          attemptedBackends
+        )
       }
 
       throw error
@@ -285,6 +310,7 @@ export class MessagesService implements OnModuleInit {
   private async *executeRoutedMessageStream(
     dto: CreateMessageDto,
     route: ModelRouteResult,
+    forwardHeaders?: Record<string, string>,
     attemptedBackends: Set<string> = new Set()
   ): AsyncGenerator<string, void, unknown> {
     attemptedBackends.add(route.backend)
@@ -313,6 +339,22 @@ export class MessagesService implements OnModuleInit {
     }
 
     try {
+      if (route.backend === "claude-api") {
+        this.logger.log(
+          `[ROUTE] Claude API backend | model: ${route.model} | stream: true`
+        )
+        for await (const event of this.claudeApiService.sendClaudeMessageStream(
+          routedDto,
+          forwardHeaders
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
       if (route.backend === "openai-compat") {
         this.logger.log(
           `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
@@ -375,7 +417,12 @@ export class MessagesService implements OnModuleInit {
             error
           )}; falling back to ${fallback.backend}`
         )
-        yield* this.executeRoutedMessageStream(dto, fallback, attemptedBackends)
+        yield* this.executeRoutedMessageStream(
+          dto,
+          fallback,
+          forwardHeaders,
+          attemptedBackends
+        )
         return
       }
 
@@ -383,7 +430,10 @@ export class MessagesService implements OnModuleInit {
     }
   }
 
-  async createMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
+  async createMessage(
+    dto: CreateMessageDto,
+    forwardHeaders?: Record<string, string>
+  ): Promise<AnthropicResponse> {
     this.logger.log(
       `Request for model: ${dto.model}, stream: ${dto.stream || false}`
     )
@@ -397,14 +447,15 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
-    return this.executeRoutedMessage(dto, route)
+    return this.executeRoutedMessage(dto, route, forwardHeaders)
   }
 
   /**
    * Create streaming message response
    */
   async *createMessageStream(
-    dto: CreateMessageDto
+    dto: CreateMessageDto,
+    forwardHeaders?: Record<string, string>
   ): AsyncGenerator<string, void, unknown> {
     this.logger.log(`Streaming request for model: ${dto.model}`)
 
@@ -417,7 +468,7 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
-    yield* this.executeRoutedMessageStream(dto, route)
+    yield* this.executeRoutedMessageStream(dto, route, forwardHeaders)
   }
 
   /**
@@ -506,6 +557,41 @@ export class MessagesService implements OnModuleInit {
 
   listModels() {
     const now = Math.floor(Date.now() / 1000)
+    const canRouteViaGoogle = (modelId: string): boolean => {
+      if (!this.modelRouter.isGoogleAvailable) {
+        return false
+      }
+
+      const resolved = resolveCloudCodeModel(modelId)
+      if (!resolved) {
+        return false
+      }
+
+      return (
+        (resolved.family !== "claude" ||
+          canPublicClaudeModelUseGoogle(modelId)) &&
+        this.googleModelCache.isValidModel(resolved.cloudCodeId)
+      )
+    }
+    const isModelAdvertisable = (modelId: string): boolean => {
+      const resolved = resolveCloudCodeModel(modelId)
+      if (!resolved) {
+        return false
+      }
+
+      if (resolved.family === "gpt") {
+        return this.codexService.isAvailable()
+      }
+
+      if (resolved.family === "gemini") {
+        return canRouteViaGoogle(modelId)
+      }
+
+      return (
+        this.claudeApiService.supportsModel(modelId) ||
+        canRouteViaGoogle(modelId)
+      )
+    }
     const modelMap = new Map<
       string,
       {
@@ -546,6 +632,10 @@ export class MessagesService implements OnModuleInit {
     }
 
     // 2) Compatibility aliases we intentionally keep for existing clients
+    for (const modelId of this.claudeApiService.getPublicModelIds()) {
+      addModel(modelId, "anthropic")
+    }
+
     const compatibilityModels = [
       "gemini-2.5-flash",
       "gemini-3-flash",
@@ -565,7 +655,9 @@ export class MessagesService implements OnModuleInit {
       "claude-4.5-opus-high-thinking",
     ]
     for (const modelId of compatibilityModels) {
-      addModel(modelId)
+      if (isModelAdvertisable(modelId)) {
+        addModel(modelId)
+      }
     }
 
     // 3) Codex models (if backend is available)

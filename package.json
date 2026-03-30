@@ -52,6 +52,7 @@
     "cursor:forward:off": "node bin/agent-vibes forward off",
     "cursor:forward:status": "node bin/agent-vibes forward status",
     "antigravity:sync": "node bin/agent-vibes sync",
+    "claude:sync": "node bin/agent-vibes sync --claude",
     "codex:sync": "node bin/agent-vibes sync --codex",
     "antigravity:capture:start": "node bin/agent-vibes capture start",
     "antigravity:capture:stop": "node bin/agent-vibes capture stop",

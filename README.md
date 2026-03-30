@@ -24,6 +24,7 @@ Agent Vibes is a proxy server that connects AI coding clients to AI backends thr
 
 - **Antigravity IDE** — Google Cloud Code API with protocol-compliant requests
 - **Codex CLI** — OpenAI-compatible API for GPT and Codex models
+- **Claude-Compatible API** — Anthropic-compatible `/v1/messages` with third-party keys
 
 > **Disclaimer:** This project is for educational and research purposes only.
 >
@@ -44,18 +45,19 @@ Agent Vibes is a proxy server that connects AI coding clients to AI backends thr
 + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
 │                  Agent Vibes Proxy Server                   │
 │                                                             │
-│  Gemini / Claude  → Antigravity IDE (Cloud Code)            │
-│  GPT / Codex      → Codex CLI                               │
+│  Gemini           → Antigravity IDE (Cloud Code)            │
+│  Claude           → Claude-Compatible API / Antigravity     │
+│  GPT              → Codex CLI / OpenAI-compatible API       │
 │                                                             │
 + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
 ```
 
 ## Features
 
-| Client          | Protocol                              | Backend                    | Models                     |
-| --------------- | ------------------------------------- | -------------------------- | -------------------------- |
-| Claude Code CLI | Anthropic Messages API (SSE)          | Antigravity IDE, Codex CLI | Gemini, Claude, GPT, Codex |
-| Cursor IDE      | ConnectRPC/gRPC (protocol-compatible) | Antigravity IDE, Codex CLI | Gemini, Claude, GPT, Codex |
+| Client          | Protocol                              | Backend                                           | Models              |
+| --------------- | ------------------------------------- | ------------------------------------------------- | ------------------- |
+| Claude Code CLI | Anthropic Messages API (SSE)          | Antigravity IDE, Claude-Compatible API, Codex CLI | Gemini, Claude, GPT |
+| Cursor IDE      | ConnectRPC/gRPC (protocol-compatible) | Antigravity IDE, Claude-Compatible API, Codex CLI | Gemini, Claude, GPT |
 
 ## Compared with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 
@@ -102,14 +104,31 @@ mkcert -install
 agent-vibes cert
 ```
 
-Sync your Antigravity credentials ([Antigravity IDE](https://antigravity.google) or [Antigravity Manager](https://github.com/lbjlaq/Antigravity-Manager)):
+### Choose One Upstream Source
+
+Antigravity ([Antigravity IDE](https://antigravity.google) or [Antigravity Manager](https://github.com/lbjlaq/Antigravity-Manager)):
 
 ```bash
 agent-vibes sync --ide       # from Antigravity IDE
 agent-vibes sync --tools     # from Antigravity Manager
 ```
 
-### Use with Claude Code CLI
+Claude Code third-party config:
+
+```bash
+agent-vibes sync --claude
+```
+
+Codex:
+
+```bash
+codex --login
+agent-vibes sync --codex
+```
+
+### Daily Use
+
+#### Claude Code CLI
 
 ```bash
 agent-vibes                  # start proxy
@@ -124,7 +143,7 @@ claude
 
 > **Tip:** Add `export ANTHROPIC_BASE_URL=https://localhost:8000` to your shell profile to make it persistent.
 
-### Use with Cursor IDE
+#### Cursor IDE
 
 For the Cursor client side, a free account is enough. No paid Cursor plan is required.
 
@@ -150,31 +169,38 @@ Verify everything is working:
 agent-vibes forward status
 ```
 
-### Environment Variables
+## Backend Configuration Reference
 
-| Variable               | Default              | Description                      |
-| ---------------------- | -------------------- | -------------------------------- |
-| `PORT`                 | `8000`               | Server port                      |
-| `PROXY_API_KEY`        | _(disabled)_         | Require API key for all requests |
-| `ANTIGRAVITY_STORAGE`  | `~/.protocol-bridge` | Path to Antigravity credentials  |
-| `ANTIGRAVITY_APP_PATH` | _(auto-detect)_      | Optional Antigravity.app path    |
+### 1. Antigravity
 
-## Codex Backend (GPT / O-series Models)
+Use for Antigravity / Google Cloud Code access.
+
+Configuration:
 
 ```bash
-# Login and sync (supports multiple accounts / team workspaces, sync after each login to add)
-codex --login
-agent-vibes sync --codex
-
-# Start proxy
-agent-vibes
+agent-vibes sync --ide
+agent-vibes sync --tools
 ```
 
-Multiple accounts are automatically rotated. When quota is exhausted, the system automatically switches to the next available account.
+Behavior:
 
-## OpenAI-Compatible Backend (Third-party GPT APIs)
+- Credentials are synced into `apps/protocol-bridge/data/antigravity-accounts.json`.
+- Supports multi-account rotation.
 
-Add accounts to `apps/protocol-bridge/data/openai-compat-accounts.json` (supports multi-account rotation):
+### 2. GPT
+
+Use for GPT models.
+
+Configuration:
+
+- Codex:
+
+```bash
+codex --login
+agent-vibes sync --codex
+```
+
+- OpenAI-compatible file: `apps/protocol-bridge/data/openai-compat-accounts.json`
 
 ```json
 {
@@ -193,9 +219,63 @@ Add accounts to `apps/protocol-bridge/data/openai-compat-accounts.json` (support
 }
 ```
 
-When both OpenAI-compatible and Codex backends are configured,
-GPT / O-series requests are routed to the OpenAI-compatible backend first.
-When quota is exhausted, the system automatically switches to the next available account.
+Behavior:
+
+- Codex and OpenAI-compatible both support multi-account rotation.
+- If both OpenAI-compatible and Codex are configured, GPT requests go to OpenAI-compatible first.
+- When quota is exhausted, the system automatically switches to the next available account.
+
+### 3. Claude API
+
+Use for third-party Claude-compatible APIs.
+
+Configuration:
+
+- `agent-vibes sync --claude` reads `~/.claude/settings.json` and writes or updates a managed `claude-code-sync` entry in `apps/protocol-bridge/data/claude-api-accounts.json`.
+- Or edit `apps/protocol-bridge/data/claude-api-accounts.json` manually:
+
+```json
+{
+  "forceModelPrefix": false,
+  "accounts": [
+    {
+      "label": "anthropic-official",
+      "apiKey": "sk-ant-xxx",
+      "baseUrl": "https://api.anthropic.com"
+    },
+    {
+      "label": "third-party",
+      "apiKey": "sk-third-yyy",
+      "baseUrl": "https://claude.example.com",
+      "stripThinking": true,
+      "proxyUrl": "socks5://127.0.0.1:1080",
+      "prefix": "team-a",
+      "priority": 10,
+      "headers": {
+        "X-Custom-Header": "value"
+      },
+      "excludedModels": ["claude-3-*"],
+      "models": [
+        {
+          "name": "claude-opus-4-6",
+          "alias": "claude-4.6-opus-thinking"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Behavior:
+
+- Unprefixed Claude models prefer the Claude API backend when a matching account exists, and fall back to Antigravity/Google Cloud Code.
+- `forceModelPrefix=false` means a prefixed account exposes both `claude-sonnet-latest` and `team-a/claude-sonnet-latest`.
+- `forceModelPrefix=true` requires explicit prefixed requests for prefixed accounts.
+- Prefixed models such as `team-a/claude-sonnet-latest` only route to the matching Claude API account prefix.
+- If `models` is omitted, the requested Claude model name is passed upstream as-is.
+- `stripThinking=true` removes Anthropic thinking fields before forwarding for providers that only support the base Claude model name.
+- `excludedModels` supports case-insensitive wildcard patterns such as `claude-3-*`, `*-thinking`, or `*haiku*`.
+- Official `api.anthropic.com` accounts use `x-api-key`; third-party endpoints use `Authorization: Bearer ...`.
 
 ## Project Structure
 
@@ -234,6 +314,7 @@ agent-vibes/
 │       │   │   ├── model.module.ts            #   ModelModule
 │       │   │   ├── model-registry.ts          #   Model alias → backend ID mapping
 │       │   │   ├── model-router.service.ts    #   Multi-backend dispatcher
+│       │   │   ├── claude-api/                #   ClaudeApiModule — Claude-compatible key pool
 │       │   │   ├── google/                    #   GoogleModule — Cloud Code API
 │       │   │   ├── codex/                     #   CodexModule — OpenAI Codex reverse proxy
 │       │   │   ├── native/                    #   NativeModule — Process pool workers
@@ -260,62 +341,6 @@ agent-vibes/
     ├── diagnostics/                           # One-click issue report collector
     ├── proxy/                                 # Port forwarding (TCP relay/iptables/netsh)
     └── capture/                               # Traffic capture and dump inspection
-```
-
-## Commands
-
-### Development
-
-```bash
-npm run dev                    # Start dev server (turbo watch mode)
-npm run build                  # Build all packages
-npm run start                  # Start production server
-```
-
-### Code Quality
-
-```bash
-npm run lint                   # ESLint check
-npm run lint:fix               # Auto-fix lint issues
-npm run format                 # Prettier check
-npm run format:fix             # Auto-fix formatting
-npm run types                  # TypeScript type check
-```
-
-### Proxy App (from `apps/protocol-bridge/`)
-
-```bash
-npm run dev                    # NestJS watch mode
-npm run build                  # Build to dist/
-npm run test                   # Run Jest tests
-npm run proto:gen              # Generate TypeScript from proto files
-```
-
-### Cursor Integration
-
-```bash
-npm run cursor:cert            # Generate SSL certificates (mkcert)
-npm run cursor:forward:on      # Enable port forwarding (requires sudo/admin)
-npm run cursor:forward:off     # Disable port forwarding (requires sudo/admin)
-npm run cursor:forward:status  # Show forwarding status
-```
-
-If Cursor is installed in a non-standard location, set `CURSOR_BINARY_PATH`, `CURSOR_WORKBENCH_PATH`, or `CURSOR_APP_ROOT` for the tooling scripts.
-
-### Credential Sync & Deployment
-
-```bash
-npm run antigravity:sync       # Sync Antigravity accounts → data/antigravity-accounts.json
-npm run codex:sync             # Sync Codex CLI auth → data/codex-accounts.json
-npm run deploy:sync            # Upload all credentials to GitHub Secrets
-npm run deploy:sync -- --run   # Upload + trigger CI/CD deployment
-npm run release                # Merge dev → main → push (triggers CI deploy)
-```
-
-### Diagnostics
-
-```bash
-npm run issues                 # Collect logs & environment info, copy to clipboard
 ```
 
 ## API Endpoints
