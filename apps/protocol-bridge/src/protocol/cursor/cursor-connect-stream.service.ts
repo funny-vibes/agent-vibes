@@ -1547,6 +1547,12 @@ ${raw}
     }
 
     if (searchText.length === 0) {
+      // When beforeContent is empty (new file creation) and search is empty,
+      // this is a valid "create new file" pattern: the LLM passes old_text=""
+      // + new_text="content" to write the entire file. Allow it through.
+      if (beforeContent.length === 0 && replaceText.length > 0) {
+        return { fileText: replaceText }
+      }
       return {
         fileText: beforeContent,
         warning:
@@ -6688,6 +6694,37 @@ ${raw}
       this.logger.warn(
         `[PostToolContinuation] Backend appears rate-limited; ` +
           `tool execution succeeded but agent continuation could not continue automatically`
+      )
+    }
+
+    // Send checkpoint before turn_ended (required for rollback consistency).
+    // Matches the pattern in handleChatMessage, emitAgentFinalTextResponse,
+    // and handleToolResultContinuation to ensure all turn-ending paths
+    // produce a valid conversationCheckpointUpdate.
+    const session = this.sessionManager.getSession(conversationId)
+    if (session) {
+      const turnId = this.generateTurnId(conversationId, session.turns.length)
+      this.sessionManager.addTurn(conversationId, turnId)
+
+      const checkpoint = this.grpcService.createConversationCheckpointResponse(
+        conversationId,
+        session.model,
+        {
+          messageBlobIds: session.messageBlobIds,
+          usedTokens: session.usedTokens || 0,
+          maxTokens: this.resolveCheckpointMaxTokens(session),
+          workspaceUri: session.projectContext?.rootPath
+            ? `file://${session.projectContext.rootPath}`
+            : undefined,
+          readPaths: Array.from(session.readPaths),
+          fileStates: Object.fromEntries(session.fileStates),
+          turns: session.turns,
+          todos: session.todos,
+        }
+      )
+      yield checkpoint
+      this.logger.log(
+        "Sent conversationCheckpointUpdate (post-tool continuation error)"
       )
     }
 
