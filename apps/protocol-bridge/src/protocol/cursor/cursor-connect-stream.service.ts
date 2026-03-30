@@ -1320,6 +1320,53 @@ ${raw}
     )
   }
 
+  private buildConversationCheckpoint(
+    session: ChatSession,
+    conversationId: string,
+    model: string
+  ): Buffer {
+    return this.grpcService.createConversationCheckpointResponse(
+      conversationId,
+      model,
+      {
+        messageBlobIds: session.messageBlobIds,
+        usedTokens: session.usedTokens || 0,
+        maxTokens: this.resolveCheckpointMaxTokens(session),
+        workspaceUri: session.projectContext?.rootPath
+          ? `file://${session.projectContext.rootPath}`
+          : undefined,
+        readPaths: Array.from(session.readPaths),
+        fileStates: Object.fromEntries(session.fileStates),
+        turns: session.turns,
+        todos: session.todos,
+      }
+    )
+  }
+
+  private *finalizeAssistantContinuationTurn(
+    session: ChatSession,
+    conversationId: string,
+    text?: string
+  ): Generator<Buffer> {
+    if (text) {
+      this.sessionManager.addMessage(session.conversationId, "assistant", text)
+    }
+
+    const turnId = this.generateTurnId(
+      session.conversationId,
+      session.turns.length
+    )
+    this.sessionManager.addTurn(session.conversationId, turnId)
+
+    yield this.buildConversationCheckpoint(
+      session,
+      conversationId,
+      session.model
+    )
+    yield this.grpcService.createServerHeartbeatResponse()
+    yield this.grpcService.createAgentTurnEndedResponse()
+  }
+
   // eslint-disable-next-line @typescript-eslint/require-await
   private async *emitAgentFinalTextResponse(
     session: ChatSession,
@@ -5861,8 +5908,11 @@ ${raw}
             sessionAfterTool.pendingToolCalls.size > 0
 
           if (!hasMorePendingToolCalls) {
-            // CRITICAL: End the stream after tool result processing completes
-            // Cursor expects each turn to be a separate BiDi stream request
+            // CRITICAL: End the stream after tool result processing completes.
+            // handleToolResult already emits checkpoint + turn_ended when it
+            // receives a proper message_stop from the backend, or emits a
+            // fallback text response when the backend returns empty.
+            // We just need to close the BiDi stream loop here.
             this.logger.log(
               "No more pending tool calls after tool result - ending stream for this turn"
             )
@@ -8158,53 +8208,182 @@ ${raw}
           "Agent mode: no more tool calls, sending turn_ended signal"
         )
 
-        // CRITICAL: Add text-only message to history
-        if (accumulatedText) {
-          this.sessionManager.addMessage(
-            session.conversationId,
-            "assistant",
-            accumulatedText
-          )
-          this.logger.log(
-            `Added continuation text message to history (${accumulatedText.length} chars)`
-          )
-        }
-
-        // Generate and add turn ID (match handleChatMessage flow)
-        const turnId = this.generateTurnId(
-          session.conversationId,
-          session.turns.length
+        yield* this.finalizeAssistantContinuationTurn(
+          session,
+          conversationId,
+          accumulatedText || undefined
         )
-        this.sessionManager.addTurn(session.conversationId, turnId)
-
-        // Send checkpoint before turn_ended (required for multi-turn)
-        const checkpoint =
-          this.grpcService.createConversationCheckpointResponse(
-            conversationId,
-            session.model,
-            {
-              messageBlobIds: session.messageBlobIds,
-              usedTokens: session.usedTokens || 0,
-              maxTokens: this.resolveCheckpointMaxTokens(session),
-              workspaceUri: session.projectContext?.rootPath
-                ? `file://${session.projectContext.rootPath}`
-                : undefined,
-              readPaths: Array.from(session.readPaths),
-              fileStates: Object.fromEntries(session.fileStates),
-              turns: session.turns,
-              todos: session.todos,
-            }
-          )
-        yield checkpoint
         this.logger.log("Sent conversationCheckpointUpdate (continuation)")
-
-        // Send heartbeat before turn_ended
-        yield this.grpcService.createServerHeartbeatResponse()
-
-        const turnEnded = this.grpcService.createAgentTurnEndedResponse()
-        yield turnEnded
         return
       }
+    }
+
+    // ─── Empty stream detection & retry ───────────────────────────────
+    // If we reach here, the for-await loop exited without hitting
+    // message_stop or dispatching a tool call. This means the backend
+    // returned an empty stream (0 blocks, no text, no tool calls).
+    // This is abnormal — a well-behaved AI should always produce output.
+    //
+    // Protocol requirement: Cursor expects every turn to end with either
+    // a tool dispatch (waiting_for_result) or a turn_ended signal with
+    // text content. An empty stream exit violates this contract and
+    // causes Cursor to open a new chat window via resumeAction.
+    //
+    // Strategy: retry the continuation request once. If still empty,
+    // emit a fallback text response to maintain protocol integrity.
+
+    if (!accumulatedText && !currentToolCall) {
+      this.logger.warn(
+        `[Empty Stream] Continuation returned empty response for ${conversationId}; retrying once`
+      )
+
+      // Retry: rebuild and resend the same continuation request
+      try {
+        const retryStream = this.getBackendStream(dto)
+        let retryAccumulatedText = ""
+        let retryHasToolCall = false
+        const retryModelCallBaseId = crypto.randomUUID()
+        let retryToolCallIndex = 0
+        let retryCurrentToolCall: ActiveToolCall | null = null
+        let retryIsInThinkingBlock = false
+        let retryThinkingStartTime = 0
+        let retryHeartbeatCount = 0
+
+        for await (const retryItem of this.streamWithHeartbeat(retryStream)) {
+          if (retryItem.type === "heartbeat") {
+            yield this.grpcService.createHeartbeatResponse()
+            if (retryHeartbeatCount === 0) {
+              yield this.grpcService.createThinkingDeltaResponse(
+                "Generating..."
+              )
+            }
+            retryHeartbeatCount++
+            continue
+          }
+
+          const retrySseEvent = retryItem.value
+          const retryEvent = this.parseSseEvent(retrySseEvent)
+          if (!retryEvent) continue
+
+          if (retryEvent.type === "content_block_start") {
+            const contentBlock = retryEvent.data.content_block
+            if (
+              contentBlock?.type === "tool_use" &&
+              contentBlock.id &&
+              contentBlock.name
+            ) {
+              const modelCallId = this.generateModelCallId(
+                retryModelCallBaseId,
+                retryToolCallIndex++
+              )
+              retryCurrentToolCall = {
+                id: contentBlock.id,
+                name: contentBlock.name,
+                inputJson: "",
+                modelCallId,
+              }
+              retryHasToolCall = true
+            } else if (contentBlock?.type === "thinking") {
+              retryIsInThinkingBlock = true
+              retryThinkingStartTime = Date.now()
+            }
+          } else if (retryEvent.type === "content_block_delta") {
+            const delta = retryEvent.data.delta
+            if (delta?.type === "text_delta" && delta.text) {
+              const textResponse = this.grpcService.createAgentTextResponse(
+                delta.text
+              )
+              yield textResponse
+              retryAccumulatedText += delta.text
+
+              const { estimateTokenCount } = await import("./agent-helpers")
+              const outputTokens = estimateTokenCount(delta.text)
+              if (outputTokens > 0) {
+                yield this.grpcService.createTokenDeltaResponse(0, outputTokens)
+              }
+            } else if (
+              delta?.type === "input_json_delta" &&
+              retryCurrentToolCall
+            ) {
+              retryCurrentToolCall.inputJson += delta.partial_json || ""
+            } else if (delta?.type === "thinking_delta" && delta.thinking) {
+              yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
+            }
+          } else if (retryEvent.type === "content_block_stop") {
+            if (retryIsInThinkingBlock) {
+              const thinkingDurationMs = Date.now() - retryThinkingStartTime
+              yield this.grpcService.createThinkingCompletedResponse(
+                thinkingDurationMs
+              )
+              retryIsInThinkingBlock = false
+            }
+            if (retryCurrentToolCall) {
+              this.logger.log(
+                `[Retry] Tool call completed: ${retryCurrentToolCall.name}, dispatching`
+              )
+              const dispatchOutcome =
+                yield* this.registerAndDispatchToolInvocation({
+                  conversationId,
+                  session,
+                  toolCall: retryCurrentToolCall,
+                  accumulatedText: retryAccumulatedText,
+                  checkpointModel: session.model,
+                  workspaceRootPath: session.projectContext?.rootPath,
+                })
+              if (dispatchOutcome === "waiting_for_result") {
+                this.logger.log(
+                  `[Retry] Waiting for tool result: ${retryCurrentToolCall.id}`
+                )
+              }
+              return
+            }
+          } else if (retryEvent.type === "message_stop") {
+            this.logger.log(
+              "[Retry] message_stop received, ending continuation"
+            )
+            yield* this.finalizeAssistantContinuationTurn(
+              session,
+              conversationId,
+              retryAccumulatedText || undefined
+            )
+            return
+          }
+        }
+
+        // Retry also produced output — check if it was meaningful
+        if (retryAccumulatedText || retryHasToolCall) {
+          if (retryHasToolCall) {
+            this.logger.warn(
+              `[Retry] Stream exited after tool-call output without message_stop for ${conversationId}; awaiting tool result path`
+            )
+            return
+          }
+
+          this.logger.warn(
+            `[Retry] Stream exited after text output without message_stop for ${conversationId}; finalizing turn defensively`
+          )
+          yield* this.finalizeAssistantContinuationTurn(
+            session,
+            conversationId,
+            retryAccumulatedText || undefined
+          )
+          return
+        }
+      } catch (retryError) {
+        this.logger.warn(`[Empty Stream] Retry failed: ${String(retryError)}`)
+      }
+
+      // Both attempts returned empty — emit fallback text to maintain
+      // protocol integrity. Without this, Cursor receives no assistant
+      // output and opens a new chat window.
+      this.logger.warn(
+        `[Empty Stream] Both attempts returned empty for ${conversationId}; emitting fallback text response`
+      )
+      yield* this.emitAgentFinalTextResponse(
+        session,
+        "I'll continue from here. What would you like me to do next?"
+      )
+      return
     }
   }
 

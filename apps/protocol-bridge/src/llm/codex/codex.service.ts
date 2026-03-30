@@ -318,6 +318,94 @@ export class CodexService implements OnModuleInit {
     return this.accounts.length > 0
   }
 
+  /**
+   * Hot-reload accounts from config file.
+   * Adds new accounts without disturbing existing account state (tokens, cooldown, etc.).
+   * Returns the number of newly added accounts.
+   */
+  reloadAccounts(): number {
+    const freshRecords = this.loadAllCodexAccountsFromFile()
+    const envBaseUrl =
+      this.configService
+        .get<string>("CODEX_BASE_URL", DEFAULT_BASE_URL)
+        .trim() || DEFAULT_BASE_URL
+    const envProxyUrl = this.configService
+      .get<string>("CODEX_PROXY_URL", "")
+      .trim()
+
+    // Build a fingerprint set from existing accounts for dedup
+    const existingFingerprints = new Set(
+      this.accounts.map((a) =>
+        [a.apiKey || "", a.email || "", a.accountId || "", a.baseUrl].join("\0")
+      )
+    )
+
+    let added = 0
+    for (const fa of freshRecords) {
+      const fingerprint = [
+        fa.apiKey || "",
+        fa.email || "",
+        fa.accountId || "",
+        fa.baseUrl || envBaseUrl,
+      ].join("\0")
+
+      if (existingFingerprints.has(fingerprint)) continue
+
+      const slot: CodexAccountSlot = {
+        label: fa.label || fa.email || undefined,
+        apiKey: fa.apiKey || undefined,
+        accessToken: fa.accessToken || undefined,
+        refreshToken: fa.refreshToken || undefined,
+        accountId: fa.accountId || undefined,
+        email: fa.email || undefined,
+        planType: normalizeCodexModelTier(fa.planType) || undefined,
+        baseUrl: fa.baseUrl || envBaseUrl,
+        proxyUrl: fa.proxyUrl || envProxyUrl || undefined,
+        source: "file",
+        tokenData: null,
+        cooldownUntil: 0,
+        modelStates: new Map(),
+        persistedMatch: {
+          apiKey: fa.apiKey || undefined,
+          email: fa.email || undefined,
+          accountId: fa.accountId || undefined,
+          accessToken: fa.accessToken || undefined,
+          refreshToken: fa.refreshToken || undefined,
+        },
+      }
+
+      if (fa.accessToken || fa.refreshToken || fa.idToken) {
+        this.applyTokenDataToSlot(
+          slot,
+          this.hydrateTokenData({
+            idToken: fa.idToken || "",
+            accessToken: fa.accessToken || "",
+            refreshToken: fa.refreshToken || "",
+            accountId: fa.accountId || "",
+            email: fa.email || "",
+            expire: fa.expire || "",
+          })
+        )
+      }
+
+      this.accounts.push(slot)
+      existingFingerprints.add(fingerprint)
+      added++
+      this.logger.log(
+        `[Hot-reload] Added new Codex account: ${slot.label || slot.email || "unnamed"}`
+      )
+    }
+
+    if (added > 0) {
+      this.configuredModelTier = this.resolveConfiguredModelTier()
+      this.logger.log(
+        `[Hot-reload] Codex: ${added} new account(s) added, total=${this.accounts.length}`
+      )
+    }
+
+    return added
+  }
+
   getPoolStatus(): BackendPoolStatus {
     const now = Date.now()
     const entries = this.accounts.map((account) => {

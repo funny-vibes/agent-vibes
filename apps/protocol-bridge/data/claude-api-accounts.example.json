@@ -1,0 +1,10 @@
+{
+  "accounts": [
+    {
+      "label": "example-claude-api",
+      "apiKey": "sk-REPLACE_ME",
+      "baseUrl": "https://api.anthropic.com",
+      "stripThinking": true
+    }
+  ]
+}

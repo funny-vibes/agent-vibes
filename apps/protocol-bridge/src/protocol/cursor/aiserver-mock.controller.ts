@@ -304,10 +304,14 @@ export class AiserverMockController {
   }
 
   @Post("aiserver.v1.AiService/AvailableModels")
-  handleAvailableModels(
+  async handleAvailableModels(
     @Req() req: FastifyRequest,
     @Res() res: FastifyReply
-  ): void {
+  ): Promise<void> {
+    // Await refresh with timeout so a single click returns up-to-date models.
+    // If refresh takes longer than 5s, fall through with cached data.
+    await this.refreshModelsWithTimeout(5000)
+
     try {
       const allModels = this.buildCursorModels(req)
       const protoModels = allModels.map((m) =>
@@ -790,6 +794,53 @@ export class AiserverMockController {
   }
 
   // ── Helpers ──
+
+  /**
+   * Refresh model caches and backend availability with a timeout.
+   * If the refresh completes within the timeout, the caller gets up-to-date data.
+   * If it exceeds the timeout, the caller proceeds with cached data (no error thrown).
+   *
+   * Steps:
+   * 1. Reload accounts from all backend config files (hot-reload new accounts)
+   * 2. Recompute Google backend health from Cloud Code API
+   * 3. Refresh Google model cache only when the backend is healthy
+   */
+  private async refreshModelsWithTimeout(timeoutMs: number): Promise<void> {
+    const refresh = async () => {
+      // 1. Hot-reload accounts from config files
+      const openaiAdded = this.openaiCompatService.reloadAccounts()
+      const codexAdded = this.codexService.reloadAccounts()
+      const claudeAdded = await this.claudeApiService.reloadAccounts()
+
+      if (openaiAdded + codexAdded + claudeAdded > 0) {
+        this.logger.log(
+          `[Model Refresh] Hot-reloaded accounts: openai-compat=${openaiAdded}, codex=${codexAdded}, claude-api=${claudeAdded}`
+        )
+      }
+
+      // 2. Recompute Google backend availability from a real health check.
+      const googleAvailable = await this.googleService.checkAvailability()
+      this.modelRouter.updateGoogleAvailability(googleAvailable)
+
+      // 3. Only refresh the cache when the backend is actually reachable.
+      if (googleAvailable) {
+        await this.googleModelCache.forceRefresh()
+      }
+    }
+
+    const timeout = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs)
+      if (timer && typeof timer.unref === "function") timer.unref()
+    })
+
+    try {
+      await Promise.race([refresh(), timeout])
+    } catch (error) {
+      this.logger.debug(
+        `Model refresh failed: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
 
   private sendEmpty(res: FastifyReply): void {
     res.header("Content-Type", "application/proto")

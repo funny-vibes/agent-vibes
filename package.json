@@ -31,7 +31,7 @@
   "scripts": {
     "prepare": "husky",
     "dev": "turbo run dev",
-    "release": "git pull && git push origin dev && git checkout main && git pull && git merge dev --no-edit && git push origin main && git checkout dev && echo . && echo Released! Check Actions for deployment status.",
+    "release": "node scripts/git/release.js",
     "build": "turbo run build",
     "start": "turbo run start",
     "start:debug": "turbo run start:debug",

@@ -238,6 +238,49 @@ export class ClaudeApiService implements OnModuleInit {
     return this.accounts.some((account) => !isAccountDisabled(account))
   }
 
+  /**
+   * Hot-reload accounts from config file.
+   * Adds new accounts without disturbing existing account state (cooldown, disabled, etc.).
+   * Triggers model discovery for newly added accounts.
+   * Returns the number of newly added accounts.
+   */
+  async reloadAccounts(): Promise<number> {
+    const freshAccounts = this.loadAllAccountsFromFile()
+    const existingKeys = new Set(this.accounts.map((a) => a.stateKey))
+    const newAccounts: ClaudeApiAccount[] = []
+    const persistedStates = this.loadPersistedAccountStates()
+
+    for (const account of freshAccounts) {
+      if (!existingKeys.has(account.stateKey)) {
+        this.applyPersistedAccountState(
+          account,
+          persistedStates.get(account.stateKey)
+        )
+        this.accounts.push(account)
+        existingKeys.add(account.stateKey)
+        newAccounts.push(account)
+        this.logger.log(
+          `[Hot-reload] Added new Claude API account: ${account.label || account.baseUrl}`
+        )
+      }
+    }
+
+    if (newAccounts.length > 0) {
+      this.persistAccountStates()
+      this.logger.log(
+        `[Hot-reload] Claude API: ${newAccounts.length} new account(s) added, total=${this.accounts.length}`
+      )
+      // Trigger model discovery for new accounts
+      await Promise.allSettled(
+        newAccounts.map((account) =>
+          this.refreshDiscoveredModelsForAccount(account, { force: true })
+        )
+      )
+    }
+
+    return newAccounts.length
+  }
+
   checkAvailability(): Promise<boolean> {
     return Promise.resolve(this.isAvailable())
   }

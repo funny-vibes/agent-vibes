@@ -19,6 +19,7 @@ import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
+import { resolveCloudCodeModel } from "../../llm/model-registry"
 import { KvStorageService } from "./kv-storage.service"
 
 // GZIP 魔数
@@ -1065,23 +1066,33 @@ export class CursorRequestParser {
     }
 
     // 推导 thinkingLevel
-    // - modelDetails.thinkingDetails 存在（presence）→ thinking 已启用
-    // - modelDetails.maxMode 或 requestedModel.maxMode → 最大 thinking
-    // - 模型名含 "thinking" → 标准 thinking
+    // - modelDetails.maxMode 或 requestedModel.maxMode → 最大 thinking (level 2)
+    // - modelDetails.thinkingDetails 存在（presence）→ thinking 已启用 (level 1)
+    // - 模型名含 "thinking" → 标准 thinking (level 1)
+    // - model-registry 标记 isThinking → 降级 thinking (level 1)
+    //   确保模型本身支持 thinking 时即使 max 关闭也不完全禁用
     const hasThinkingDetails = !!req.modelDetails?.thinkingDetails
     const modelMaxMode = req.modelDetails?.maxMode === true
     const requestedMaxMode = req.requestedModel?.maxMode === true
+    const registryEntry = resolveCloudCodeModel(model)
+    const registryIsThinking = registryEntry?.isThinking === true
     let thinkingLevel = 0
-    if (hasThinkingDetails || modelMaxMode || requestedMaxMode) {
-      thinkingLevel = modelMaxMode || requestedMaxMode ? 2 : 1
+    if (modelMaxMode || requestedMaxMode) {
+      thinkingLevel = 2
+    } else if (hasThinkingDetails) {
+      thinkingLevel = 1
     } else if (model.toLowerCase().includes("thinking")) {
+      thinkingLevel = 1
+    } else if (registryIsThinking) {
+      // 模型本身支持 thinking，但 Cursor 没有传 thinkingDetails
+      // （通常因为 max mode 被关闭）→ 降级到 level 1
       thinkingLevel = 1
     }
 
     if (thinkingLevel > 0) {
       this.logger.log(
         `Thinking enabled: level=${thinkingLevel} (thinkingDetails=${hasThinkingDetails}, ` +
-          `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode})`
+          `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode}, registryIsThinking=${registryIsThinking})`
       )
     }
 

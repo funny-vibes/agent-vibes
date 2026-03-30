@@ -144,6 +144,16 @@ export class ModelRouterService {
   get isGoogleAvailable(): boolean {
     return this.googleAvailable
   }
+
+  /** Update Google backend availability at runtime (e.g. after account sync) */
+  updateGoogleAvailability(available: boolean): void {
+    if (this.googleAvailable !== available) {
+      this.logger.log(
+        `Google backend availability updated: ${this.googleAvailable ? "✓" : "✗"} -> ${available ? "✓" : "✗"}`
+      )
+      this.googleAvailable = available
+    }
+  }
   get isCodexAvailable(): boolean {
     return this.codexAvailable
   }

@@ -174,4 +174,14 @@ export class GoogleModelCacheService implements OnModuleInit {
       await this.loadModels()
     }
   }
+
+  /**
+   * Force refresh cache regardless of staleness.
+   * Used when user explicitly requests model list refresh.
+   */
+  async forceRefresh(): Promise<void> {
+    if (this.processPool.isConfigured()) {
+      await this.loadModels()
+    }
+  }
 }

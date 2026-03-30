@@ -46,6 +46,7 @@ lerna-debug.log*
 
 # Antigravity account credentials
 .runtime/
+/claude-api-accounts.json
 data/accounts.json
 data/accounts.local.json
 data/*-accounts.json

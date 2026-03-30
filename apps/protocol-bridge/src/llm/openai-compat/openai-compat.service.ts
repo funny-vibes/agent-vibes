@@ -383,6 +383,7 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   apiKey: string
   baseUrl: string
   proxyUrl?: string
+  preferResponsesApi?: boolean
   source: "env" | "file"
   stateKey: string
 }
@@ -424,6 +425,7 @@ export class OpenaiCompatService implements OnModuleInit {
    * Per-model endpoint preference cache.
    * When auto mode detects a 503 on Chat Completions and succeeds with Responses API,
    * it remembers this for subsequent requests to avoid repeated fallback overhead.
+   * Explicit per-account overrides are not learned into this cache.
    * Key: model name (lowercase), Value: "responses" | "chat-completions"
    */
   private endpointPreference = new Map<
@@ -467,6 +469,7 @@ export class OpenaiCompatService implements OnModuleInit {
     apiKey: string
     baseUrl: string
     proxyUrl?: string
+    preferResponsesApi?: boolean
     source: "env" | "file"
   }): OpenaiCompatAccount {
     return {
@@ -474,6 +477,7 @@ export class OpenaiCompatService implements OnModuleInit {
       apiKey: params.apiKey,
       baseUrl: params.baseUrl,
       proxyUrl: params.proxyUrl,
+      preferResponsesApi: params.preferResponsesApi,
       source: params.source,
       stateKey: this.buildAccountStateKey(params.apiKey, params.baseUrl),
       cooldownUntil: 0,
@@ -745,7 +749,7 @@ export class OpenaiCompatService implements OnModuleInit {
   private getStreamResponseHeadersTimeoutMs(): number {
     return this.parsePositiveTimeoutMs(
       "OPENAI_COMPAT_STREAM_HEADERS_TIMEOUT_MS",
-      15_000
+      60_000
     )
   }
 
@@ -934,6 +938,9 @@ export class OpenaiCompatService implements OnModuleInit {
                 apiKey: a.apiKey,
                 baseUrl: a.baseUrl,
                 proxyUrl: a.proxyUrl,
+                preferResponsesApi:
+                  a.preferResponsesApi === "true" ||
+                  (a as Record<string, unknown>).preferResponsesApi === true,
                 source: "file",
               })
             )
@@ -1003,6 +1010,42 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   isAvailable(): boolean {
     return this.accounts.some((account) => !isAccountDisabled(account))
+  }
+
+  /**
+   * Hot-reload accounts from config file.
+   * Adds new accounts without disturbing existing account state (cooldown, disabled, etc.).
+   * Returns the number of newly added accounts.
+   */
+  reloadAccounts(): number {
+    const freshAccounts = this.loadAllAccountsFromFile()
+    const existingKeys = new Set(this.accounts.map((a) => a.stateKey))
+    const persistedStates = this.loadPersistedAccountStates()
+    let added = 0
+
+    for (const account of freshAccounts) {
+      if (!existingKeys.has(account.stateKey)) {
+        this.applyPersistedAccountState(
+          account,
+          persistedStates.get(account.stateKey)
+        )
+        this.accounts.push(account)
+        existingKeys.add(account.stateKey)
+        added++
+        this.logger.log(
+          `[Hot-reload] Added new OpenAI-compat account: ${account.label || account.baseUrl}`
+        )
+      }
+    }
+
+    if (added > 0) {
+      this.persistAccountStates()
+      this.logger.log(
+        `[Hot-reload] OpenAI-compat: ${added} new account(s) added, total=${this.accounts.length}`
+      )
+    }
+
+    return added
   }
 
   /**
@@ -1564,8 +1607,16 @@ export class OpenaiCompatService implements OnModuleInit {
    * Returns "responses" if Responses API should be tried first,
    * "chat-completions" otherwise.
    */
-  private resolveEndpoint(model: string): "responses" | "chat-completions" {
+  private resolveEndpoint(
+    model: string,
+    account?: OpenaiCompatAccount
+  ): "responses" | "chat-completions" {
     const normalizedModel = model.toLowerCase().trim()
+
+    // Per-account override: preferResponsesApi takes highest priority
+    if (account?.preferResponsesApi && this.isResponsesApiEligible(model)) {
+      return "responses"
+    }
 
     // Mode: always → force Responses API for eligible models
     if (
@@ -1589,9 +1640,12 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private recordEndpointSuccess(
     model: string,
-    endpoint: "responses" | "chat-completions"
+    endpoint: "responses" | "chat-completions",
+    account?: OpenaiCompatAccount
   ): void {
     if (this.responsesApiMode !== "auto") return
+    if (account?.preferResponsesApi) return
+
     const normalizedModel = model.toLowerCase().trim()
     const current = this.endpointPreference.get(normalizedModel)
     if (current !== endpoint) {
@@ -1690,8 +1744,8 @@ export class OpenaiCompatService implements OnModuleInit {
       )
     }
 
-    const endpoint = this.resolveEndpoint(dto.model)
     const account = this.nextAccount(dto.model)
+    const endpoint = this.resolveEndpoint(dto.model, account)
 
     if (endpoint === "responses") {
       try {
@@ -1700,7 +1754,7 @@ export class OpenaiCompatService implements OnModuleInit {
           account,
           this.responsesApiMode !== "always"
         )
-        this.recordEndpointSuccess(dto.model, "responses")
+        this.recordEndpointSuccess(dto.model, "responses", account)
         return result
       } catch (e) {
         if (!this.shouldFallbackToChatCompletionsApi(e, dto.model)) {
@@ -1719,7 +1773,7 @@ export class OpenaiCompatService implements OnModuleInit {
         account,
         endpoint !== "responses"
       )
-      this.recordEndpointSuccess(dto.model, "chat-completions")
+      this.recordEndpointSuccess(dto.model, "chat-completions", account)
       return result
     } catch (e) {
       // Check if we should fallback to Responses API
@@ -1734,7 +1788,7 @@ export class OpenaiCompatService implements OnModuleInit {
           `[OpenAI-Compat] Chat Completions returned ${status} for ${dto.model}, falling back to Responses API`
         )
         const result = await this.sendClaudeMessageViaResponses(dto, account)
-        this.recordEndpointSuccess(dto.model, "responses")
+        this.recordEndpointSuccess(dto.model, "responses", account)
         return result
       }
       throw e
@@ -1909,8 +1963,8 @@ export class OpenaiCompatService implements OnModuleInit {
       )
     }
 
-    const endpoint = this.resolveEndpoint(dto.model)
     const account = this.nextAccount(dto.model)
+    const endpoint = this.resolveEndpoint(dto.model, account)
 
     if (endpoint === "responses") {
       let emittedResponsesEvents = false
@@ -1923,7 +1977,7 @@ export class OpenaiCompatService implements OnModuleInit {
           emittedResponsesEvents = true
           yield event
         }
-        this.recordEndpointSuccess(dto.model, "responses")
+        this.recordEndpointSuccess(dto.model, "responses", account)
         return
       } catch (e) {
         if (
@@ -1949,7 +2003,7 @@ export class OpenaiCompatService implements OnModuleInit {
         emittedChatEvents = true
         yield event
       }
-      this.recordEndpointSuccess(dto.model, "chat-completions")
+      this.recordEndpointSuccess(dto.model, "chat-completions", account)
     } catch (e) {
       const errorMsg = (e as Error).message || ""
       const status = this.getBackendErrorStatus(e)
@@ -1963,7 +2017,7 @@ export class OpenaiCompatService implements OnModuleInit {
           `[OpenAI-Compat] Chat Completions stream returned ${status} for ${dto.model}, falling back to Responses API`
         )
         yield* this.sendClaudeMessageStreamViaResponses(dto, account)
-        this.recordEndpointSuccess(dto.model, "responses")
+        this.recordEndpointSuccess(dto.model, "responses", account)
         return
       }
       throw e
