@@ -1,0 +1,15 @@
+{
+  "main": "dist/sea-entry.js",
+  "output": "dist/sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": true,
+  "assets": {
+    "001_backend_account_states.sql": "dist/persistence/migrations/001_backend_account_states.sql",
+    "002_cursor_sessions.sql": "dist/persistence/migrations/002_cursor_sessions.sql",
+    "003_summary_cache.sql": "dist/persistence/migrations/003_summary_cache.sql",
+    "004_knowledge_base.sql": "dist/persistence/migrations/004_knowledge_base.sql",
+    "005_usage_events.sql": "dist/persistence/migrations/005_usage_events.sql",
+    "006_usage_events_rich_metrics.sql": "dist/persistence/migrations/006_usage_events_rich_metrics.sql"
+  }
+}

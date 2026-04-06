@@ -1,5 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common"
-import Database from "better-sqlite3"
+import { DatabaseSync } from "node:sqlite"
 import * as path from "path"
 import * as os from "os"
 
@@ -12,10 +12,30 @@ export class CursorAuthService {
   private readonly dbPath: string
 
   constructor() {
-    this.dbPath = path.join(
-      os.homedir(),
-      "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
-    )
+    this.dbPath = CursorAuthService.resolveCursorDbPath()
+  }
+
+  /**
+   * Resolve Cursor state.vscdb path across platforms.
+   */
+  private static resolveCursorDbPath(): string {
+    const home = os.homedir()
+    switch (process.platform) {
+      case "darwin":
+        return path.join(
+          home,
+          "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+        )
+      case "linux":
+        return path.join(home, ".config/Cursor/User/globalStorage/state.vscdb")
+      case "win32":
+        return path.join(
+          process.env.APPDATA || path.join(home, "AppData/Roaming"),
+          "Cursor/User/globalStorage/state.vscdb"
+        )
+      default:
+        return path.join(home, ".config/Cursor/User/globalStorage/state.vscdb")
+    }
   }
 
   /**
@@ -37,7 +57,7 @@ export class CursorAuthService {
     }
 
     try {
-      const db = new Database(this.dbPath, { readonly: true })
+      const db = new DatabaseSync(this.dbPath, { readOnly: true })
 
       const rows = db
         .prepare(

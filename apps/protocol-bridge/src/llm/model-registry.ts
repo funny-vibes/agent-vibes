@@ -32,7 +32,6 @@ export interface PublicModelMetadata {
 }
 
 export type CodexModelTier = "free" | "team" | "plus" | "pro"
-
 // ---------------------------------------------------------------------------
 // Gemini Models: Cursor alias -> Cloud Code canonical ID
 // ---------------------------------------------------------------------------
@@ -59,7 +58,7 @@ const GEMINI_MODELS: Record<
   "gemini-3.1-pro-high": {
     cloudCodeId: "gemini-3.1-pro-high",
     displayName: "Gemini 3.1 Pro High",
-    isThinking: false,
+    isThinking: true,
   },
   "gemini-3.1-pro-low": {
     cloudCodeId: "gemini-3.1-pro-low",
@@ -483,6 +482,16 @@ const CODEX_SHARED_MODEL_IDS = [
   "codex-mini",
 ] as const
 
+const CHATGPT_CODEX_MODEL_PATTERNS: RegExp[] = [
+  /^gpt-5$/,
+  /^gpt-5-codex$/,
+  /^gpt-5-codex-mini$/,
+  /^gpt-5\.\d+$/,
+  /^gpt-5\.\d+-codex$/,
+  /^gpt-5\.\d+-codex-mini$/,
+  /^gpt-5\.\d+-codex-max$/,
+]
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -715,6 +724,27 @@ export function getPublicModelMetadata(
 }
 
 /**
+ * Determine whether a public model ID should be treated as thinking-capable.
+ *
+ * Use registry metadata as the source of truth when available, but keep a
+ * suffix-based fallback for custom or passthrough model IDs such as
+ * provider-specific aliases ending in "thinking".
+ */
+export function doesModelSupportThinking(modelId: string): boolean {
+  const normalized = modelId.toLowerCase().trim()
+  if (!normalized) {
+    return false
+  }
+
+  const resolved = resolveCloudCodeModel(normalized)
+  if (resolved?.isThinking === true) {
+    return true
+  }
+
+  return normalized.includes("thinking")
+}
+
+/**
  * Detect model family from name.
  */
 export function detectModelFamily(name: string): ModelFamily {
@@ -796,7 +826,7 @@ export const GEMINI_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
     displayName: "Gemini 3.1 Pro High",
     shortName: "Gemini 3.1 Pro",
     family: "gemini",
-    isThinking: false,
+    isThinking: true,
   },
   {
     name: "gemini-3.1-pro-low",
@@ -1175,6 +1205,17 @@ export function getCodexPublicModelIds(
       ...getCodexCursorDisplayModels(options).map((model) => model.name),
       "codex-mini-latest",
     ])
+  )
+}
+
+export function isChatGptCodexModelSupported(modelId: string): boolean {
+  const normalized = modelId.toLowerCase().trim()
+  if (!normalized) {
+    return false
+  }
+
+  return CHATGPT_CODEX_MODEL_PATTERNS.some((pattern) =>
+    pattern.test(normalized)
   )
 }
 

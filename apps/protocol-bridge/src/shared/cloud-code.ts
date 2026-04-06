@@ -80,7 +80,10 @@ export interface CloudCodeGenerationConfig {
 /** Thinking/reasoning configuration */
 export interface CloudCodeThinkingConfig {
   includeThoughts: boolean
-  thinkingBudget: number
+  /** Explicit reasoning budget for non-adaptive thinking flows */
+  thinkingBudget?: number
+  /** Cloud Code adaptive thinking level */
+  thinkingLevel?: "medium" | "high"
 }
 
 /** Safety setting entry */

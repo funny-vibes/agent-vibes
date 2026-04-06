@@ -16,11 +16,9 @@ import * as crypto from "crypto"
 import * as fs from "fs"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
-import {
-  getAccountConfigPathCandidates,
-  resolveLegacyAccountStatePath as resolveLegacyAccountStateJsonPath,
-  resolveRuntimeDataPath,
-} from "../../shared/protocol-bridge-paths"
+import { getAccountConfigPathCandidates } from "../../shared/protocol-bridge-paths"
+import { PersistenceService } from "../../persistence"
+import { UsageStatsService } from "../../usage/usage-stats.service"
 import { translateClaudeToCodex } from "../codex/codex-request-translator"
 import {
   createStreamState as createCodexStreamState,
@@ -39,7 +37,6 @@ import {
   pickAvailableAccount,
 } from "../shared/account-cooldown"
 import {
-  BACKEND_ACCOUNT_STATE_DB_FILENAME,
   BackendAccountStateStore,
   type PersistedBackendAccountState,
 } from "../shared/backend-account-state-store"
@@ -51,6 +48,7 @@ import {
   BackendPoolEntryState,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
+import { sanitizeOpenAiChatToolCallIntegrity } from "../shared/openai-tool-call-integrity"
 
 // ── Types for OpenAI Chat Completions API ──────────────────────────────
 
@@ -350,6 +348,9 @@ interface StreamState {
   leadingTaggedContentState: LeadingTaggedContentState
   leadingTaggedContentBuffer: string
   thinkingTagState: ThinkingTagStreamState
+  lastInputTokens: number
+  lastCachedInputTokens: number
+  lastOutputTokens: number
 }
 
 export function createStreamState(): StreamState {
@@ -367,6 +368,9 @@ export function createStreamState(): StreamState {
     leadingTaggedContentState: "plain",
     leadingTaggedContentBuffer: "",
     thinkingTagState: createThinkingTagStreamState(),
+    lastInputTokens: 0,
+    lastCachedInputTokens: 0,
+    lastOutputTokens: 0,
   }
 }
 
@@ -400,18 +404,8 @@ export class OpenaiCompatService implements OnModuleInit {
   private accountIndex = 0
   /** Resolved config file path used to load file-backed accounts */
   private accountsConfigPath: string | null = null
-  /** Runtime account health state persistence path */
-  private accountStatePath: string = resolveRuntimeDataPath(
-    BACKEND_ACCOUNT_STATE_DB_FILENAME
-  )
-  /** Legacy JSON state file path kept only for one-time migration */
-  private legacyAccountStatePath: string = resolveLegacyAccountStateJsonPath(
-    "openai-compat-account-state.json"
-  )
-  private accountStateStore = new BackendAccountStateStore(
-    this.accountStatePath,
-    this.logger
-  )
+  /** Runtime account health state persistence */
+  private accountStateStore!: BackendAccountStateStore
 
   /**
    * Responses API routing mode:
@@ -433,7 +427,16 @@ export class OpenaiCompatService implements OnModuleInit {
     "responses" | "chat-completions"
   >()
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly persistence: PersistenceService,
+    private readonly usageStats: UsageStatsService
+  ) {
+    this.accountStateStore = new BackendAccountStateStore(
+      this.persistence,
+      this.logger
+    )
+  }
 
   private buildAccountStateKey(apiKey: string, baseUrl: string): string {
     return crypto
@@ -444,24 +447,8 @@ export class OpenaiCompatService implements OnModuleInit {
       .digest("hex")
   }
 
-  private resolveAccountStateDbPath(configPath?: string | null): string {
-    return resolveRuntimeDataPath(BACKEND_ACCOUNT_STATE_DB_FILENAME, configPath)
-  }
-
-  private resolveLegacyAccountStatePath(configPath?: string | null): string {
-    return resolveLegacyAccountStateJsonPath(
-      "openai-compat-account-state.json",
-      configPath
-    )
-  }
-
-  private configureAccountStateStore(configPath?: string | null): void {
-    this.accountStatePath = this.resolveAccountStateDbPath(configPath)
-    this.legacyAccountStatePath = this.resolveLegacyAccountStatePath(configPath)
-    this.accountStateStore = new BackendAccountStateStore(
-      this.accountStatePath,
-      this.logger
-    )
+  private configureAccountStateStore(_configPath?: string | null): void {
+    // No-op: PersistenceService handles the unified DB path.
   }
 
   private buildAccountRecord(params: {
@@ -506,10 +493,7 @@ export class OpenaiCompatService implements OnModuleInit {
     string,
     PersistedOpenaiCompatAccountState
   > {
-    return this.accountStateStore.loadStates(
-      "openai-compat",
-      this.legacyAccountStatePath
-    )
+    return this.accountStateStore.loadStates("openai-compat")
   }
 
   private applyPersistedAccountState(
@@ -1080,15 +1064,20 @@ export class OpenaiCompatService implements OnModuleInit {
       configured: this.accounts.length > 0,
       total: entries.length,
       available: entries.filter(
-        (entry) => entry.state === "ready" || entry.state === "degraded"
+        (entry) =>
+          entry.state === "ready" ||
+          entry.state === "degraded" ||
+          entry.state === "model_cooldown"
       ).length,
       ready: entries.filter((entry) => entry.state === "ready").length,
       degraded: entries.filter((entry) => entry.state === "degraded").length,
+      modelCooldown: entries.filter((entry) => entry.state === "model_cooldown")
+        .length,
       cooling: entries.filter((entry) => entry.state === "cooldown").length,
       disabled: entries.filter((entry) => entry.state === "disabled").length,
       unavailable: 0,
       configPath: this.accountsConfigPath,
-      statePath: this.accountStatePath,
+      statePath: "~/.agent-vibes/pgdata/agent-vibes.db",
       entries,
     }
   }
@@ -1138,9 +1127,90 @@ export class OpenaiCompatService implements OnModuleInit {
       return "cooldown"
     }
     if (modelCooldowns.length > 0) {
-      return "degraded"
+      return "model_cooldown"
     }
     return "ready"
+  }
+
+  private recordOpenAiCompatUsage(
+    account: OpenaiCompatAccount,
+    modelName: string,
+    transport: string,
+    usage: {
+      inputTokens: number
+      cachedInputTokens?: number
+      cacheCreationInputTokens?: number
+      outputTokens: number
+      webSearchRequests?: number
+      durationMs?: number
+    }
+  ): void {
+    this.usageStats.recordOpenAiCompatUsage({
+      transport,
+      modelName,
+      accountKey: account.stateKey,
+      accountLabel: account.label || account.baseUrl,
+      inputTokens: usage.inputTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      outputTokens: usage.outputTokens,
+      webSearchRequests: usage.webSearchRequests,
+      durationMs: usage.durationMs,
+    })
+  }
+
+  private extractChatCompletionUsage(completion: Record<string, unknown>): {
+    inputTokens: number
+    cachedInputTokens: number
+    outputTokens: number
+  } {
+    const usage = completion.usage as Record<string, unknown> | undefined
+    const totalInputTokens = this.toWholeNumber(usage?.prompt_tokens)
+    const cachedInputTokens = this.toWholeNumber(
+      usage?.prompt_tokens_details &&
+        typeof usage.prompt_tokens_details === "object"
+        ? (usage.prompt_tokens_details as Record<string, unknown>).cached_tokens
+        : 0
+    )
+    return {
+      inputTokens: Math.max(0, totalInputTokens - cachedInputTokens),
+      cachedInputTokens,
+      outputTokens: this.toWholeNumber(usage?.completion_tokens),
+    }
+  }
+
+  private extractResponsesUsage(event: Record<string, unknown>): {
+    inputTokens: number
+    cachedInputTokens: number
+    outputTokens: number
+  } {
+    const response =
+      event.response && typeof event.response === "object"
+        ? (event.response as Record<string, unknown>)
+        : null
+    const usage =
+      response?.usage && typeof response.usage === "object"
+        ? (response.usage as Record<string, unknown>)
+        : null
+    const totalInputTokens = this.toWholeNumber(usage?.input_tokens)
+    const cachedInputTokens = this.toWholeNumber(
+      usage?.input_tokens_details &&
+        typeof usage.input_tokens_details === "object"
+        ? (usage.input_tokens_details as Record<string, unknown>).cached_tokens
+        : 0
+    )
+
+    return {
+      inputTokens: Math.max(0, totalInputTokens - cachedInputTokens),
+      cachedInputTokens,
+      outputTokens: this.toWholeNumber(usage?.output_tokens),
+    }
+  }
+
+  private toWholeNumber(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value)
+      ? Math.max(0, Math.round(value))
+      : 0
   }
 
   // ── Request translation ──────────────────────────────────────────────
@@ -1382,68 +1452,18 @@ export class OpenaiCompatService implements OnModuleInit {
     messages: ChatCompletionMessage[],
     pendingToolUseIds?: string[]
   ): void {
-    const pendingIds = new Set(pendingToolUseIds || [])
-    // Collect all tool response IDs
-    const toolResponseIds = new Set<string>()
-    for (const msg of messages) {
-      if (msg.role === "tool" && msg.tool_call_id) {
-        toolResponseIds.add(msg.tool_call_id)
-      }
-    }
+    const sanitized = sanitizeOpenAiChatToolCallIntegrity(
+      messages,
+      pendingToolUseIds
+    )
 
-    // Collect all tool_call IDs
-    const toolCallIds = new Set<string>()
-    for (const msg of messages) {
-      if (msg.role === "assistant" && msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          toolCallIds.add(tc.id)
-        }
-      }
-    }
-
-    // Strip orphan tool_calls from assistant messages (no matching tool response)
-    for (const msg of messages) {
-      if (msg.role !== "assistant" || !msg.tool_calls) continue
-
-      const before = msg.tool_calls.length
-      msg.tool_calls = msg.tool_calls.filter(
-        (tc) => toolResponseIds.has(tc.id) || pendingIds.has(tc.id)
+    if (sanitized.changed) {
+      this.logger.warn(
+        `[sanitize] Stripped ${sanitized.removedToolCalls} orphan/non-adjacent tool_call(s), ` +
+          `${sanitized.removedToolResponses} orphan/non-adjacent tool response(s), ` +
+          `${sanitized.removedEmptyMessages} empty assistant message(s)`
       )
-
-      if (msg.tool_calls.length < before) {
-        this.logger.warn(
-          `[sanitize] Stripped ${before - msg.tool_calls.length} orphan tool_call(s) from assistant message`
-        )
-      }
-      if (msg.tool_calls.length === 0) {
-        delete msg.tool_calls
-      }
-    }
-
-    // Strip orphan tool responses (no matching tool_call)
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      if (msg && msg.role === "tool" && msg.tool_call_id) {
-        if (!toolCallIds.has(msg.tool_call_id)) {
-          this.logger.warn(
-            `[sanitize] Stripped orphan tool response: ${msg.tool_call_id}`
-          )
-          messages.splice(i, 1)
-        }
-      }
-    }
-
-    // Remove empty assistant messages (had only tool_calls, all stripped)
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      if (
-        msg &&
-        msg.role === "assistant" &&
-        !msg.tool_calls &&
-        (!msg.content || msg.content === "")
-      ) {
-        messages.splice(i, 1)
-      }
+      messages.splice(0, messages.length, ...sanitized.items)
     }
   }
 
@@ -1803,6 +1823,7 @@ export class OpenaiCompatService implements OnModuleInit {
     account: OpenaiCompatAccount = this.nextAccount(dto.model),
     suppressCooldownForResponsesFallback: boolean = false
   ): Promise<AnthropicResponse> {
+    const requestStartedAt = Date.now()
     const request = this.translateRequest(dto, false)
     const url = this.buildUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, false)
@@ -1857,6 +1878,10 @@ export class OpenaiCompatService implements OnModuleInit {
 
     const result = (await response.json()) as Record<string, unknown>
     this.markAccountHealthy(account, request.model)
+    this.recordOpenAiCompatUsage(account, request.model, "chat-completions", {
+      ...this.extractChatCompletionUsage(result),
+      durationMs: Math.max(0, Date.now() - requestStartedAt),
+    })
     return this.translateNonStreamResponse(result)
   }
 
@@ -2032,6 +2057,7 @@ export class OpenaiCompatService implements OnModuleInit {
     account: OpenaiCompatAccount = this.nextAccount(dto.model),
     suppressCooldownForResponsesFallback: boolean = false
   ): AsyncGenerator<string, void, unknown> {
+    const requestStartedAt = Date.now()
     const request = this.translateRequest(dto, true)
     const url = this.buildUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, true)
@@ -2175,6 +2201,12 @@ export class OpenaiCompatService implements OnModuleInit {
         yield* this.emitStreamEnd(state)
       }
       this.markAccountHealthy(account, request.model)
+      this.recordOpenAiCompatUsage(account, request.model, "chat-completions", {
+        inputTokens: state.lastInputTokens,
+        cachedInputTokens: state.lastCachedInputTokens,
+        outputTokens: state.lastOutputTokens,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+      })
     } catch (error) {
       if (
         error instanceof BackendApiError ||
@@ -2626,8 +2658,19 @@ export class OpenaiCompatService implements OnModuleInit {
 
       // Extract usage from the chunk if available
       const chunkUsage = chunk.usage as Record<string, unknown> | undefined
-      const inputTokens = (chunkUsage?.prompt_tokens as number) || 0
+      const totalInputTokens = (chunkUsage?.prompt_tokens as number) || 0
       const outputTokens = (chunkUsage?.completion_tokens as number) || 0
+      const cachedInputTokens = this.toWholeNumber(
+        chunkUsage?.prompt_tokens_details &&
+          typeof chunkUsage.prompt_tokens_details === "object"
+          ? (chunkUsage.prompt_tokens_details as Record<string, unknown>)
+              .cached_tokens
+          : 0
+      )
+      const inputTokens = Math.max(0, totalInputTokens - cachedInputTokens)
+      state.lastInputTokens = this.toWholeNumber(inputTokens)
+      state.lastCachedInputTokens = cachedInputTokens
+      state.lastOutputTokens = this.toWholeNumber(outputTokens)
 
       results.push(
         formatSseEvent("message_delta", {
@@ -2635,6 +2678,7 @@ export class OpenaiCompatService implements OnModuleInit {
           delta: { stop_reason: stopReason, stop_sequence: null },
           usage: {
             input_tokens: inputTokens,
+            cache_read_input_tokens: cachedInputTokens,
             output_tokens: outputTokens,
           },
         })
@@ -2689,6 +2733,7 @@ export class OpenaiCompatService implements OnModuleInit {
     account: OpenaiCompatAccount = this.nextAccount(dto.model),
     suppressCooldownForChatFallback: boolean = false
   ): AsyncGenerator<string, void, unknown> {
+    const requestStartedAt = Date.now()
     const modelName = dto.model
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
 
@@ -2783,6 +2828,11 @@ export class OpenaiCompatService implements OnModuleInit {
     const FIRST_CHUNK_TIMEOUT_MS = this.getStreamFirstChunkTimeoutMs()
     const IDLE_TIMEOUT_MS = this.getStreamIdleTimeoutMs()
     let receivedChunk = false
+    let completedUsage: {
+      inputTokens: number
+      cachedInputTokens: number
+      outputTokens: number
+    } | null = null
 
     try {
       while (true) {
@@ -2810,6 +2860,20 @@ export class OpenaiCompatService implements OnModuleInit {
           const trimmed = line.trim()
           if (!trimmed) continue
 
+          if (trimmed.startsWith("data:")) {
+            const jsonStr = trimmed.slice(5).trim()
+            if (jsonStr && jsonStr !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(jsonStr) as Record<string, unknown>
+                if (parsed.type === "response.completed") {
+                  completedUsage = this.extractResponsesUsage(parsed)
+                }
+              } catch {
+                // Ignore malformed chunks for analytics bookkeeping
+              }
+            }
+          }
+
           // Use Codex SSE translator to convert to Claude SSE events
           const events = translateCodexSseEvent(trimmed, state, reverseToolMap)
           for (const event of events) {
@@ -2820,6 +2884,19 @@ export class OpenaiCompatService implements OnModuleInit {
 
       // Process remaining buffer
       if (buffer.trim()) {
+        if (buffer.trim().startsWith("data:")) {
+          const jsonStr = buffer.trim().slice(5).trim()
+          if (jsonStr && jsonStr !== "[DONE]") {
+            try {
+              const parsed = JSON.parse(jsonStr) as Record<string, unknown>
+              if (parsed.type === "response.completed") {
+                completedUsage = this.extractResponsesUsage(parsed)
+              }
+            } catch {
+              // Ignore malformed chunks for analytics bookkeeping
+            }
+          }
+        }
         const events = translateCodexSseEvent(
           buffer.trim(),
           state,
@@ -2830,6 +2907,12 @@ export class OpenaiCompatService implements OnModuleInit {
         }
       }
       this.markAccountHealthy(account, modelName)
+      this.recordOpenAiCompatUsage(account, modelName, "responses", {
+        inputTokens: completedUsage?.inputTokens || 0,
+        cachedInputTokens: completedUsage?.cachedInputTokens || 0,
+        outputTokens: completedUsage?.outputTokens || 0,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+      })
     } catch (error) {
       if (
         error instanceof BackendApiError ||
@@ -2863,6 +2946,7 @@ export class OpenaiCompatService implements OnModuleInit {
     account: OpenaiCompatAccount = this.nextAccount(dto.model),
     suppressCooldownForChatFallback: boolean = false
   ): Promise<AnthropicResponse> {
+    const requestStartedAt = Date.now()
     const modelName = dto.model
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
 
@@ -2935,6 +3019,10 @@ export class OpenaiCompatService implements OnModuleInit {
           const result = translateCodexToClaudeNonStream(event, reverseToolMap)
           if (result) {
             this.markAccountHealthy(account, modelName)
+            this.recordOpenAiCompatUsage(account, modelName, "responses", {
+              ...this.extractResponsesUsage(event),
+              durationMs: Math.max(0, Date.now() - requestStartedAt),
+            })
             this.logger.log(
               `[OpenAI-Compat/Responses] Non-stream response: model=${result.model}, stop=${result.stop_reason}`
             )

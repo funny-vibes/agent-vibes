@@ -4,25 +4,33 @@
  * Sync Codex CLI credentials into agent-vibes.
  *
  * Reads ~/.codex/auth.json (created by `codex --login`) and writes
- * the account entry into apps/protocol-bridge/data/codex-accounts.json.
+ * the account entry into the configured Codex accounts JSON file.
  *
  * Usage:
  *   agent-vibes sync --codex
+ *   agent-vibes sync --codex --accounts-file /abs/path/codex-accounts.json
  *   npm run codex:sync
  */
 
 const fs = require("fs")
 const path = require("path")
 const os = require("os")
+const {
+  formatPathForDisplay,
+  resolveDefaultAccountConfigPath,
+} = require("./lib/account-config-paths")
+
+const args = process.argv.slice(2)
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..")
-const DEST_FILE = path.join(
+const DEST_FILE = resolveDefaultAccountConfigPath(
   PROJECT_ROOT,
-  "apps/protocol-bridge/data/codex-accounts.json"
+  "codex-accounts.json",
+  args
 )
 
 /** Codex CLI credential file — respects CODEX_HOME env var */
@@ -215,7 +223,7 @@ if (auth.mode === "api_key") {
 }
 
 console.log(
-  `\n✅ Credentials written to ${path.relative(PROJECT_ROOT, DEST_FILE)}`
+  `\n✅ Credentials written to ${formatPathForDisplay(PROJECT_ROOT, DEST_FILE)}`
 )
 console.log("   Restart the proxy to apply changes.")
 console.log("   To deploy to remote, run: npm run deploy:sync")

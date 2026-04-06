@@ -47,6 +47,10 @@ const SCALAR_TYPES = new Set([
 
 const SKIP_PACKAGES = new Set(["google.protobuf", "google.protobuf.compiler"])
 
+// 无法从 schema 解引用回真实包/类型名的混淆残留类型。
+// 这类类型会被收敛为当前 package 内的占位类型，避免生成不可编译的 import。
+let opaquePlaceholderTypes = new Map()
+
 // Google 类型 → 文件映射
 const GOOGLE_TYPE_TO_FILE = {
   "google.protobuf.Timestamp": "google/protobuf/timestamp.proto",
@@ -98,6 +102,29 @@ function shortName(fullName, pkg) {
 
 function pkgToFilePath(pkg) {
   return pkg.replace(/\./g, "/") + ".proto"
+}
+
+function isOpaqueTypeName(typeName) {
+  if (!typeName || typeof typeName !== "string") return false
+  if (SCALAR_TYPES.has(typeName)) return false
+  if (typeName.startsWith("map<")) return false
+  if (typeName.startsWith("google.")) return false
+  if (/^[a-z]+\.[a-z0-9]+(\.|$)/.test(typeName)) return false
+  if (
+    /^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(typeName)
+  ) {
+    return true
+  }
+  if (/^[A-Za-z_$][\w$]*$/.test(typeName)) {
+    return true
+  }
+  return false
+}
+
+function ensureOpaquePlaceholder(pkg, typeName) {
+  if (!opaquePlaceholderTypes.has(pkg))
+    opaquePlaceholderTypes.set(pkg, new Set())
+  opaquePlaceholderTypes.get(pkg).add(typeName)
 }
 
 // T 值 → proto 标量类型
@@ -171,6 +198,11 @@ function toPlaceholderName(fullTypeName) {
 function shortenRef(typeName, currentPkg) {
   if (SCALAR_TYPES.has(typeName)) return typeName
   if (typeName.startsWith("map<")) return typeName
+
+  if (isOpaqueTypeName(typeName)) {
+    ensureOpaquePlaceholder(currentPkg, typeName)
+    return toPlaceholderName(typeName)
+  }
 
   // 如果需要 placeholder
   if (needsPlaceholder(typeName, currentPkg)) {
@@ -528,6 +560,10 @@ function collectImports(pkg, data, schema) {
   function addRef(typeName) {
     if (!typeName || SCALAR_TYPES.has(typeName) || typeName.startsWith("map<"))
       return
+    if (isOpaqueTypeName(typeName)) {
+      ensureOpaquePlaceholder(pkg, typeName)
+      return
+    }
     const refPkg = getPackage(typeName)
 
     // 跳过被打断的边
@@ -679,14 +715,21 @@ function generatePackageProto(pkg, data, schema, imports) {
   // placeholder types
   const phSet = placeholderTypes.get(pkg)
   const directSet = directPlaceholderTypes.get(pkg) || new Set()
-  if (phSet && phSet.size > 0) {
+  const opaqueSet = opaquePlaceholderTypes.get(pkg) || new Set()
+  if ((phSet && phSet.size > 0) || opaqueSet.size > 0) {
+    const phCount = phSet?.size || 0
     lines.push("// ============================")
     lines.push(
-      `// Placeholder types (${directSet.size} direct + ${phSet.size - directSet.size} recursive-shell)`
+      `// Placeholder types (${directSet.size} direct + ${Math.max(phCount - directSet.size, 0)} recursive-shell + ${opaqueSet.size} opaque)`
     )
     lines.push("// ============================")
     lines.push("")
-    writePlaceholders(lines, phSet, directSet, pkg, schema)
+    if (phSet && phSet.size > 0) {
+      writePlaceholders(lines, phSet, directSet, pkg, schema)
+    }
+    if (opaqueSet.size > 0) {
+      writeOpaquePlaceholders(lines, opaqueSet)
+    }
   }
 
   // services
@@ -957,6 +1000,14 @@ function resolvePHFieldType(field, currentPkg) {
 
   // 在 placeholder 上下文中，对需要 PH 的引用使用 PH 名
   return shortenRef(raw, currentPkg)
+}
+
+function writeOpaquePlaceholders(lines, opaqueSet) {
+  for (const fullName of [...opaqueSet].sort()) {
+    const phName = toPlaceholderName(fullName)
+    lines.push(`message ${phName} {} // opaque placeholder for ${fullName}`)
+    lines.push("")
+  }
 }
 
 // ============================================================

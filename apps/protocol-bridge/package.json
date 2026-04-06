@@ -32,7 +32,6 @@
     "@nestjs/platform-express": "^11.1.9",
     "@nestjs/platform-fastify": "^11.1.12",
     "@nestjs/swagger": "^11.2.3",
-    "better-sqlite3": "^12.6.2",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.3",
     "http-proxy-agent": "^7.0.2",
@@ -46,11 +45,11 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
+    "@anatine/esbuild-decorators": "^0.2.19",
     "@bufbuild/buf": "^1.63.0",
     "@bufbuild/protoc-gen-es": "^2.10.2",
     "@nestjs/cli": "^11.0.14",
     "@nestjs/schematics": "^11.0.9",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.0",
     "@types/node": "^25.0.9",
     "@types/uuid": "^10.0.0",

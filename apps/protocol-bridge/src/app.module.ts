@@ -7,7 +7,9 @@ import { CursorModule } from "./protocol/cursor/cursor.module"
 import { HistoryModule } from "./context/history.module"
 import { HealthController } from "./health.controller"
 import { ModelModule } from "./llm/model.module"
+import { PersistenceModule } from "./persistence"
 import { validateEnv } from "./shared/env.validation"
+import { UsageStatsModule } from "./usage/usage-stats.module"
 
 const ENV_FILE_CANDIDATES = [
   path.resolve(process.cwd(), "apps/protocol-bridge/.env.local"),
@@ -25,11 +27,13 @@ const ENV_FILE_CANDIDATES = [
       envFilePath: Array.from(new Set(ENV_FILE_CANDIDATES)),
       validate: validateEnv,
     }),
+    PersistenceModule,
     AnthropicModule,
     CursorModule,
     HistoryModule,
     ModelModule,
     NativeModule,
+    UsageStatsModule,
   ],
   controllers: [HealthController],
 })

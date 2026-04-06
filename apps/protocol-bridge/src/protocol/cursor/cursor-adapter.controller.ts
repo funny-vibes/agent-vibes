@@ -92,7 +92,11 @@ export class CursorAdapterController {
     }
 
     if (resolved.family === "gpt") {
-      return this.isGptBackendAvailable()
+      if (this.openaiCompatService.isAvailable()) {
+        return true
+      }
+
+      return this.codexService.supportsModel(modelId)
     }
 
     if (resolved.family === "gemini") {

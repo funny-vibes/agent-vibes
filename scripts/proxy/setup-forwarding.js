@@ -19,7 +19,7 @@
  *   node setup-forwarding.js hosts    Print /etc/hosts entries
  */
 
-const { execSync } = require("child_process")
+const { execSync, spawnSync } = require("child_process")
 const fs = require("fs")
 const os = require("os")
 const platform = require("../lib/platform")
@@ -531,7 +531,9 @@ function pfEnable() {
   const startTime = Date.now()
   while (Date.now() - startTime < 1000) {
     if (getRelayPid()) break
-    require("child_process").execSync("sleep 0.1")
+    spawnSync(process.execPath, ["-e", "setTimeout(()=>{},100)"], {
+      stdio: "ignore",
+    })
   }
 
   if (getRelayPid()) {

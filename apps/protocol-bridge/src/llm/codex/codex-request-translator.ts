@@ -9,6 +9,7 @@
 
 import { normalizeToolProtocolMessages } from "../../context/tool-protocol-normalizer"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
+import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
 import { buildShortNameMap, shortenNameIfNeeded } from "./tool-name-shortener"
 
 // ── Types for Codex Responses API ──────────────────────────────────────
@@ -184,7 +185,7 @@ export function translateClaudeToCodex(
   dto: CreateMessageDto,
   modelName: string
 ): CodexRequest {
-  const input: CodexInputItem[] = []
+  let input: CodexInputItem[] = []
 
   // ── Build tool name shortening map ───────────────────────────────
   const toolNames: string[] = []
@@ -399,6 +400,12 @@ export function translateClaudeToCodex(
       flushMessage()
     }
   }
+
+  const sanitizedInput = sanitizeResponsesToolCallIntegrity(
+    input,
+    dto._pendingToolUseIds
+  )
+  input = sanitizedInput.items
 
   // ── Convert tools ────────────────────────────────────────────────
   let codexTools: CodexTool[] | undefined

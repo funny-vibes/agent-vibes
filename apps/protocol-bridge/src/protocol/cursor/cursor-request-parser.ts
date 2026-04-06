@@ -19,7 +19,7 @@ import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
-import { resolveCloudCodeModel } from "../../llm/model-registry"
+import { doesModelSupportThinking } from "../../llm/model-registry"
 import { KvStorageService } from "./kv-storage.service"
 
 // GZIP 魔数
@@ -58,6 +58,20 @@ export interface ParsedToolResult {
       }>
       reason?: string
       errorMessage?: string
+    }
+    webSearchResult?: {
+      query?: string
+      references?: Array<{
+        title?: string
+        url?: string
+        chunk?: string
+      }>
+    }
+    webFetchResult?: {
+      url?: string
+      title?: string
+      contentType?: string
+      markdown?: string
     }
   }
 }
@@ -161,6 +175,7 @@ export interface ParsedCursorRequest {
     | "execHeartbeat"
     | "execStreamClose"
     | "execThrow"
+    | "cancelAction"
     | "other"
   agentControlExecId?: number
   agentControlError?: string
@@ -216,8 +231,10 @@ function makeControlMessage(
     | "execHeartbeat"
     | "execStreamClose"
     | "execThrow"
+    | "cancelAction"
     | "other",
   options?: {
+    conversationId?: string
     execId?: number
     error?: string
     stackTrace?: string
@@ -232,6 +249,7 @@ function makeControlMessage(
     isAgentic: true,
     supportedTools: [],
     useWeb: false,
+    conversationId: options?.conversationId,
     isAgentControlMessage: true,
     agentControlType,
     agentControlExecId: options?.execId,
@@ -594,7 +612,19 @@ export class CursorRequestParser {
         return this.parseExecClientControlMessage(message.value)
 
       case "conversationAction":
-        this.logger.debug("收到 conversationAction（非 runRequest）")
+        if (message.value.action.case === "cancelAction") {
+          const reason = (message.value.action.value.reason || "").trim()
+          this.logger.warn(
+            `收到 conversationAction.cancelAction reason=${reason || "(empty)"}`
+          )
+          return makeControlMessage("cancelAction", {
+            error: reason,
+          })
+        }
+
+        this.logger.debug(
+          `收到 conversationAction（非 runRequest） action=${message.value.action.case || "(none)"}`
+        )
         return makeControlMessage("other")
 
       case "kvClientMessage":
@@ -833,8 +863,49 @@ export class CursorRequestParser {
           )
         }
       }
+      // DEBUG: dump 每条 rule 的关键信息，排查用户自定义规则是否被发送
+      if (requestContext.rules?.length) {
+        for (let i = 0; i < requestContext.rules.length; i++) {
+          const r = requestContext.rules[i]!
+          const typeCase = r.type?.type.case || "(none)"
+          const contentPreview = (r.content || "")
+            .substring(0, 80)
+            .replace(/\n/g, "\\n")
+          this.logger.debug(
+            `[DEBUG] rule[${i}]: type=${typeCase}, source=${r.source}, ` +
+              `path="${r.fullPath || ""}", content="${contentPreview}..."`
+          )
+        }
+      }
     } else {
       this.logger.debug("[DEBUG] requestContext is undefined")
+    }
+    // DEBUG: dump selectedContext.cursorRules
+    if (action && actionCase === "userMessageAction") {
+      const _userMsg = action.action.value.userMessage
+      const _selRules = _userMsg?.selectedContext?.cursorRules
+      this.logger.debug(
+        `[DEBUG] selectedContext.cursorRules: ${_selRules?.length ?? "undefined"} item(s)`
+      )
+      if (_selRules?.length) {
+        for (let i = 0; i < _selRules.length; i++) {
+          const sr = _selRules[i]!
+          const r = sr.rule
+          if (r) {
+            const contentPreview = (r.content || "")
+              .substring(0, 80)
+              .replace(/\n/g, "\\n")
+            this.logger.debug(
+              `[DEBUG] selectedCursorRule[${i}]: type=${r.type?.type.case || "(none)"}, ` +
+                `source=${r.source}, path="${r.fullPath || ""}", content="${contentPreview}..."`
+            )
+          } else {
+            this.logger.debug(
+              `[DEBUG] selectedCursorRule[${i}]: rule is undefined`
+            )
+          }
+        }
+      }
     }
     if (req.conversationState) {
       this.logger.debug(
@@ -877,12 +948,63 @@ export class CursorRequestParser {
     }
 
     // 提取 Cursor Rules
-    const cursorRules: CursorRule[] = []
-    if (requestContext?.rules?.length) {
-      for (const rule of requestContext.rules) {
-        cursorRules.push(rule)
+    // 规则来自两个来源：
+    //   1. requestContext.rules — 工作区级别的 rules（Cursor skills、项目 .cursor/rules 等）
+    //   2. userMsg.selectedContext.cursorRules — 用户手动创建的全局 rules（如 "Always Apply" 类型）
+    // 两者合并后去重（按 fullPath），确保用户自定义规则不会丢失。
+    //
+    // 过滤 Cursor 根据系统 locale 自动注入的语言 rule（如 "Always respond in Chinese-simplified"）。
+    // 这类 rule 由客户端在每次启动时写入 aicontext.personalContext，
+    // 与用户自定义的 rule 叠加而非覆盖，导致删除后重启又出现。
+    // 当用户已有自定义 rule 时，这条自动 rule 是多余的，直接过滤即可。
+    const AUTO_LANG_RULE_PATTERN = /^Always respond in [A-Za-z-]+$/i
+
+    // 收集 requestContext.rules
+    const contextRules = requestContext?.rules ? [...requestContext.rules] : []
+
+    // 收集 selectedContext.cursorRules（SelectedCursorRule 包装了 CursorRule）
+    if (action && actionCase === "userMessageAction") {
+      const userMsg = action.action.value.userMessage
+      const selectedRules = userMsg?.selectedContext?.cursorRules
+      if (selectedRules && selectedRules.length > 0) {
+        // 用 fullPath 集合去重，避免同一条规则重复注入
+        const existingPaths = new Set(
+          contextRules.map((r) => r.fullPath).filter(Boolean)
+        )
+        for (const selected of selectedRules) {
+          if (selected.rule) {
+            if (
+              !selected.rule.fullPath ||
+              !existingPaths.has(selected.rule.fullPath)
+            ) {
+              contextRules.push(selected.rule)
+              if (selected.rule.fullPath) {
+                existingPaths.add(selected.rule.fullPath)
+              }
+            }
+          }
+        }
+        this.logger.log(
+          `Merged ${selectedRules.length} rule(s) from selectedContext.cursorRules ` +
+            `(total after merge: ${contextRules.length})`
+        )
       }
     }
+
+    // 过滤自动注入的语言 rule 并生成最终列表
+    const cursorRules =
+      contextRules.length > 0
+        ? contextRules.filter((rule) => {
+            const content = rule.content?.trim() || ""
+            if (AUTO_LANG_RULE_PATTERN.test(content)) {
+              this.logger.log(
+                `Filtered auto-injected locale rule: "${content}"`
+              )
+              return false
+            }
+            return true
+          })
+        : undefined
 
     // 提取 Cursor Commands (/ 命令)
     const cursorCommands: Array<{ name: string; content: string }> = []
@@ -1059,7 +1181,7 @@ export class CursorRequestParser {
     if (prompt) {
       this.logger.log(
         `AgentRunRequest: prompt="${prompt.substring(0, 100)}...", model=${model}, ` +
-          `workspace=${rootPath || "(none)"}, rules=${cursorRules.length}, ` +
+          `workspace=${rootPath || "(none)"}, rules=${cursorRules?.length || 0}, ` +
           `customPrompt=${customSystemPrompt ? customSystemPrompt.length + " chars" : "none"}, ` +
           `tools=${supportedTools.length}, useWeb=${useWeb}`
       )
@@ -1074,14 +1196,11 @@ export class CursorRequestParser {
     const hasThinkingDetails = !!req.modelDetails?.thinkingDetails
     const modelMaxMode = req.modelDetails?.maxMode === true
     const requestedMaxMode = req.requestedModel?.maxMode === true
-    const registryEntry = resolveCloudCodeModel(model)
-    const registryIsThinking = registryEntry?.isThinking === true
+    const registryIsThinking = doesModelSupportThinking(model)
     let thinkingLevel = 0
     if (modelMaxMode || requestedMaxMode) {
       thinkingLevel = 2
     } else if (hasThinkingDetails) {
-      thinkingLevel = 1
-    } else if (model.toLowerCase().includes("thinking")) {
       thinkingLevel = 1
     } else if (registryIsThinking) {
       // 模型本身支持 thinking，但 Cursor 没有传 thinkingDetails
@@ -1099,6 +1218,20 @@ export class CursorRequestParser {
     const hasUserInput = prompt.length > 0 || attachedImages.length > 0
 
     if (!hasUserInput) {
+      if (actionCase === "cancelAction") {
+        const reason =
+          action?.action.case === "cancelAction"
+            ? (action.action.value.reason || "").trim()
+            : ""
+        this.logger.log(
+          `AgentRunRequest cancelAction: conversationId=${conversationId || "(none)"}, reason=${reason || "(empty)"}`
+        )
+        return makeControlMessage("cancelAction", {
+          conversationId,
+          error: reason,
+        })
+      }
+
       if (actionCase === "resumeAction") {
         this.logger.log(
           `AgentRunRequest resumeAction: conversationId=${conversationId || "(none)"}, pendingToolCalls=${req.conversationState?.pendingToolCalls?.length || 0}`
@@ -1116,7 +1249,7 @@ export class CursorRequestParser {
           projectContext: rootPath
             ? { rootPath, directories, files: [] }
             : undefined,
-          cursorRules: cursorRules.length > 0 ? cursorRules : undefined,
+          cursorRules,
           cursorCommands:
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
@@ -1161,7 +1294,7 @@ export class CursorRequestParser {
       projectContext: rootPath
         ? { rootPath, directories, files: [] }
         : undefined,
-      cursorRules: cursorRules.length > 0 ? cursorRules : undefined,
+      cursorRules,
       cursorCommands: cursorCommands.length > 0 ? cursorCommands : undefined,
       customSystemPrompt: customSystemPrompt || undefined,
       contextTokenLimit,

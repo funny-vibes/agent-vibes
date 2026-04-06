@@ -1,7 +1,11 @@
-import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common"
-import Database from "better-sqlite3"
-import * as fs from "fs"
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from "@nestjs/common"
 import * as path from "path"
+import { PersistenceService } from "../../persistence"
 import { ParsedCursorRequest } from "./cursor-request-parser"
 import { enforceToolProtocol } from "../../context/message-integrity-guard"
 
@@ -107,6 +111,7 @@ export interface ChatSession {
   usedTokens: number
   readPaths: Set<string>
   fileStates: Map<string, { beforeContent: string; afterContent: string }>
+  toolMetrics: SessionToolMetrics
 
   // Message history with blobIds for checkpoint
   messageBlobIds: string[] // SHA-256 hashes from KV storage
@@ -158,6 +163,64 @@ export interface PendingToolCall {
     signal?: string
     started: boolean
   }
+}
+
+export interface SessionToolMetrics {
+  completedCalls: number
+  shellCalls: number
+  editCalls: number
+  mcpCalls: number
+  otherCalls: number
+  totalDurationMs: number
+  lastCompletedAt: number | null
+}
+
+export interface ChatSessionAnalyticsEntry {
+  conversationId: string
+  loaded: boolean
+  active: boolean
+  model: string
+  createdAt: string
+  lastActivityAt: string
+  idleMs: number
+  pendingToolCalls: number
+  completedToolCalls: number
+  shellToolCalls: number
+  editToolCalls: number
+  mcpToolCalls: number
+  otherToolCalls: number
+  totalToolDurationMs: number
+  avgToolDurationMs: number | null
+  readFiles: number
+  editedFiles: number
+  linesAdded: number
+  linesRemoved: number
+  contextTokenLimit: number | null
+  usedContextTokens: number | null
+  contextUsagePct: number | null
+  requestedMaxOutputTokens: number | null
+  subAgentTurns: number
+  subAgentToolCalls: number
+}
+
+export interface ChatSessionAnalyticsSummary {
+  timestamp: string
+  totals: {
+    totalSessions: number
+    activeSessions: number
+    loadedSessions: number
+    persistedOnlySessions: number
+    pendingToolCalls: number
+    completedToolCalls: number
+    totalToolDurationMs: number
+    avgToolDurationMs: number | null
+    readFiles: number
+    editedFiles: number
+    linesAdded: number
+    linesRemoved: number
+    lastActivityAt: string | null
+  }
+  sessions: ChatSessionAnalyticsEntry[]
 }
 
 /**
@@ -290,6 +353,8 @@ interface PersistedChatSessionV1 {
   pendingInteractionQueryCount: number
   projectContext?: ParsedCursorRequest["projectContext"]
   codeChunks?: ParsedCursorRequest["codeChunks"]
+  // Legacy only: request-scoped rules used to be persisted, but are now
+  // intentionally ignored on restore.
   cursorRules?: ParsedCursorRequest["cursorRules"] | string[]
   cursorCommands?: ParsedCursorRequest["cursorCommands"]
   customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
@@ -305,6 +370,7 @@ interface PersistedChatSessionV1 {
     beforeContent: string
     afterContent: string
   }>
+  toolMetrics?: SessionToolMetrics
   messageBlobIds: string[]
   turns: string[]
   currentAssistantMessage?: Record<string, unknown>
@@ -317,30 +383,24 @@ interface PersistedChatSessionV1 {
 }
 
 @Injectable()
-export class ChatSessionManager implements OnModuleDestroy {
+export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ChatSessionManager.name)
   private readonly sessions = new Map<string, ChatSession>()
+  private readonly ACTIVE_SESSION_WINDOW_MS = 5 * 60 * 1000
   private readonly SESSION_TIMEOUT = 30 * 60 * 1000 // 30 minutes
   private readonly PERSISTED_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
   private readonly PERSIST_FLUSH_INTERVAL_MS = 15 * 1000
   private readonly PERSIST_DEBOUNCE_MS = 250
-  private readonly dbPath: string
-  private db: Database.Database | null = null
   private readonly scheduledPersistTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
   >()
-  private readonly cleanupInterval: ReturnType<typeof setInterval>
-  private readonly persistFlushInterval: ReturnType<typeof setInterval>
+  private cleanupInterval!: ReturnType<typeof setInterval>
+  private persistFlushInterval!: ReturnType<typeof setInterval>
 
-  constructor() {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp"
-    const dataDir = path.join(homeDir, ".protocol-bridge")
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true })
-    }
-    this.dbPath = path.join(dataDir, "session-state.db")
-    this.initDatabase()
+  constructor(private readonly persistence: PersistenceService) {}
+
+  onModuleInit(): void {
     this.cleanupOldPersistedSessions()
 
     this.cleanupInterval = setInterval(
@@ -365,48 +425,15 @@ export class ChatSessionManager implements OnModuleDestroy {
 
     clearInterval(this.cleanupInterval)
     clearInterval(this.persistFlushInterval)
-
-    if (this.db) {
-      this.db.close()
-      this.db = null
-    }
-  }
-
-  private initDatabase(): void {
-    try {
-      this.db = new Database(this.dbPath)
-      this.db.pragma("journal_mode = WAL")
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS cursor_sessions (
-          conversation_id TEXT PRIMARY KEY,
-          state_json TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          last_activity_at INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_cursor_sessions_last_activity
-          ON cursor_sessions(last_activity_at);
-      `)
-      this.logger.log(`Session persistence initialized at ${this.dbPath}`)
-    } catch (error) {
-      this.logger.error(
-        `Failed to initialize session persistence: ${String(error)}`
-      )
-      this.db = null
-    }
+    // PersistenceService handles DB cleanup
   }
 
   private cleanupOldPersistedSessions(): void {
-    if (!this.db) return
-
+    if (!this.persistence.isReady) return
     const cutoff = Date.now() - this.PERSISTED_SESSION_TTL_MS
     try {
-      const result = this.db
-        .prepare(
-          `DELETE FROM cursor_sessions
-           WHERE last_activity_at < ?`
-        )
+      const result = this.persistence
+        .prepare(`DELETE FROM cursor_sessions WHERE last_activity_at < ?`)
         .run(cutoff)
       if (result.changes > 0) {
         this.logger.log(
@@ -449,8 +476,6 @@ export class ChatSessionManager implements OnModuleDestroy {
   }
 
   persistSession(conversationId: string): void {
-    if (!this.db) return
-
     const session = this.sessions.get(conversationId)
     if (!session) return
 
@@ -458,7 +483,7 @@ export class ChatSessionManager implements OnModuleDestroy {
     const state = this.serializeSession(session)
 
     try {
-      this.db
+      this.persistence
         .prepare(
           `INSERT INTO cursor_sessions (
              conversation_id,
@@ -489,10 +514,8 @@ export class ChatSessionManager implements OnModuleDestroy {
   private loadPersistedSession(
     conversationId: string
   ): ChatSession | undefined {
-    if (!this.db) return undefined
-
     try {
-      const row = this.db
+      const row = this.persistence
         .prepare(
           `SELECT state_json, last_activity_at
            FROM cursor_sessions
@@ -526,9 +549,8 @@ export class ChatSessionManager implements OnModuleDestroy {
   }
 
   private deletePersistedSession(conversationId: string): void {
-    if (!this.db) return
     try {
-      this.db
+      this.persistence
         .prepare(`DELETE FROM cursor_sessions WHERE conversation_id = ?`)
         .run(conversationId)
     } catch (error) {
@@ -550,6 +572,220 @@ export class ChatSessionManager implements OnModuleDestroy {
       return Math.floor(value)
     }
     return fallback
+  }
+
+  private createEmptyToolMetrics(): SessionToolMetrics {
+    return {
+      completedCalls: 0,
+      shellCalls: 0,
+      editCalls: 0,
+      mcpCalls: 0,
+      otherCalls: 0,
+      totalDurationMs: 0,
+      lastCompletedAt: null,
+    }
+  }
+
+  private toNonNegativeInt(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value)
+      ? Math.max(0, Math.round(value))
+      : 0
+  }
+
+  private normalizeToolMetrics(value: unknown): SessionToolMetrics {
+    const metrics =
+      value && typeof value === "object"
+        ? (value as Partial<SessionToolMetrics>)
+        : {}
+    return {
+      completedCalls: this.toNonNegativeInt(metrics.completedCalls),
+      shellCalls: this.toNonNegativeInt(metrics.shellCalls),
+      editCalls: this.toNonNegativeInt(metrics.editCalls),
+      mcpCalls: this.toNonNegativeInt(metrics.mcpCalls),
+      otherCalls: this.toNonNegativeInt(metrics.otherCalls),
+      totalDurationMs: this.toNonNegativeInt(metrics.totalDurationMs),
+      lastCompletedAt:
+        typeof metrics.lastCompletedAt === "number" &&
+        Number.isFinite(metrics.lastCompletedAt)
+          ? Math.max(0, Math.round(metrics.lastCompletedAt))
+          : null,
+    }
+  }
+
+  private classifyToolCall(
+    toolCall: Pick<PendingToolCall, "toolName" | "toolFamilyHint">
+  ): "shell" | "edit" | "mcp" | "other" {
+    const toolName = toolCall.toolName.toLowerCase()
+    if (
+      toolCall.toolFamilyHint === "edit" ||
+      toolName === "edit_file_v2" ||
+      toolName === "edit"
+    ) {
+      return "edit"
+    }
+    if (toolCall.toolFamilyHint === "mcp") {
+      return "mcp"
+    }
+    if (
+      toolName.includes("run_terminal_command") ||
+      toolName.includes("write_shell_stdin")
+    ) {
+      return "shell"
+    }
+    return "other"
+  }
+
+  private toDiffLines(content: string): string[] {
+    if (!content) return []
+    const lines = content.split(/\r?\n/)
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop()
+    }
+    return lines
+  }
+
+  private countLineDelta(
+    beforeContent: string,
+    afterContent: string
+  ): { linesAdded: number; linesRemoved: number } {
+    const beforeLines = this.toDiffLines(beforeContent)
+    const afterLines = this.toDiffLines(afterContent)
+
+    let prefix = 0
+    while (
+      prefix < beforeLines.length &&
+      prefix < afterLines.length &&
+      beforeLines[prefix] === afterLines[prefix]
+    ) {
+      prefix++
+    }
+
+    let beforeEnd = beforeLines.length - 1
+    let afterEnd = afterLines.length - 1
+    while (
+      beforeEnd >= prefix &&
+      afterEnd >= prefix &&
+      beforeLines[beforeEnd] === afterLines[afterEnd]
+    ) {
+      beforeEnd--
+      afterEnd--
+    }
+
+    const beforeRemaining = beforeLines.slice(prefix, beforeEnd + 1)
+    const afterRemaining = afterLines.slice(prefix, afterEnd + 1)
+
+    if (beforeRemaining.length === 0 || afterRemaining.length === 0) {
+      return {
+        linesAdded: afterRemaining.length,
+        linesRemoved: beforeRemaining.length,
+      }
+    }
+
+    const maxCells = 1_000_000
+    if (beforeRemaining.length * afterRemaining.length > maxCells) {
+      return {
+        linesAdded: afterRemaining.length,
+        linesRemoved: beforeRemaining.length,
+      }
+    }
+
+    let previous = new Array(afterRemaining.length + 1).fill(0)
+    for (const beforeLine of beforeRemaining) {
+      const current = new Array(afterRemaining.length + 1).fill(0)
+      for (let index = 1; index <= afterRemaining.length; index++) {
+        current[index] =
+          beforeLine === afterRemaining[index - 1]
+            ? previous[index - 1] + 1
+            : Math.max(previous[index], current[index - 1])
+      }
+      previous = current
+    }
+
+    const lcsLength = previous[afterRemaining.length] || 0
+    return {
+      linesAdded: afterRemaining.length - lcsLength,
+      linesRemoved: beforeRemaining.length - lcsLength,
+    }
+  }
+
+  private getSessionLineChangeStats(session: ChatSession): {
+    linesAdded: number
+    linesRemoved: number
+  } {
+    let linesAdded = 0
+    let linesRemoved = 0
+
+    for (const state of session.fileStates.values()) {
+      const delta = this.countLineDelta(state.beforeContent, state.afterContent)
+      linesAdded += delta.linesAdded
+      linesRemoved += delta.linesRemoved
+    }
+
+    return { linesAdded, linesRemoved }
+  }
+
+  private buildAnalyticsEntry(
+    conversationId: string,
+    session: ChatSession,
+    loaded: boolean,
+    now: number
+  ): ChatSessionAnalyticsEntry {
+    const lineStats = this.getSessionLineChangeStats(session)
+    const idleMs = Math.max(0, now - session.lastActivityAt.getTime())
+    const contextTokenLimit =
+      typeof session.contextTokenLimit === "number" &&
+      Number.isFinite(session.contextTokenLimit)
+        ? Math.max(0, Math.round(session.contextTokenLimit))
+        : null
+    const usedContextTokens =
+      typeof session.usedContextTokens === "number" &&
+      Number.isFinite(session.usedContextTokens)
+        ? Math.max(0, Math.round(session.usedContextTokens))
+        : null
+    const requestedMaxOutputTokens =
+      typeof session.requestedMaxOutputTokens === "number" &&
+      Number.isFinite(session.requestedMaxOutputTokens)
+        ? Math.max(0, Math.round(session.requestedMaxOutputTokens))
+        : null
+    const contextUsagePct =
+      contextTokenLimit && usedContextTokens != null && contextTokenLimit > 0
+        ? Math.round((usedContextTokens / contextTokenLimit) * 1000) / 10
+        : null
+
+    return {
+      conversationId,
+      loaded,
+      active: idleMs < this.ACTIVE_SESSION_WINDOW_MS,
+      model: session.model || "(unknown)",
+      createdAt: session.createdAt.toISOString(),
+      lastActivityAt: session.lastActivityAt.toISOString(),
+      idleMs,
+      pendingToolCalls: session.pendingToolCalls.size,
+      completedToolCalls: session.toolMetrics.completedCalls,
+      shellToolCalls: session.toolMetrics.shellCalls,
+      editToolCalls: session.toolMetrics.editCalls,
+      mcpToolCalls: session.toolMetrics.mcpCalls,
+      otherToolCalls: session.toolMetrics.otherCalls,
+      totalToolDurationMs: session.toolMetrics.totalDurationMs,
+      avgToolDurationMs:
+        session.toolMetrics.completedCalls > 0
+          ? Math.round(
+              (session.toolMetrics.totalDurationMs /
+                session.toolMetrics.completedCalls) *
+                10
+            ) / 10
+          : null,
+      readFiles: session.readPaths.size,
+      editedFiles: session.fileStates.size,
+      linesAdded: lineStats.linesAdded,
+      linesRemoved: lineStats.linesRemoved,
+      contextTokenLimit,
+      usedContextTokens,
+      contextUsagePct,
+      requestedMaxOutputTokens,
+      subAgentTurns: session.subAgentContext?.turnCount ?? 0,
+      subAgentToolCalls: session.subAgentContext?.toolCallCount ?? 0,
+    }
   }
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
@@ -591,7 +827,6 @@ export class ChatSessionManager implements OnModuleDestroy {
       pendingInteractionQueryCount: session.pendingInteractionQueries.size,
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
-      cursorRules: session.cursorRules,
       cursorCommands: session.cursorCommands,
       customSystemPrompt: session.customSystemPrompt,
       explicitContext: session.explicitContext,
@@ -608,6 +843,7 @@ export class ChatSessionManager implements OnModuleDestroy {
           afterContent: state.afterContent,
         })
       ),
+      toolMetrics: { ...session.toolMetrics },
       messageBlobIds: [...session.messageBlobIds],
       turns: [...session.turns],
       currentAssistantMessage: session.currentAssistantMessage,
@@ -781,9 +1017,10 @@ export class ChatSessionManager implements OnModuleDestroy {
       currentStreamId: crypto.randomUUID(),
       projectContext: persisted.projectContext,
       codeChunks: persisted.codeChunks,
-      cursorRules: Array.isArray(persisted.cursorRules)
-        ? (persisted.cursorRules as ParsedCursorRequest["cursorRules"])
-        : undefined,
+      // Cursor rules are request-scoped and re-sent by Cursor on each
+      // user/resume action. Restoring them from persisted session state causes
+      // stale/duplicated default rules to leak across turns.
+      cursorRules: undefined,
       cursorCommands: persisted.cursorCommands,
       customSystemPrompt: persisted.customSystemPrompt,
       explicitContext: persisted.explicitContext,
@@ -807,6 +1044,7 @@ export class ChatSessionManager implements OnModuleDestroy {
             ])
           : []
       ),
+      toolMetrics: this.normalizeToolMetrics(persisted.toolMetrics),
       messageBlobIds: Array.isArray(persisted.messageBlobIds)
         ? persisted.messageBlobIds
         : [],
@@ -873,6 +1111,7 @@ export class ChatSessionManager implements OnModuleDestroy {
       usedTokens: initialRequest?.usedContextTokens || 0,
       readPaths: new Set(),
       fileStates: new Map(),
+      toolMetrics: this.createEmptyToolMetrics(),
       messageBlobIds: [],
       turns: [],
       currentAssistantMessage: undefined,
@@ -933,7 +1172,7 @@ export class ChatSessionManager implements OnModuleDestroy {
       if (initialRequest?.projectContext) {
         session.projectContext = initialRequest.projectContext
       }
-      if (initialRequest?.cursorRules) {
+      if (initialRequest) {
         session.cursorRules = initialRequest.cursorRules
       }
       session.cursorCommands = initialRequest?.cursorCommands
@@ -1218,6 +1457,21 @@ export class ChatSessionManager implements OnModuleDestroy {
   /**
    * Add pending tool call
    */
+  private resolveWorkspaceFilePath(
+    session: ChatSession,
+    filePath: string
+  ): string {
+    const rootPath =
+      typeof session.projectContext?.rootPath === "string" &&
+      session.projectContext.rootPath.trim() !== ""
+        ? session.projectContext.rootPath
+        : process.cwd()
+    const normalizedRoot = path.resolve(rootPath)
+    return path.isAbsolute(filePath)
+      ? path.resolve(filePath)
+      : path.resolve(normalizedRoot, filePath)
+  }
+
   async addPendingToolCall(
     conversationId: string,
     toolCallId: string,
@@ -1235,9 +1489,13 @@ export class ChatSessionManager implements OnModuleDestroy {
         if (filePath) {
           try {
             const fs = await import("fs/promises")
-            beforeContent = await fs.readFile(filePath, "utf-8")
+            const resolvedFilePath = this.resolveWorkspaceFilePath(
+              session,
+              filePath
+            )
+            beforeContent = await fs.readFile(resolvedFilePath, "utf-8")
             this.logger.debug(
-              `Captured before content for ${filePath}: ${beforeContent.length} bytes`
+              `Captured before content for ${resolvedFilePath}: ${beforeContent.length} bytes`
             )
           } catch (e) {
             const errorMessage = e instanceof Error ? e.message : String(e)
@@ -1274,30 +1532,56 @@ export class ChatSessionManager implements OnModuleDestroy {
     return Array.from(session.pendingToolCalls.keys())
   }
 
+  getPendingToolCallIdsByStream(
+    conversationId: string,
+    streamId: string
+  ): string[] {
+    const session = this.getSession(conversationId)
+    if (!session || !streamId) return []
+
+    const pendingIds: string[] = []
+    for (const [toolCallId, pendingToolCall] of session.pendingToolCalls) {
+      if (pendingToolCall.streamId === streamId) {
+        pendingIds.push(toolCallId)
+      }
+    }
+    return pendingIds
+  }
+
   /**
    * Get and remove pending tool call
    */
+  private detachPendingToolCall(
+    session: ChatSession,
+    toolCallId: string
+  ): PendingToolCall | undefined {
+    const toolCall = session.pendingToolCalls.get(toolCallId)
+    if (!toolCall) {
+      return undefined
+    }
+
+    for (const execId of toolCall.execIds) {
+      session.pendingToolCallByExecId.delete(execId)
+    }
+    for (const [execId, mappedToolCallId] of session.pendingToolCallByExecId) {
+      if (mappedToolCallId === toolCallId) {
+        session.pendingToolCallByExecId.delete(execId)
+      }
+    }
+    session.pendingToolCalls.delete(toolCallId)
+    session.lastActivityAt = new Date()
+
+    return toolCall
+  }
+
   consumePendingToolCall(
     conversationId: string,
     toolCallId: string
   ): PendingToolCall | undefined {
     const session = this.getSession(conversationId)
     if (session) {
-      const toolCall = session.pendingToolCalls.get(toolCallId)
+      const toolCall = this.detachPendingToolCall(session, toolCallId)
       if (toolCall) {
-        for (const execId of toolCall.execIds) {
-          session.pendingToolCallByExecId.delete(execId)
-        }
-        for (const [
-          execId,
-          mappedToolCallId,
-        ] of session.pendingToolCallByExecId) {
-          if (mappedToolCallId === toolCallId) {
-            session.pendingToolCallByExecId.delete(execId)
-          }
-        }
-        session.pendingToolCalls.delete(toolCallId)
-        session.lastActivityAt = new Date()
         this.logger.debug(
           `Consumed tool call: ${toolCallId} for session ${conversationId}`
         )
@@ -1306,6 +1590,25 @@ export class ChatSessionManager implements OnModuleDestroy {
       }
     }
     return undefined
+  }
+
+  clearPendingToolCall(
+    conversationId: string,
+    toolCallId: string,
+    reason?: string
+  ): PendingToolCall | undefined {
+    const session = this.getSession(conversationId)
+    if (!session) return undefined
+
+    const toolCall = this.detachPendingToolCall(session, toolCallId)
+    if (!toolCall) return undefined
+
+    const reasonSuffix = reason ? ` (${reason})` : ""
+    this.logger.warn(
+      `Cleared pending tool call: ${toolCallId} for session ${conversationId}${reasonSuffix}`
+    )
+    this.schedulePersist(conversationId)
+    return toolCall
   }
 
   registerPendingToolExecId(
@@ -1583,7 +1886,10 @@ export class ChatSessionManager implements OnModuleDestroy {
     let oldestSession: Date | null = null
 
     for (const session of this.sessions.values()) {
-      if (now - session.lastActivityAt.getTime() < 5 * 60 * 1000) {
+      if (
+        now - session.lastActivityAt.getTime() <
+        this.ACTIVE_SESSION_WINDOW_MS
+      ) {
         activeSessions++
       }
       if (!oldestSession || session.createdAt < oldestSession) {
@@ -1595,6 +1901,153 @@ export class ChatSessionManager implements OnModuleDestroy {
       totalSessions: this.sessions.size,
       activeSessions,
       oldestSession,
+    }
+  }
+
+  recordCompletedToolCall(
+    conversationId: string,
+    toolCall: Pick<PendingToolCall, "toolName" | "toolFamilyHint" | "sentAt">
+  ): void {
+    const session = this.getSession(conversationId)
+    if (!session) return
+
+    const durationMs = Math.max(0, Date.now() - toolCall.sentAt.getTime())
+    session.toolMetrics.completedCalls += 1
+    session.toolMetrics.totalDurationMs += durationMs
+    session.toolMetrics.lastCompletedAt = Date.now()
+
+    switch (this.classifyToolCall(toolCall)) {
+      case "shell":
+        session.toolMetrics.shellCalls += 1
+        break
+      case "edit":
+        session.toolMetrics.editCalls += 1
+        break
+      case "mcp":
+        session.toolMetrics.mcpCalls += 1
+        break
+      default:
+        session.toolMetrics.otherCalls += 1
+        break
+    }
+
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
+  }
+
+  getAnalyticsSummary(limit = 12): ChatSessionAnalyticsSummary {
+    const now = Date.now()
+    const sessions = new Map<
+      string,
+      {
+        session: ChatSession
+        loaded: boolean
+      }
+    >()
+
+    for (const [conversationId, session] of this.sessions.entries()) {
+      sessions.set(conversationId, { session, loaded: true })
+    }
+
+    if (this.persistence.isReady) {
+      try {
+        const stmt = this.persistence.prepare(
+          `SELECT conversation_id, state_json
+             FROM cursor_sessions
+            ORDER BY last_activity_at DESC`
+        ) as unknown as {
+          all?: () => Array<{ conversation_id: string; state_json: string }>
+        }
+        const rows = typeof stmt.all === "function" ? stmt.all() : []
+        for (const row of rows) {
+          if (!row?.conversation_id || sessions.has(row.conversation_id)) {
+            continue
+          }
+          try {
+            const persisted = JSON.parse(
+              row.state_json
+            ) as PersistedChatSessionV1
+            sessions.set(row.conversation_id, {
+              session: this.deserializeSession(persisted),
+              loaded: false,
+            })
+          } catch (error) {
+            this.logger.warn(
+              `Failed to deserialize analytics session ${row.conversation_id}: ${String(error)}`
+            )
+          }
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Failed to load persisted session analytics: ${String(error)}`
+        )
+      }
+    }
+
+    const entries = Array.from(sessions.entries())
+      .map(([conversationId, value]) =>
+        this.buildAnalyticsEntry(
+          conversationId,
+          value.session,
+          value.loaded,
+          now
+        )
+      )
+      .sort(
+        (left, right) =>
+          Date.parse(right.lastActivityAt) - Date.parse(left.lastActivityAt)
+      )
+
+    let lastActivityAt: string | null = null
+    let activeSessions = 0
+    let loadedSessions = 0
+    let pendingToolCalls = 0
+    let completedToolCalls = 0
+    let totalToolDurationMs = 0
+    let readFiles = 0
+    let editedFiles = 0
+    let linesAdded = 0
+    let linesRemoved = 0
+
+    for (const entry of entries) {
+      if (entry.active) activeSessions++
+      if (entry.loaded) loadedSessions++
+      pendingToolCalls += entry.pendingToolCalls
+      completedToolCalls += entry.completedToolCalls
+      totalToolDurationMs += entry.totalToolDurationMs
+      readFiles += entry.readFiles
+      editedFiles += entry.editedFiles
+      linesAdded += entry.linesAdded
+      linesRemoved += entry.linesRemoved
+      if (
+        !lastActivityAt ||
+        Date.parse(entry.lastActivityAt) > Date.parse(lastActivityAt)
+      ) {
+        lastActivityAt = entry.lastActivityAt
+      }
+    }
+
+    return {
+      timestamp: new Date(now).toISOString(),
+      totals: {
+        totalSessions: entries.length,
+        activeSessions,
+        loadedSessions,
+        persistedOnlySessions: Math.max(0, entries.length - loadedSessions),
+        pendingToolCalls,
+        completedToolCalls,
+        totalToolDurationMs,
+        avgToolDurationMs:
+          completedToolCalls > 0
+            ? Math.round((totalToolDurationMs / completedToolCalls) * 10) / 10
+            : null,
+        readFiles,
+        editedFiles,
+        linesAdded,
+        linesRemoved,
+        lastActivityAt,
+      },
+      sessions: entries.slice(0, Math.max(1, limit)),
     }
   }
 

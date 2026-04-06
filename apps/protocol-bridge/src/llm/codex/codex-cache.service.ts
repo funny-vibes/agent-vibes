@@ -74,17 +74,33 @@ export class CodexCacheService {
   getCacheIdFromApiKey(apiKey: string): string {
     if (!apiKey) return ""
 
-    const namespace = "6ba7b812-9dad-11d1-80b4-00c04fd430c8" // UUID v5 OID namespace
-    const name = `cli-proxy-api:codex:prompt-cache:${apiKey}`
+    return this.buildDeterministicCacheId(
+      `cli-proxy-api:codex:prompt-cache:${apiKey}`
+    )
+  }
 
-    // Generate UUID v5 (SHA-1 based)
+  /**
+   * Generate a deterministic cache ID from an arbitrary stable identity.
+   * Useful for OAuth-backed flows where no API key is available but we still
+   * want prompt cache reuse across related requests.
+   */
+  getCacheIdFromIdentity(identity: string): string {
+    if (!identity) return ""
+
+    return this.buildDeterministicCacheId(
+      `cli-proxy-api:codex:prompt-cache:${identity}`
+    )
+  }
+
+  private buildDeterministicCacheId(name: string): string {
+    const namespace = "6ba7b812-9dad-11d1-80b4-00c04fd430c8" // UUID v5 OID namespace
+
     const hash = crypto
       .createHash("sha1")
       .update(Buffer.from(namespace.replace(/-/g, ""), "hex"))
       .update(name)
       .digest()
 
-    // Set version (5) and variant bits
     hash[6] = (hash[6]! & 0x0f) | 0x50
     hash[8] = (hash[8]! & 0x3f) | 0x80
 
@@ -109,12 +125,19 @@ export class CodexCacheService {
    * Build prompt cache headers for Codex requests.
    * Returns headers to be added to the HTTP request.
    */
-  buildCacheHeaders(cacheId: string): Record<string, string> {
+  buildHttpCacheHeaders(cacheId: string): Record<string, string> {
+    if (!cacheId) return {}
+
+    return {
+      Session_id: cacheId,
+    }
+  }
+
+  buildWebSocketCacheHeaders(cacheId: string): Record<string, string> {
     if (!cacheId) return {}
 
     return {
       Conversation_id: cacheId,
-      Session_id: cacheId,
     }
   }
 

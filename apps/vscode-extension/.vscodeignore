@@ -1,0 +1,15 @@
+.vscode/**
+src/**
+test/**
+node_modules/**
+.turbo/**
+scripts/sync-bridge-assets.mjs
+scripts/sync-chatgpt-register-assets.mjs
+scripts/sync-readme.mjs
+scripts/restart-bridge-after-pack.mjs
+esbuild.config.mjs
+tsconfig.json
+.gitignore
+**/*.map
+**/*.ts
+!dist/**

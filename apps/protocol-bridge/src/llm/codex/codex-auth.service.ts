@@ -48,6 +48,7 @@ export interface CodexTokenData {
   accessToken: string
   refreshToken: string
   accountId: string
+  workspaceId?: string
   email: string
   expire: string
 }
@@ -179,6 +180,7 @@ export class CodexAuthService {
       accessToken: tokenResp.access_token,
       refreshToken: tokenResp.refresh_token,
       accountId,
+      workspaceId: claims ? this.extractWorkspaceId(claims) : "",
       email,
       expire: expireDate,
     }
@@ -249,6 +251,7 @@ export class CodexAuthService {
       accessToken: tokenResp.access_token,
       refreshToken: tokenResp.refresh_token,
       accountId,
+      workspaceId: claims ? this.extractWorkspaceId(claims) : "",
       email,
       expire: expireDate,
     }
@@ -342,21 +345,33 @@ export class CodexAuthService {
    */
   private extractAccountId(claims: JWTClaims): string {
     const authClaims = claims["https://api.openai.com/auth"]
-    if (authClaims?.chatgpt_account_id) {
-      return authClaims.chatgpt_account_id
+    return authClaims?.chatgpt_account_id?.trim() || ""
+  }
+
+  private extractWorkspaceId(claims: JWTClaims): string {
+    const candidates = [
+      claims["https://api.openai.com/auth"]?.organizations,
+      claims.organizations,
+    ]
+
+    for (const organizations of candidates) {
+      if (!Array.isArray(organizations) || organizations.length === 0) continue
+
+      const defaultOrg = organizations.find(
+        (org) => typeof org?.id === "string" && Boolean(org?.is_default)
+      )
+      if (defaultOrg?.id?.trim()) {
+        return defaultOrg.id.trim()
+      }
+
+      const firstOrg = organizations.find(
+        (org) => typeof org?.id === "string" && org.id.trim().length > 0
+      )
+      if (firstOrg?.id?.trim()) {
+        return firstOrg.id.trim()
+      }
     }
 
-    const organizations = authClaims?.organizations || claims.organizations
-    if (organizations && Array.isArray(organizations)) {
-      for (const org of organizations) {
-        if (org.is_default && org.id) {
-          return org.id
-        }
-      }
-      if (organizations.length > 0 && organizations[0]?.id) {
-        return organizations[0].id
-      }
-    }
     return ""
   }
 
@@ -426,6 +441,15 @@ export class CodexAuthService {
     }
 
     return this.extractAccountId(claims)
+  }
+
+  getWorkspaceIdFromIdToken(idToken: string): string {
+    const claims = this.parseJWTToken(idToken)
+    if (!claims) {
+      return ""
+    }
+
+    return this.extractWorkspaceId(claims)
   }
 
   setTokenData(tokenData: CodexTokenData): void {

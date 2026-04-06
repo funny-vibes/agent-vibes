@@ -20,7 +20,6 @@
  */
 
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common"
-import * as crypto from "crypto"
 import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
@@ -110,7 +109,6 @@ export class CodexWebSocketService implements OnModuleDestroy {
       Authorization: `Bearer ${token}`,
       Version: CODEX_CLIENT_VERSION,
       "OpenAI-Beta": CODEX_WS_BETA_HEADER,
-      Session_id: crypto.randomUUID(),
       "User-Agent": CODEX_USER_AGENT,
       "x-codex-turn-state": "",
       "x-codex-turn-metadata": "",

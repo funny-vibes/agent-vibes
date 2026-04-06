@@ -233,9 +233,14 @@ export class ToolIntegrityService {
    */
   findTruncationPointWithIntegrity(
     messages: UnifiedMessage[],
-    targetTokens: number
+    targetTokens: number,
+    options?: {
+      mode?: EnforceToolProtocolOptions["mode"]
+    }
   ): number {
     if (messages.length === 0) return 0
+
+    const mode = options?.mode ?? "global"
 
     // Step 1: Find initial truncation point based on tokens
     let truncationIndex = this.tokenCounter.findTruncationIndex(
@@ -265,11 +270,17 @@ export class ToolIntegrityService {
         }
       }
 
-      // Find orphaned tool_results in retained messages
-      const orphans = this.findOrphanedToolResults(
-        retainedMessages,
-        retainedToolUseIds
-      )
+      // Find orphaned tool_results in retained messages. Strict-adjacent
+      // backends (Cloud Code Claude) require tool_result blocks to match the
+      // immediately preceding assistant message, not merely any assistant in
+      // the retained window.
+      const orphans =
+        mode === "strict-adjacent"
+          ? this.findStrictAdjacentOrphanedToolResults(
+              retainedMessages,
+              retainedToolUseIds
+            )
+          : this.findOrphanedToolResults(retainedMessages, retainedToolUseIds)
 
       if (orphans.length === 0) {
         // No orphans, we're done
@@ -391,13 +402,44 @@ export class ToolIntegrityService {
    */
   extractWithIntegrity(
     messages: UnifiedMessage[],
-    targetTokens: number
+    targetTokens: number,
+    options?: {
+      mode?: EnforceToolProtocolOptions["mode"]
+    }
   ): UnifiedMessage[] {
     const truncationIndex = this.findTruncationPointWithIntegrity(
       messages,
-      targetTokens
+      targetTokens,
+      options
     )
     return messages.slice(truncationIndex)
+  }
+
+  private findStrictAdjacentOrphanedToolResults(
+    messages: UnifiedMessage[],
+    availableToolUseIds: Set<string>
+  ): Array<{ tool_use_id: string; message_index: number }> {
+    const orphans: Array<{ tool_use_id: string; message_index: number }> = []
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]!
+      if (message.role !== "user") continue
+
+      const previous = i > 0 ? messages[i - 1] : undefined
+      const previousToolUseIds =
+        previous?.role === "assistant"
+          ? new Set(this.extractToolUseIds(previous))
+          : new Set<string>()
+
+      const toolResultIds = this.extractToolResultIds(message)
+      for (const id of toolResultIds) {
+        if (!availableToolUseIds.has(id) || !previousToolUseIds.has(id)) {
+          orphans.push({ tool_use_id: id, message_index: i })
+        }
+      }
+    }
+
+    return orphans
   }
 
   /**

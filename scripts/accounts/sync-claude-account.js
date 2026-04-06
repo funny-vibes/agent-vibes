@@ -4,21 +4,27 @@
  * Sync Claude Code third-party API settings into agent-vibes.
  *
  * Reads ~/.claude/settings.json (or CLAUDE_SETTINGS_PATH) and writes/updates
- * apps/protocol-bridge/data/claude-api-accounts.json.
+ * the configured Claude API accounts JSON file.
  *
  * Usage:
  *   agent-vibes sync --claude
+ *   agent-vibes sync --claude --accounts-file /abs/path/claude-api-accounts.json
  *   npm run claude:sync
  */
 
 const fs = require("fs")
 const path = require("path")
 const os = require("os")
+const {
+  formatPathForDisplay,
+  resolveDefaultAccountConfigPath,
+} = require("./lib/account-config-paths")
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..")
-const DEST_FILE = path.join(
+const DEST_FILE = resolveDefaultAccountConfigPath(
   PROJECT_ROOT,
-  "apps/protocol-bridge/data/claude-api-accounts.json"
+  "claude-api-accounts.json",
+  process.argv.slice(2)
 )
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -281,7 +287,7 @@ if (account.models.length > 0) {
   )
 }
 console.log(
-  `\n✅ Credentials written to ${path.relative(PROJECT_ROOT, DEST_FILE)}`
+  `\n✅ Credentials written to ${formatPathForDisplay(PROJECT_ROOT, DEST_FILE)}`
 )
 console.log("   Restart the proxy to apply changes.")
 console.log("   To deploy to remote, run: npm run deploy:sync")

@@ -85,6 +85,8 @@ native client compatibility for Cursor and native upstream fidelity for Antigrav
 
 **From source (all platforms):**
 
+> **Tip:** If you only need Cursor IDE support, skip this and use the [Extension install](#cursor-ide) instead — no source build required.
+>
 > **Note:** Primary development and testing is done on macOS.
 > Linux and Windows support is implemented but not fully tested —
 > scripts may have edge-case bugs on those platforms. PRs welcome!
@@ -147,6 +149,30 @@ claude
 
 For the Cursor client side, a free account is enough. No paid Cursor plan is required.
 
+**Option A: Extension (Recommended)**
+
+Download the `.vsix` for your platform from [GitHub Releases](https://github.com/funny-vibes/agent-vibes/releases) and install:
+
+```bash
+# macOS Apple Silicon
+cursor --install-extension agent-vibes-darwin-arm64-*.vsix --force
+
+# macOS Intel
+cursor --install-extension agent-vibes-darwin-x64-*.vsix --force
+
+# Linux x64
+cursor --install-extension agent-vibes-linux-x64-*.vsix --force
+
+# Windows x64
+cursor --install-extension agent-vibes-win32-x64-*.vsix --force
+```
+
+Restart Cursor after installation.
+The extension auto-starts the proxy server and guides you through first-run setup
+(SSL certificates, account sync, network forwarding — all from the Command Palette).
+
+**Option B: CLI**
+
 Cursor requires HTTPS interception — one-time setup:
 
 ```bash
@@ -184,7 +210,7 @@ agent-vibes sync --tools
 
 Behavior:
 
-- Credentials are synced into `apps/protocol-bridge/data/antigravity-accounts.json`.
+- Credentials are synced into `~/.agent-vibes/data/antigravity-accounts.json`.
 - Supports multi-account rotation.
 - **Claude model routing:** When Claude Code CLI routes through the Google backend,
   only **Opus** models use the Claude-through-Google (Cloud Code) path.
@@ -217,7 +243,7 @@ codex --login
 agent-vibes sync --codex
 ```
 
-- OpenAI-compatible file: `apps/protocol-bridge/data/openai-compat-accounts.json`
+- OpenAI-compatible file: `~/.agent-vibes/data/openai-compat-accounts.json`
 
 ```json
 {
@@ -230,7 +256,9 @@ agent-vibes sync --codex
     {
       "label": "provider-2",
       "baseUrl": "https://b.example.com/v1",
-      "apiKey": "sk-yyy"
+      "apiKey": "sk-yyy",
+      "proxyUrl": "http://127.0.0.1:7897",
+      "preferResponsesApi": true
     }
   ]
 }
@@ -241,6 +269,8 @@ Behavior:
 - Codex and OpenAI-compatible both support multi-account rotation.
 - If both OpenAI-compatible and Codex are configured, GPT requests go to OpenAI-compatible first.
 - When quota is exhausted, the system automatically switches to the next available account.
+- `proxyUrl` routes requests through the specified HTTP/SOCKS proxy for that account.
+- `preferResponsesApi=true` uses the OpenAI Responses API (`/v1/responses`) instead of Chat Completions.
 
 ### 3. Claude API
 
@@ -248,9 +278,9 @@ Use for third-party Claude-compatible APIs.
 
 Configuration:
 
-- `agent-vibes sync --claude` reads `~/.claude/settings.json` and writes or updates a managed `claude-code-sync` entry in `apps/protocol-bridge/data/claude-api-accounts.json`.
+- `agent-vibes sync --claude` reads `~/.claude/settings.json` and writes or updates a managed `claude-code-sync` entry in `~/.agent-vibes/data/claude-api-accounts.json`.
   The managed entry mirrors the current source settings; if the source no longer declares explicit model IDs, stale managed `models` are removed so dynamic discovery can take effect.
-- Or edit `apps/protocol-bridge/data/claude-api-accounts.json` manually:
+- Or edit `~/.agent-vibes/data/claude-api-accounts.json` manually:
 
 ```json
 {

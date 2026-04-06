@@ -15,37 +15,16 @@
 const { execSync } = require("child_process")
 const fs = require("fs")
 const path = require("path")
+const {
+  resolveDefaultAccountConfigPath,
+} = require("./lib/account-config-paths")
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..")
-const BRIDGE_DIR = path.join(PROJECT_ROOT, "apps/protocol-bridge")
 const REPO = "funny-vibes/agent-vibes"
-
-const CREDENTIAL_FILES = [
-  {
-    localPath: path.join(BRIDGE_DIR, "data/antigravity-accounts.json"),
-    secretName: "ANTIGRAVITY_ACCOUNTS",
-    label: "Antigravity accounts",
-  },
-  {
-    localPath: path.join(BRIDGE_DIR, "data/codex-accounts.json"),
-    secretName: "CODEX_ACCOUNTS",
-    label: "Codex accounts",
-  },
-  {
-    localPath: path.join(BRIDGE_DIR, "data/openai-compat-accounts.json"),
-    secretName: "OPENAI_COMPAT_ACCOUNTS",
-    label: "OpenAI-compat accounts",
-  },
-  {
-    localPath: path.join(BRIDGE_DIR, "data/claude-api-accounts.json"),
-    secretName: "CLAUDE_API_ACCOUNTS",
-    label: "Claude API accounts",
-  },
-]
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -111,6 +90,45 @@ function syncEnvConfig() {
 
 const args = process.argv.slice(2)
 const triggerDeploy = args.includes("--run")
+const BRIDGE_DIR = path.join(PROJECT_ROOT, "apps/protocol-bridge")
+const CREDENTIAL_FILES = [
+  {
+    localPath: resolveDefaultAccountConfigPath(
+      PROJECT_ROOT,
+      "antigravity-accounts.json",
+      []
+    ),
+    secretName: "ANTIGRAVITY_ACCOUNTS",
+    label: "Antigravity accounts",
+  },
+  {
+    localPath: resolveDefaultAccountConfigPath(
+      PROJECT_ROOT,
+      "codex-accounts.json",
+      []
+    ),
+    secretName: "CODEX_ACCOUNTS",
+    label: "Codex accounts",
+  },
+  {
+    localPath: resolveDefaultAccountConfigPath(
+      PROJECT_ROOT,
+      "openai-compat-accounts.json",
+      []
+    ),
+    secretName: "OPENAI_COMPAT_ACCOUNTS",
+    label: "OpenAI-compat accounts",
+  },
+  {
+    localPath: resolveDefaultAccountConfigPath(
+      PROJECT_ROOT,
+      "claude-api-accounts.json",
+      []
+    ),
+    secretName: "CLAUDE_API_ACCOUNTS",
+    label: "Claude API accounts",
+  },
+]
 
 console.log("🚀 Deploying credentials to GitHub Secrets...\n")
 

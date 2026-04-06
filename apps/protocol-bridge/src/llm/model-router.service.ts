@@ -2,6 +2,7 @@ import { HttpException, Injectable, Logger } from "@nestjs/common"
 import {
   canPublicClaudeModelUseGoogle,
   detectModelFamily,
+  doesModelSupportThinking,
   isOpusModel,
   resolveCloudCodeModel,
 } from "./model-registry"
@@ -122,16 +123,16 @@ export class ModelRouterService {
     } else {
       this.logger.log("  Claude models       -> Google backend")
     }
-    if (this.openaiCompatAvailable && this.codexAvailable) {
+    if (this.codexAvailable && this.openaiCompatAvailable) {
       this.logger.log(
-        "  GPT/O-series models  -> OpenAI-compatible backend (priority, Codex fallback)"
-      )
-    } else if (this.openaiCompatAvailable) {
-      this.logger.log(
-        "  GPT/O-series models  -> OpenAI-compatible backend (priority)"
+        "  GPT/O-series models  -> Codex backend (priority, OpenAI-compatible fallback)"
       )
     } else if (this.codexAvailable) {
       this.logger.log("  GPT/O-series models  -> Codex backend")
+    } else if (this.openaiCompatAvailable) {
+      this.logger.log(
+        "  GPT/O-series models  -> OpenAI-compatible backend (fallback only)"
+      )
     } else {
       this.logger.log(
         "  GPT/O-series models  -> ERROR (no GPT backend configured)"
@@ -202,17 +203,18 @@ export class ModelRouterService {
     const openaiCompatAvailable = this.getOpenaiCompatAvailability()
     const codexAvailable = this.getCodexAvailability()
 
-    if (openaiCompatAvailable) {
+    // Codex first, openai-compat as fallback
+    if (codexAvailable) {
       candidates.push({
-        backend: "openai-compat",
+        backend: "codex",
         model: target.model,
         isThinking: target.isThinking,
       })
     }
 
-    if (codexAvailable) {
+    if (openaiCompatAvailable) {
       candidates.push({
-        backend: "codex",
+        backend: "openai-compat",
         model: target.model,
         isThinking: target.isThinking,
       })
@@ -283,7 +285,7 @@ export class ModelRouterService {
       candidates.push({
         backend: "claude-api",
         model: normalized,
-        isThinking: entry?.isThinking ?? normalized.includes("thinking"),
+        isThinking: entry?.isThinking ?? doesModelSupportThinking(normalized),
       })
     }
 
@@ -456,7 +458,7 @@ export class ModelRouterService {
 
     // 1. Known model with registry entry
     if (entry) {
-      // GPT family → openai-compat (priority) > codex
+      // GPT family → codex (priority) > openai-compat
       if (entry.family === "gpt") {
         if (gptCandidates) {
           const route = gptCandidates.primary
@@ -520,7 +522,7 @@ export class ModelRouterService {
       return route
     }
 
-    // 3. GPT family -> openai-compat > codex
+    // 3. GPT family -> codex > openai-compat
     if (family === "gpt") {
       if (gptCandidates) {
         const route = gptCandidates.primary

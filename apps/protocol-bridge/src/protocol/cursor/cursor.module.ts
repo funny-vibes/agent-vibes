@@ -6,6 +6,7 @@ import { GoogleModule } from "../../llm/google/google.module"
 import { ModelModule } from "../../llm/model.module"
 import { OpenaiCompatModule } from "../../llm/openai-compat/openai-compat.module"
 import { AiserverMockController } from "./aiserver-mock.controller"
+import { AntigravityIdeSyncService } from "./antigravity-ide-sync.service"
 import { AuthController } from "./auth.controller"
 import { ChatSessionManager } from "./chat-session.service"
 import { ClientSideToolV2ExecutorService } from "./client-side-tool-v2-executor.service"
@@ -34,6 +35,7 @@ import { KnowledgeBaseService } from "./knowledge-base.service"
   providers: [
     ChatSessionManager,
     ClientSideToolV2ExecutorService,
+    AntigravityIdeSyncService,
     CursorAuthService,
     CursorConnectStreamService,
     CursorGrpcService,
@@ -41,6 +43,6 @@ import { KnowledgeBaseService } from "./knowledge-base.service"
     SemanticSearchProviderService,
     KnowledgeBaseService,
   ],
-  exports: [CursorAuthService, CursorConnectStreamService],
+  exports: [CursorAuthService, CursorConnectStreamService, ChatSessionManager],
 })
 export class CursorModule {}

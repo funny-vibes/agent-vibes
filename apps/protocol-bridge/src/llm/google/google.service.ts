@@ -5,7 +5,11 @@ import { TokenCounterService } from "../../context/token-counter.service"
 import { normalizeToolProtocolMessages } from "../../context/tool-protocol-normalizer"
 import { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
-import { DEFAULT_CLAUDE_MODEL, resolveCloudCodeModel } from "../model-registry"
+import {
+  DEFAULT_CLAUDE_MODEL,
+  doesModelSupportThinking,
+  resolveCloudCodeModel,
+} from "../model-registry"
 import { ProcessPoolService } from "../native/process-pool.service"
 import { findPendingToolUseIdsInMessages } from "../tool-continuation-policy"
 import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
@@ -29,7 +33,7 @@ class FatalCloudCodeRequestError extends Error {
 @Injectable()
 export class GoogleService {
   private readonly logger = new Logger(GoogleService.name)
-  private readonly ANTIGRAVITY_IDE_VERSION = "1.19.6"
+  private readonly ANTIGRAVITY_IDE_VERSION = "1.21.9"
 
   // Official Antigravity system prompt baked into source.
   private readonly officialSystemPrompt = ANTIGRAVITY_SYSTEM_PROMPT
@@ -56,6 +60,9 @@ export class GoogleService {
   private readonly MAX_RETRY_DELAY = 60000 // Cap for exponential backoff (60s for rate limit recovery)
   private readonly MAX_429_WAIT_MS = 3 * 60 * 1000 // Cap API retryMs (3 min), allow longer recovery
   private readonly QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS = 3 * 60 * 1000 // Fallback cooldown when quota exhausted but no reset time parsed (aligned with MAX_429_WAIT_MS)
+  private readonly MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS = 60 * 1000
+  private readonly TRANSIENT_WORKER_FAILURE_COOLDOWN_MS = 5 * 60 * 1000
+  private readonly TRANSIENT_TRANSPORT_FAILURE_COOLDOWN_MS = 60 * 1000
   private readonly MAX_PROMPT_SHRINK_RETRIES: number = 3
   private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 65536
   private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 65536
@@ -114,6 +121,160 @@ export class GoogleService {
     return Math.round(totalMs)
   }
 
+  private parseRetryAfterMs(errorText: string): number | null {
+    const match = errorText.match(/retry-after(?:=|:)\s*([^\]\s]+)/i)
+    if (!match?.[1]) return null
+
+    const rawValue = match[1].replace(/^"|"$/g, "").trim()
+    if (!rawValue) return null
+
+    const seconds = Number.parseFloat(rawValue)
+    if (Number.isFinite(seconds)) {
+      return Math.max(0, Math.round(seconds * 1000))
+    }
+
+    const retryAt = Date.parse(rawValue)
+    if (Number.isNaN(retryAt)) return null
+    return Math.max(0, retryAt - Date.now())
+  }
+
+  private formatCooldownRemainingMs(
+    targetTimestamp: number,
+    now: number
+  ): number {
+    return Math.max(0, targetTimestamp - now)
+  }
+
+  private async describeCloudCodeAccountStatuses(
+    model: string,
+    limit: number = 10
+  ): Promise<string> {
+    const now = Date.now()
+    const pool = this.processPool.getPoolStatus()
+    const quotaSnapshots = await this.processPool.fetchGoogleQuotaSnapshots()
+    const quotaByEmail = new Map(
+      quotaSnapshots.map((entry) => [entry.email, entry])
+    )
+
+    const entries = pool.entries
+      .map((entry) => {
+        const label = entry.email || entry.label || entry.id
+        const modelCooldown = entry.modelCooldowns.find(
+          (cooldown) => cooldown.model === model
+        )
+        const globalRemainingMs = this.formatCooldownRemainingMs(
+          entry.cooldownUntil,
+          now
+        )
+        const modelRemainingMs = modelCooldown
+          ? this.formatCooldownRemainingMs(modelCooldown.cooldownUntil, now)
+          : 0
+        const effectiveRemainingMs = Math.max(
+          globalRemainingMs,
+          modelRemainingMs
+        )
+        const quotaSnapshot = entry.email
+          ? quotaByEmail.get(entry.email)
+          : undefined
+        const modelQuota = quotaSnapshot?.models.find(
+          (quotaEntry) => quotaEntry.name === model
+        )
+        const percentage = modelQuota?.percentage
+        const resetTime = modelQuota?.resetTime
+
+        let detail = "ready"
+        if (entry.state === "unavailable" || entry.ready === false) {
+          detail = "unavailable"
+        } else if (modelCooldown?.quotaExhausted) {
+          detail = `quota exhausted, retry in ${Math.ceil(effectiveRemainingMs / 1000)}s`
+        } else if (effectiveRemainingMs > 0) {
+          const reasons: string[] = []
+          if (globalRemainingMs > 0) {
+            reasons.push(`global ${Math.ceil(globalRemainingMs / 1000)}s`)
+          }
+          if (modelRemainingMs > 0) {
+            reasons.push(`${model} ${Math.ceil(modelRemainingMs / 1000)}s`)
+          }
+          detail = `rate-limited, retry in ${Math.ceil(effectiveRemainingMs / 1000)}s${reasons.length > 0 ? ` (${reasons.join(", ")})` : ""}`
+        } else if (
+          entry.state === "model_cooldown" ||
+          entry.state === "degraded"
+        ) {
+          detail = `cooling for other models, available for ${model}`
+        }
+
+        const extras: string[] = []
+        if (typeof percentage === "number") {
+          extras.push(`quota=${percentage}%`)
+        }
+        if (resetTime) {
+          try {
+            const d = new Date(resetTime)
+            if (!isNaN(d.getTime())) {
+              const pad = (n: number) => n.toString().padStart(2, "0")
+              const formatted = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+              extras.push(`reset=${formatted}`)
+            } else {
+              extras.push(`reset=${resetTime}`)
+            }
+          } catch {
+            extras.push(`reset=${resetTime}`)
+          }
+        }
+
+        return {
+          label,
+          state: entry.state,
+          detail,
+          effectiveRemainingMs,
+          requestCount: entry.requestCount ?? 0,
+          percentage: typeof percentage === "number" ? percentage : -1,
+          extraText: extras.length > 0 ? `; ${extras.join("; ")}` : "",
+        }
+      })
+      .sort((left, right) => {
+        if (left.state !== right.state) {
+          return (
+            this.getBackendPoolStateRank(left.state) -
+            this.getBackendPoolStateRank(right.state)
+          )
+        }
+        if (right.percentage !== left.percentage) {
+          return right.percentage - left.percentage
+        }
+        if (left.effectiveRemainingMs !== right.effectiveRemainingMs) {
+          return left.effectiveRemainingMs - right.effectiveRemainingMs
+        }
+        return left.label.localeCompare(right.label)
+      })
+
+    const visibleEntries = entries.slice(0, limit)
+    const lines = visibleEntries.map(
+      (entry, index) =>
+        `${index + 1}. ${entry.label} — ${entry.detail}${entry.extraText}; requests=${entry.requestCount}`
+    )
+
+    const hiddenCount = Math.max(0, entries.length - visibleEntries.length)
+    if (hiddenCount > 0) {
+      lines.push(`... and ${hiddenCount} more accounts not shown`)
+    }
+
+    return [
+      `Pool snapshot for ${model}: total=${pool.total}, ready=${pool.ready}, degraded=${pool.degraded}, modelCooldown=${pool.modelCooldown}, cooling=${pool.cooling}, unavailable=${pool.unavailable}`,
+      ...lines,
+    ].join("\n")
+  }
+
+  private async buildCloudCodeRateLimitMessage(
+    model: string,
+    waitMs: number
+  ): Promise<string> {
+    return [
+      `All Cloud Code accounts are rate-limited for ${model}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+      await this.describeCloudCodeAccountStatuses(model),
+    ].join("\n")
+  }
+
   private getTelemetryPlatform(): string {
     const platformMap: Record<string, string> = {
       darwin: "DARWIN",
@@ -134,6 +295,25 @@ export class GoogleService {
   private formatTelemetryDurationNs(durationNs: bigint): string {
     const seconds = Number(durationNs) / 1_000_000_000
     return `${seconds.toFixed(9)}s`
+  }
+
+  private getBackendPoolStateRank(state: string): number {
+    switch (state) {
+      case "ready":
+        return 0
+      case "degraded":
+        return 1
+      case "model_cooldown":
+        return 2
+      case "cooldown":
+        return 3
+      case "disabled":
+        return 4
+      case "unavailable":
+        return 5
+      default:
+        return 6
+    }
   }
 
   private getCloudCodeTraceId(source: unknown): string | null {
@@ -305,30 +485,60 @@ export class GoogleService {
 
   /**
    * Parse retry delay from 429 error response
-   * Order: RetryInfo.retryDelay -> ErrorInfo.metadata.quotaResetDelay -> error.message regex
+   * Order: Retry-After header -> RetryInfo.retryDelay -> ErrorInfo.metadata.quotaResetDelay -> error.message regex
    */
   private parseRetryDelayMs(errText: string): number | null {
-    try {
-      const errObj = JSON.parse(errText) as {
-        error?: {
-          message?: string
-          details?: Array<{
-            "@type"?: string
-            retryDelay?: string
-            metadata?: { quotaResetDelay?: string }
-          }>
+    const retryAfterMs = this.parseRetryAfterMs(errText)
+    if (retryAfterMs != null) {
+      return retryAfterMs
+    }
+
+    const parseDelayFromMessage = (message: string): number | null => {
+      const durationMatch = message.match(
+        /(?:quota will reset|retry(?:ing)?(?: after)?)\s+after\s+((?:[\d.]+\s*(?:ms|s|m|h))+)\.?/i
+      )
+      if (durationMatch?.[1]) {
+        const durationMs = this.parseDurationMs(durationMatch[1])
+        if (durationMs != null) {
+          return durationMs
         }
       }
-      const details = errObj.error?.details || []
 
-      // RetryInfo.retryDelay like "1.203608125s"
+      const secondsMatch = message.match(/after\s+(\d+)s\.?/i)
+      if (secondsMatch?.[1]) {
+        const seconds = parseInt(secondsMatch[1], 10)
+        if (Number.isFinite(seconds)) {
+          return seconds * 1000
+        }
+      }
+
+      return null
+    }
+
+    const errObj = this.parseCloudCodeErrorEnvelope(errText)
+    if (!errObj?.error) {
+      return parseDelayFromMessage(errText)
+    }
+
+    const candidates = [errObj.error]
+    if (typeof errObj.error.message === "string") {
+      const nested = this.parseCloudCodeErrorEnvelope(errObj.error.message)
+      if (nested?.error) {
+        candidates.push(nested.error)
+      }
+    }
+
+    for (const candidate of candidates) {
+      const details = Array.isArray(candidate.details) ? candidate.details : []
+
       const retryInfo = details.find((d) => d["@type"]?.includes("RetryInfo"))
       if (retryInfo?.retryDelay) {
         const ms = this.parseDurationMs(retryInfo.retryDelay)
-        if (ms != null) return ms
+        if (ms != null) {
+          return ms
+        }
       }
 
-      // ErrorInfo.metadata.quotaResetDelay or details[].metadata.quotaResetDelay
       const metaDelay =
         details.find((d) => d["@type"]?.includes("ErrorInfo"))?.metadata
           ?.quotaResetDelay ??
@@ -336,20 +546,20 @@ export class GoogleService {
           ?.quotaResetDelay
       if (metaDelay) {
         const ms = this.parseDurationMs(metaDelay)
-        if (ms != null) return ms
+        if (ms != null) {
+          return ms
+        }
       }
 
-      // Fallback: error.message "Your quota will reset after Xs."
-      const message = errObj.error?.message ?? ""
-      const match = message.match(/after\s+(\d+)s\.?/i)
-      if (match?.[1]) {
-        const seconds = parseInt(match[1], 10)
-        if (Number.isFinite(seconds)) return seconds * 1000
+      const message =
+        typeof candidate.message === "string" ? candidate.message : ""
+      const messageDelayMs = parseDelayFromMessage(message)
+      if (messageDelayMs != null) {
+        return messageDelayMs
       }
-    } catch {
-      // Ignore JSON parse errors
     }
-    return null
+
+    return parseDelayFromMessage(errText)
   }
 
   /**
@@ -375,6 +585,43 @@ export class GoogleService {
     )
   }
 
+  private isModelCapacityExhausted(errMsg: string): boolean {
+    const normalized = this.extractCloudCodeErrorText(errMsg).toLowerCase()
+    return (
+      normalized.includes("model_capacity_exhausted") ||
+      normalized.includes("no capacity available for model") ||
+      (normalized.includes("unavailable") &&
+        normalized.includes("backenderror") &&
+        normalized.includes("claude-opus"))
+    )
+  }
+
+  private isRetryableWorkerFailure(errMsg: string): boolean {
+    const normalized = errMsg.toLowerCase()
+    return (
+      normalized.includes("worker request timeout") ||
+      normalized.includes("worker stream timeout") ||
+      normalized.includes("econnreset") ||
+      normalized.includes("etimedout") ||
+      normalized.includes("socket hang up") ||
+      normalized.includes("network socket disconnected") ||
+      normalized.includes("connection reset by peer") ||
+      this.isModelCapacityExhausted(errMsg)
+    )
+  }
+
+  private getRetryableWorkerFailureCooldownMs(errMsg: string): number {
+    const normalized = errMsg.toLowerCase()
+    if (
+      normalized.includes("loadcodeassist") ||
+      normalized.includes("fetchuserinfo") ||
+      normalized.includes("getuserstatus")
+    ) {
+      return this.TRANSIENT_WORKER_FAILURE_COOLDOWN_MS
+    }
+    return this.TRANSIENT_TRANSPORT_FAILURE_COOLDOWN_MS
+  }
+
   private parsePromptTooLongTokens(
     errorBody: string
   ): { actual: number; max: number } | null {
@@ -395,53 +642,73 @@ export class GoogleService {
   private extractCloudCodeErrorText(errorBody: string): string {
     const parts: string[] = [errorBody]
 
-    // Try to find and parse JSON from the error body.
-    // Worker errors have a text prefix like "Cloud Code streamGenerateContent stream failed: 400 {...}"
-    // so we need to find the first '{' and try to parse from there.
-    const jsonCandidates: string[] = [errorBody]
-    const firstBrace = errorBody.indexOf("{")
+    const parsed = this.parseCloudCodeErrorEnvelope(errorBody)
+    if (!parsed?.error) {
+      return parts.join("\n")
+    }
+
+    const outerMessage = parsed.error.message
+    if (typeof outerMessage === "string" && outerMessage.length > 0) {
+      parts.push(outerMessage)
+      const nested = this.parseCloudCodeErrorEnvelope(outerMessage) as {
+        type?: unknown
+        error?: { type?: unknown; message?: unknown }
+        request_id?: unknown
+      } | null
+      if (typeof nested?.type === "string") parts.push(nested.type)
+      if (typeof nested?.error?.type === "string") {
+        parts.push(nested.error.type)
+      }
+      if (typeof nested?.error?.message === "string") {
+        parts.push(nested.error.message)
+      }
+      if (typeof nested?.request_id === "string") {
+        parts.push(nested.request_id)
+      }
+    }
+    if (typeof parsed.error.status === "string") {
+      parts.push(parsed.error.status)
+    }
+
+    return parts.join("\n")
+  }
+
+  private parseCloudCodeErrorEnvelope(errorText: string): {
+    error?: {
+      message?: string
+      status?: string
+      details?: Array<{
+        "@type"?: string
+        retryDelay?: string
+        metadata?: { quotaResetDelay?: string }
+      }>
+    }
+  } | null {
+    const jsonCandidates: string[] = [errorText]
+    const firstBrace = errorText.indexOf("{")
     if (firstBrace > 0) {
-      jsonCandidates.push(errorBody.slice(firstBrace))
+      jsonCandidates.push(errorText.slice(firstBrace))
     }
 
     for (const candidate of jsonCandidates) {
       try {
-        const parsed = JSON.parse(candidate) as {
-          error?: { message?: unknown; status?: unknown }
-        }
-        const outerMessage = parsed.error?.message
-        if (typeof outerMessage === "string" && outerMessage.length > 0) {
-          parts.push(outerMessage)
-          try {
-            const nested = JSON.parse(outerMessage) as {
-              type?: unknown
-              error?: { type?: unknown; message?: unknown }
-              request_id?: unknown
-            }
-            if (typeof nested.type === "string") parts.push(nested.type)
-            if (typeof nested.error?.type === "string") {
-              parts.push(nested.error.type)
-            }
-            if (typeof nested.error?.message === "string") {
-              parts.push(nested.error.message)
-            }
-            if (typeof nested.request_id === "string") {
-              parts.push(nested.request_id)
-            }
-          } catch {
-            // Ignore nested parse failures.
+        return JSON.parse(candidate) as {
+          error?: {
+            message?: string
+            status?: string
+            details?: Array<{
+              "@type"?: string
+              retryDelay?: string
+              metadata?: { quotaResetDelay?: string }
+            }>
           }
         }
-        if (typeof parsed.error?.status === "string") {
-          parts.push(parsed.error.status)
-        }
-        break // Successfully parsed, no need to try other candidates
       } catch {
         // Try next candidate
       }
     }
 
-    return parts.join("\n")
+    return null
   }
 
   private isDeterministicInvalidRequest(errorBody: string): boolean {
@@ -457,6 +724,15 @@ export class GoogleService {
       return `Cloud Code request exceeds prompt limit: ${promptTooLong.actual} > ${promptTooLong.max} tokens`
     }
     return `Cloud Code API invalid_request_error: ${normalized.slice(0, 500)}`
+  }
+
+  private isCloudCodeToolProtocolError(errorBody: string): boolean {
+    const normalized = this.extractCloudCodeErrorText(errorBody)
+    return (
+      normalized.includes("unexpected") &&
+      normalized.includes("tool_result") &&
+      normalized.includes("tool_use_id")
+    )
   }
 
   /**
@@ -499,11 +775,50 @@ export class GoogleService {
     const trimmed = originalContents.slice(dropCount)
     if (trimmed.length <= 0) return null
 
-    const normalized = this.normalizeContentsForPromptShrink(trimmed)
-    if (normalized.length <= 0) return null
+    const normalized = this.stripPromptShrinkMetadata(
+      this.normalizeContentsForPromptShrink(trimmed)
+    )
+    if (normalized.contents.length <= 0) return null
 
+    // CHECKPOINT: inject structured summary instead of silently dropping
+    const checkpointMessage = this.buildCheckpointMessage(droppedContents)
+    requestObj.contents = [checkpointMessage, ...normalized.contents]
+
+    return {
+      dropped: originalContents.length - normalized.contents.length,
+      remaining: (requestObj.contents as unknown[]).length,
+      removedFunctionResponses: normalized.removedFunctionResponses,
+    }
+  }
+
+  private sanitizeClaudeContentsForSend(
+    contents: Array<Record<string, unknown>>
+  ): {
+    contents: Array<Record<string, unknown>>
+    removedFunctionResponses: number
+    droppedMessages: number
+  } {
+    const normalized = this.stripPromptShrinkMetadata(
+      this.normalizeContentsForPromptShrink(contents)
+    )
+
+    return {
+      contents: normalized.contents,
+      removedFunctionResponses: normalized.removedFunctionResponses,
+      droppedMessages: Math.max(
+        0,
+        contents.length - normalized.contents.length
+      ),
+    }
+  }
+
+  private stripPromptShrinkMetadata(contents: Array<Record<string, unknown>>): {
+    contents: Array<Record<string, unknown>>
+    removedFunctionResponses: number
+  } {
     let removedFunctionResponses = 0
-    for (const msg of normalized) {
+
+    for (const msg of contents) {
       if (!msg || typeof msg !== "object") continue
       const removed = (msg as { __removedFunctionResponses?: number })
         .__removedFunctionResponses
@@ -514,13 +829,8 @@ export class GoogleService {
         .__removedFunctionResponses
     }
 
-    // CHECKPOINT: inject structured summary instead of silently dropping
-    const checkpointMessage = this.buildCheckpointMessage(droppedContents)
-    requestObj.contents = [checkpointMessage, ...normalized]
-
     return {
-      dropped: originalContents.length - normalized.length,
-      remaining: (requestObj.contents as unknown[]).length,
+      contents,
       removedFunctionResponses,
     }
   }
@@ -530,7 +840,7 @@ export class GoogleService {
   ): Array<Record<string, unknown>> {
     if (!Array.isArray(contents) || contents.length === 0) return []
 
-    const normalized: Array<Record<string, unknown>> = []
+    const prepared: Array<Record<string, unknown>> = []
 
     for (const message of contents) {
       if (!message || typeof message !== "object") continue
@@ -546,6 +856,26 @@ export class GoogleService {
           !!part && typeof part === "object"
       )
       if (parts.length === 0) continue
+
+      prepared.push({
+        ...message,
+        role,
+        parts,
+      })
+    }
+
+    while (
+      prepared.length > 1 &&
+      (prepared[0] as { role?: unknown })?.role === "model"
+    ) {
+      prepared.shift()
+    }
+
+    const normalized: Array<Record<string, unknown>> = []
+
+    for (const message of prepared) {
+      const role = message.role as string
+      const parts = message.parts as Array<Record<string, unknown>>
 
       let filteredParts = parts
       let removedFunctionResponses = 0
@@ -590,13 +920,6 @@ export class GoogleService {
       }
 
       normalized.push(clonedMessage)
-    }
-
-    while (
-      normalized.length > 1 &&
-      (normalized[0] as { role?: unknown })?.role === "model"
-    ) {
-      normalized.shift()
     }
 
     // Backward pass: strip orphan functionCall parts from model messages
@@ -934,7 +1257,10 @@ export class GoogleService {
       currentContents = currentContents.slice(safeDrop)
 
       // Normalize: ensure first message is from user role
-      currentContents = this.normalizeContentsForPromptShrink(currentContents)
+      const normalized = this.stripPromptShrinkMetadata(
+        this.normalizeContentsForPromptShrink(currentContents)
+      )
+      currentContents = normalized.contents
       if (currentContents.length <= 0) {
         this.logger.error(
           "[enforceTokenBudget] Normalization left empty contents"
@@ -1115,9 +1441,12 @@ export class GoogleService {
    * Execute grounded web search via Cloud Code API (requestType=web_search).
    * Routed through native Worker IPC for proper OAuth authentication.
    */
-  async executeWebSearch(query: string): Promise<string> {
+  async executeWebSearch(query: string): Promise<{
+    text: string
+    references: Array<{ title: string; url: string; chunk: string }>
+  }> {
     const normalizedQuery = query.trim()
-    if (!normalizedQuery) return ""
+    if (!normalizedQuery) return { text: "", references: [] }
 
     if (!this.processPool.isConfigured()) {
       throw new Error("Google Cloud Code API not configured for web_search")
@@ -1130,7 +1459,10 @@ export class GoogleService {
       const responseData = this.unwrapCloudCodeResponse(data)
       const text = this.extractGenerateContentText(responseData)
       const references = this.extractGenerateContentReferences(responseData)
-      return this.withWebSearchSources(text, references)
+      return {
+        text: this.withWebSearchSources(text, references),
+        references,
+      }
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error)
       throw new Error(`web_search failed: ${errMsg}`)
@@ -1147,23 +1479,28 @@ export class GoogleService {
    * @param contents Cloud Code-format conversation contents
    * @returns Generated text, or empty string on failure
    */
-  async generateTabName(
-    contents: Array<{ role: string; parts: Array<{ text: string }> }>
-  ): Promise<string> {
+  async generateTabName(userRequest: string): Promise<string> {
     if (!this.processPool.isConfigured()) return ""
     try {
-      // Prepend a system instruction to make the model generate a short tab name
-      // instead of responding to the user's question
+      const trimmedRequest = userRequest.trim()
+      if (!trimmedRequest) return ""
+
       const tabNamingContents = [
         {
           role: "user" as const,
           parts: [
             {
               text:
-                "Based on the following conversation, generate a very short title (3-8 words, no quotes, no markdown, no punctuation at the end) that summarizes the topic. Reply with ONLY the title, nothing else.\n\n" +
-                contents
-                  .map((c) => c.parts.map((p) => p.text).join(" "))
-                  .join("\n"),
+                "Generate a short conversation title from the user's request.\n\n" +
+                "Rules:\n" +
+                "- Summarize only the user's request.\n" +
+                "- Keep it concise, 3-8 words.\n" +
+                "- No quotes.\n" +
+                "- No markdown.\n" +
+                "- No trailing punctuation.\n" +
+                "- Return ONLY the title.\n\n" +
+                "User request:\n" +
+                trimmedRequest,
             },
           ],
         },
@@ -1190,10 +1527,10 @@ export class GoogleService {
         requestType: "tab",
         requestId: `tab/${crypto.randomUUID()}`,
       }
-      const data = (await this.processPool.generate(payload)) as Record<
-        string,
-        unknown
-      >
+      const data = (await this.processPool.generate(
+        payload,
+        "tab_flash_lite_preview"
+      )) as Record<string, unknown>
       const responseData = this.unwrapCloudCodeResponse(data)
       const rawName = this.extractGenerateContentText(responseData).trim()
       // Sanitize: take only the first line, strip quotes, limit length
@@ -1738,6 +2075,21 @@ export class GoogleService {
     return Array.from(merged)
   }
 
+  private normalizeCloudCodeThinkingLevel(effort: string): "medium" | "high" {
+    switch (effort.trim().toLowerCase()) {
+      case "max":
+      case "high":
+      case "xhigh":
+      case "auto":
+        return "high"
+      case "medium":
+      case "low":
+      case "minimal":
+      default:
+        return "medium"
+    }
+  }
+
   private buildClaudeThinkingConfig(
     dto: CreateMessageDto
   ): Record<string, unknown> | null {
@@ -1767,9 +2119,17 @@ export class GoogleService {
         typeof dto.output_config?.effort === "string"
           ? dto.output_config.effort.trim().toLowerCase()
           : ""
+      const thinkingLevel = this.normalizeCloudCodeThinkingLevel(
+        effort || "high"
+      )
+      if (effort && effort !== thinkingLevel) {
+        this.logger.debug(
+          `Normalizing Cloud Code adaptive thinking effort from ${effort} to ${thinkingLevel}`
+        )
+      }
       return {
         includeThoughts: true,
-        thinkingLevel: effort || "high",
+        thinkingLevel,
       }
     }
 
@@ -1782,9 +2142,7 @@ export class GoogleService {
     thinkingConfig: Record<string, unknown> | null
   ): boolean {
     return (
-      hasTools &&
-      !!thinkingConfig &&
-      resolvedModel.toLowerCase().includes("thinking")
+      hasTools && !!thinkingConfig && doesModelSupportThinking(resolvedModel)
     )
   }
 
@@ -2863,6 +3221,23 @@ export class GoogleService {
    */
   private buildClaudePayload(dto: CreateMessageDto): Record<string, unknown> {
     const googleRequest = this.convertClaudeToGoogleFormat(dto)
+    const requestContents = Array.isArray(googleRequest.contents)
+      ? (googleRequest.contents as Array<Record<string, unknown>>)
+      : []
+
+    if (requestContents.length > 0) {
+      const sanitized = this.sanitizeClaudeContentsForSend(requestContents)
+      googleRequest.contents = sanitized.contents
+      if (
+        sanitized.removedFunctionResponses > 0 ||
+        sanitized.droppedMessages > 0
+      ) {
+        this.logger.warn(
+          `Cloud Code final payload sanitize: dropped ${sanitized.removedFunctionResponses} orphan functionResponse part(s), ` +
+            `removed ${sanitized.droppedMessages} invalid message(s)`
+        )
+      }
+    }
 
     // Resolve model name to Cloud Code format
     const model = this.resolveClaudeModel(dto.model)
@@ -2991,6 +3366,11 @@ export class GoogleService {
             cooldownMs,
             exhausted
           )
+          await this.processPool.recycleLastOfficialClient(
+            exhausted
+              ? `quota exhausted for ${resolvedModel}`
+              : `rate limited for ${resolvedModel}`
+          )
 
           // Check if another worker is available for this specific model
           if (this.processPool.hasAvailableWorkerForModel(resolvedModel)) {
@@ -3035,7 +3415,7 @@ export class GoogleService {
               `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
             )
             throw new HttpException(
-              `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+              await this.buildCloudCodeRateLimitMessage(resolvedModel, waitMs),
               HttpStatus.TOO_MANY_REQUESTS
             )
           }
@@ -3080,6 +3460,51 @@ export class GoogleService {
         if (errMsg.includes("Token refresh failed")) {
           this.logger.warn("Token refresh failed, switching account...")
           this.processPool.switchToNextWorker()
+        }
+
+        if (this.isRetryableWorkerFailure(errMsg)) {
+          const isModelCapacityExhausted = this.isModelCapacityExhausted(errMsg)
+          const cooldownMs = isModelCapacityExhausted
+            ? this.MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS
+            : this.getRetryableWorkerFailureCooldownMs(errMsg)
+
+          if (isModelCapacityExhausted) {
+            this.processPool.setModelCooldownForLastWorker(
+              resolvedModel,
+              cooldownMs,
+              false
+            )
+          } else {
+            this.processPool.setCooldownForLastWorker(
+              cooldownMs,
+              "temporarily unavailable"
+            )
+          }
+
+          await this.processPool.recycleLastOfficialClient(
+            isModelCapacityExhausted
+              ? `model capacity exhausted for ${resolvedModel}`
+              : `transient failure for ${resolvedModel}`
+          )
+
+          if (this.processPool.hasAvailableWorkerForModel(resolvedModel)) {
+            this.logger.warn(
+              `${isModelCapacityExhausted ? "Model capacity exhausted" : "Transient worker failure"} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker for ${resolvedModel}: ${errMsg}`
+            )
+            lastError = error as Error
+            continue
+          }
+
+          const waitMs =
+            this.processPool.getMinCooldownMsForModel(resolvedModel)
+          if (waitMs > 0 && waitMs <= this.MAX_RETRY_DELAY) {
+            this.logger.warn(
+              `All workers temporarily unavailable for ${resolvedModel}, waiting ${waitMs}ms before retry`
+            )
+            await this.sleep(waitMs)
+            lastError = error as Error
+            continue
+          }
         }
 
         lastError = error as Error
@@ -3240,7 +3665,7 @@ export class GoogleService {
       yield* endBlock()
     }
 
-    let fatalRequestError: string | null = null
+    let fatalRequestError: Error | null = null
 
     // Async producer-consumer queue for real-time streaming
     const eventQueue: string[] = []
@@ -3308,6 +3733,11 @@ export class GoogleService {
               cooldownMs,
               exhausted
             )
+            await self.processPool.recycleLastOfficialClient(
+              exhausted
+                ? `quota exhausted for ${resolvedModel}`
+                : `rate limited for ${resolvedModel}`
+            )
 
             // Check if another worker is available for this model
             if (self.processPool.hasAvailableWorkerForModel(resolvedModel)) {
@@ -3351,7 +3781,10 @@ export class GoogleService {
                 `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait ${self.MAX_429_WAIT_MS}ms)`
               )
               throw new HttpException(
-                `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+                await this.buildCloudCodeRateLimitMessage(
+                  resolvedModel,
+                  waitMs
+                ),
                 HttpStatus.TOO_MANY_REQUESTS
               )
             }
@@ -3372,7 +3805,7 @@ export class GoogleService {
               `All workers still exhausted for ${resolvedModel} after recovery wait, giving up`
             )
             throw new HttpException(
-              `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+              await this.buildCloudCodeRateLimitMessage(resolvedModel, waitMs),
               HttpStatus.TOO_MANY_REQUESTS
             )
           }
@@ -3400,6 +3833,9 @@ export class GoogleService {
                 continue
               }
             }
+            if (self.isCloudCodeToolProtocolError(errMsg)) {
+              throw new FatalCloudCodeRequestError(errMsg)
+            }
           }
 
           if (
@@ -3411,6 +3847,51 @@ export class GoogleService {
               self.logger.warn(
                 `Streaming auth error (attempt ${workerAttempt + 1}/${maxWorkerRetries}), switched to next worker`
               )
+              continue
+            }
+          }
+
+          if (self.isRetryableWorkerFailure(errMsg)) {
+            const isModelCapacityExhausted =
+              self.isModelCapacityExhausted(errMsg)
+            const cooldownMs = isModelCapacityExhausted
+              ? self.MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS
+              : self.getRetryableWorkerFailureCooldownMs(errMsg)
+
+            if (isModelCapacityExhausted) {
+              self.processPool.setModelCooldownForLastWorker(
+                resolvedModel,
+                cooldownMs,
+                false
+              )
+            } else {
+              self.processPool.setCooldownForLastWorker(
+                cooldownMs,
+                "temporarily unavailable"
+              )
+            }
+
+            await self.processPool.recycleLastOfficialClient(
+              isModelCapacityExhausted
+                ? `model capacity exhausted for ${resolvedModel}`
+                : `transient failure for ${resolvedModel}`
+            )
+
+            if (self.processPool.hasAvailableWorkerForModel(resolvedModel)) {
+              self.logger.warn(
+                `${isModelCapacityExhausted ? "Streaming model capacity exhausted" : "Streaming transient worker failure"} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}: ${errMsg}`
+              )
+              continue
+            }
+
+            const waitMs =
+              self.processPool.getMinCooldownMsForModel(resolvedModel)
+            if (waitMs > 0 && waitMs <= self.MAX_RETRY_DELAY) {
+              self.logger.warn(
+                `All workers temporarily unavailable for ${resolvedModel}, waiting ${waitMs}ms before retry`
+              )
+              await self.sleep(waitMs)
+              workerAttempt-- // give the recovered worker a fair chance
               continue
             }
           }
@@ -3611,7 +4092,10 @@ export class GoogleService {
       .catch((err) => {
         const errMsg = (err as Error).message || ""
         self.logger.error(`Streaming failed (all workers exhausted): ${errMsg}`)
-        fatalRequestError = errMsg || "Cloud Code API streaming failed"
+        fatalRequestError =
+          err instanceof Error
+            ? err
+            : new Error(errMsg || "Cloud Code API streaming failed")
         streamDone = true
         if (resolveWaiting) {
           resolveWaiting()
@@ -3636,8 +4120,23 @@ export class GoogleService {
     // Keep reference to avoid unhandled rejection
     void streamPromise
 
-    if (fatalRequestError) {
-      const errorMsg = fatalRequestError as string
+    const finalizedFatalRequestError: unknown = fatalRequestError
+    if (finalizedFatalRequestError) {
+      if (
+        typeof finalizedFatalRequestError === "object" &&
+        finalizedFatalRequestError !== null &&
+        "name" in finalizedFatalRequestError &&
+        finalizedFatalRequestError.name === "FatalCloudCodeRequestError"
+      ) {
+        throw finalizedFatalRequestError as Error
+      }
+      const errorMsg =
+        typeof finalizedFatalRequestError === "object" &&
+        finalizedFatalRequestError !== null &&
+        "message" in finalizedFatalRequestError &&
+        typeof finalizedFatalRequestError.message === "string"
+          ? finalizedFatalRequestError.message
+          : "Cloud Code API streaming failed"
       this.logger.error(`Cloud Code API failed for Claude model: ${errorMsg}`)
       const userFacingError = errorMsg.includes("request exceeds prompt limit")
         ? "Request context is too large. Please shorten the conversation or start a new chat."

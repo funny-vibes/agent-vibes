@@ -5,9 +5,12 @@
  * Usage:
  *   agent-vibes                          Start the gateway server
  *   agent-vibes cert                     Generate SSL certificates
- *   agent-vibes sync --ide|--tools       Sync Antigravity credentials
- *   agent-vibes sync --claude            Sync Claude Code third-party credentials
- *   agent-vibes sync --codex             Sync Codex credentials
+ *   agent-vibes sync --ide|--tools [--accounts-file PATH]
+ *                                         Sync Antigravity credentials
+ *   agent-vibes sync --claude [--accounts-file PATH]
+ *                                         Sync Claude Code third-party credentials
+ *   agent-vibes sync --codex [--accounts-file PATH]
+ *                                         Sync Codex credentials
  *   agent-vibes forward hosts|on|off|status
  *   agent-vibes sync --deploy [--run]    Deploy credentials to GitHub Secrets
  *   agent-vibes --version                Show version
@@ -60,6 +63,9 @@ Configuration:
     agent-vibes sync --claude         Sync credentials from Claude Code settings
   Codex:
     agent-vibes sync --codex          Sync credentials from Codex CLI auth.json
+
+  All sync commands support:
+    --accounts-file PATH              Write to a specific accounts JSON file
   Cursor:
     agent-vibes cert                  Generate SSL certificates (requires mkcert)
     agent-vibes forward hosts         Print /etc/hosts entries
@@ -78,6 +84,7 @@ Advanced:
   agent-vibes capture start           Start traffic capture (Clash + mitmdump)
   agent-vibes capture stop            Stop traffic capture
   agent-vibes capture status          Show capture status
+  agent-vibes capture repair          Repair stale capture injection
   agent-vibes issues                  Collect diagnostics for bug reports
 
 Documentation: https://github.com/funny-vibes/agent-vibes
@@ -114,9 +121,15 @@ if (command === "sync") {
   if (args.includes("--deploy")) {
     nodeScript("scripts/accounts/sync-deploy.js", args.slice(1))
   } else if (args.includes("--claude")) {
-    nodeScript("scripts/accounts/sync-claude-account.js")
+    nodeScript(
+      "scripts/accounts/sync-claude-account.js",
+      args.slice(1).filter((arg) => arg !== "--claude")
+    )
   } else if (args.includes("--codex")) {
-    nodeScript("scripts/accounts/sync-codex-account.js")
+    nodeScript(
+      "scripts/accounts/sync-codex-account.js",
+      args.slice(1).filter((arg) => arg !== "--codex")
+    )
   } else {
     nodeScript("scripts/accounts/sync-antigravity-accounts.js", args.slice(1))
   }

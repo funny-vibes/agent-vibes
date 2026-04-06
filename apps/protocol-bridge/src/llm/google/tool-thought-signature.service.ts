@@ -1,7 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common"
 import * as fs from "fs"
-import * as os from "os"
 import * as path from "path"
+import { getAgentVibesHome, ensureAgentVibesDirs } from "../../persistence"
 
 /**
  * ToolThoughtSignatureStore - Cross-turn signature cache
@@ -43,19 +43,8 @@ export class ToolThoughtSignatureService {
   private loadedFromDisk = false
 
   constructor() {
-    // Use ANTIGRAVITY_STORAGE or default to ~/.protocol-bridge (expand ~ to homedir)
-    const rawStorage =
-      process.env.ANTIGRAVITY_STORAGE ||
-      path.join(os.homedir(), ".protocol-bridge")
-    const storageDir = rawStorage.startsWith("~")
-      ? path.join(os.homedir(), rawStorage.slice(1))
-      : rawStorage
-
-    // Ensure directory exists
-    if (!fs.existsSync(storageDir)) {
-      fs.mkdirSync(storageDir, { recursive: true })
-    }
-
+    ensureAgentVibesDirs()
+    const storageDir = getAgentVibesHome()
     this.cacheFilePath = path.join(storageDir, "tool-thought-signatures.json")
     this.loadFromDisk()
   }

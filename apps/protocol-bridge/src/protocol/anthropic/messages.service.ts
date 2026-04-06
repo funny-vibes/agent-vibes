@@ -16,6 +16,7 @@ import {
   ModelRouterService,
 } from "../../llm/model-router.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
+import { BackendApiError } from "../../llm/shared/backend-errors"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { CountTokensDto } from "./dto/count-tokens.dto"
 import { CreateMessageDto } from "./dto/create-message.dto"
@@ -281,6 +282,16 @@ export class MessagesService implements OnModuleInit {
       }
 
       if (route.backend === "codex") {
+        if (!this.codexService.supportsModel(route.model)) {
+          throw new BackendApiError(
+            `Model ${route.model} is not supported by the configured Codex account(s).`,
+            {
+              backend: "codex",
+              statusCode: 400,
+              permanent: true,
+            }
+          )
+        }
         this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
         return await this.codexService.sendClaudeMessage(routedDto)
       }
@@ -385,6 +396,16 @@ export class MessagesService implements OnModuleInit {
       }
 
       if (route.backend === "codex") {
+        if (!this.codexService.supportsModel(route.model)) {
+          throw new BackendApiError(
+            `Model ${route.model} is not supported by the configured Codex account(s).`,
+            {
+              backend: "codex",
+              statusCode: 400,
+              permanent: true,
+            }
+          )
+        }
         this.logger.log(
           `[ROUTE] Codex backend | model: ${route.model} | stream: true`
         )
@@ -627,7 +648,11 @@ export class MessagesService implements OnModuleInit {
       }
 
       if (resolved.family === "gpt") {
-        return this.isGptBackendAvailable()
+        if (this.openaiCompatService.isAvailable()) {
+          return true
+        }
+
+        return this.codexService.supportsModel(modelId)
       }
 
       if (resolved.family === "gemini") {
@@ -724,7 +749,9 @@ export class MessagesService implements OnModuleInit {
         codexModelTier: this.getAdvertisedGptModelTier(),
       })
       for (const modelId of codexModels) {
-        addModel(modelId, "openai")
+        if (isModelAdvertisable(modelId)) {
+          addModel(modelId, "openai")
+        }
       }
     }
 

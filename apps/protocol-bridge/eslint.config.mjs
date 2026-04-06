@@ -10,6 +10,7 @@ export default tseslint.config(
       "dist/**",
       "src/gen/**",
       "src/llm/native/worker.js",
+      "src/sea/**",
     ],
   },
   eslint.configs.recommended,
@@ -65,12 +66,24 @@ export default tseslint.config(
     files: ["src/protocol/cursor/cursor-connect-stream.service.ts"],
     rules: {
       "@typescript-eslint/restrict-template-expressions": "off",
+      "@typescript-eslint/no-base-to-string": "off",
     },
   },
   {
     files: ["src/protocol/cursor/cursor-grpc.service.ts"],
     rules: {
       "@typescript-eslint/no-base-to-string": "off",
+    },
+  },
+  {
+    files: ["src/sea-entry.ts", "src/main.ts"],
+    rules: {
+      "@typescript-eslint/no-require-imports": "off",
+      "@typescript-eslint/no-unsafe-call": "off",
+      "@typescript-eslint/no-unsafe-argument": "off",
+      "@typescript-eslint/no-unsafe-assignment": "off",
+      "@typescript-eslint/no-unsafe-member-access": "off",
+      "@typescript-eslint/no-unsafe-return": "off",
     },
   }
 )

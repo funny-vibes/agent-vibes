@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Logger, Post } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import { createHash, randomUUID } from "crypto"
+import { AntigravityIdeSyncService } from "./antigravity-ide-sync.service"
 import { CursorAuthService } from "./cursor-auth.service"
 
 interface CursorGainRequest {
@@ -22,7 +23,8 @@ export class AuthController {
 
   constructor(
     private readonly configService: ConfigService,
-    private readonly cursorAuthService: CursorAuthService
+    private readonly cursorAuthService: CursorAuthService,
+    private readonly antigravityIdeSyncService: AntigravityIdeSyncService
   ) {}
 
   private getCursorIdentity(): CursorIdentity {
@@ -110,5 +112,13 @@ export class AuthController {
   @Get("auth/me")
   me() {
     return this.whoami()
+  }
+
+  @Post("antigravity/sync-ide")
+  syncAntigravityIdeCredentials() {
+    return {
+      synced: true,
+      ...this.antigravityIdeSyncService.syncCredentialsFromIde(),
+    }
   }
 }

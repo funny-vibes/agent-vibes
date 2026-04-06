@@ -34,18 +34,24 @@ import {
   getAccountConfigPathCandidates,
   resolveDefaultAccountConfigPath,
 } from "../../shared/protocol-bridge-paths"
-import { CodexModelTier, normalizeCodexModelTier } from "../model-registry"
+import {
+  CodexModelTier,
+  isChatGptCodexModelSupported,
+  normalizeCodexModelTier,
+} from "../model-registry"
 import {
   type CooldownableAccount,
   isAccountDisabled,
+  isAccountAvailableForModel,
   markAccountCooldown,
   markAccountSuccess,
-  pickAvailableAccount,
   getEarliestRecovery,
 } from "../shared/account-cooldown"
 import {
   BackendPoolEntryState,
   BackendPoolStatus,
+  type CodexRateLimitSnapshot,
+  type CodexRateLimitWindow,
 } from "../shared/backend-pool-status"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
@@ -60,6 +66,7 @@ import {
   CodexWebSocketService,
   CodexWebSocketUpgradeError,
 } from "./codex-websocket.service"
+import { UsageStatsService } from "../../usage/usage-stats.service"
 
 // ── Constants (matching codex_cli_rs) ──────────────────────────────────
 
@@ -108,11 +115,16 @@ interface PersistedCodexAccountRecord {
   refreshToken?: string
   idToken?: string
   accountId?: string
+  workspaceId?: string
   email?: string
   planType?: string
   expire?: string
   baseUrl?: string
   proxyUrl?: string
+}
+
+interface LoadedCodexAccountRecord extends PersistedCodexAccountRecord {
+  configPath: string
 }
 
 interface CodexAccountSlot extends CooldownableAccount {
@@ -121,10 +133,12 @@ interface CodexAccountSlot extends CooldownableAccount {
   accessToken?: string
   refreshToken?: string
   accountId?: string
+  workspaceId?: string
   email?: string
   planType?: CodexModelTier
   baseUrl: string
   proxyUrl?: string
+  configPath?: string
   source: "env" | "file"
   /** Per-slot token data for independent refresh */
   tokenData: CodexTokenData | null
@@ -136,6 +150,13 @@ interface CodexAccountSlot extends CooldownableAccount {
     accessToken?: string
     refreshToken?: string
   }
+  /** Rate limit snapshot from x-codex-* response headers */
+  rateLimits?: CodexRateLimitSnapshot
+}
+
+interface ConversationSlotBinding {
+  slotKey: string
+  expire: number
 }
 
 @Injectable()
@@ -149,7 +170,12 @@ export class CodexService implements OnModuleInit {
   /** Backing file used for multi-account OAuth persistence */
   private accountsFilePath: string = CODEX_ACCOUNTS_DEFAULT_PATH
 
-  private sessionId: string = crypto.randomUUID()
+  /** Sticky conversation -> account binding to keep cache locality intact. */
+  private readonly conversationSlotBindings = new Map<
+    string,
+    ConversationSlotBinding
+  >()
+
   private configuredModelTier: CodexModelTier | null = null
 
   /** Whether to prefer WebSocket transport over HTTP */
@@ -157,11 +183,14 @@ export class CodexService implements OnModuleInit {
   /** Whether WebSocket was rejected by upstream (fallback to HTTP) */
   private webSocketRejected: boolean = false
 
+  private readonly CONVERSATION_SLOT_TTL_MS = 60 * 60 * 1000
+
   constructor(
     private readonly configService: ConfigService,
     private readonly authService: CodexAuthService,
     private readonly cacheService: CodexCacheService,
-    private readonly wsService: CodexWebSocketService
+    private readonly wsService: CodexWebSocketService,
+    private readonly usageStats: UsageStatsService
   ) {}
 
   onModuleInit() {
@@ -256,10 +285,12 @@ export class CodexService implements OnModuleInit {
         accessToken: fa.accessToken || undefined,
         refreshToken: fa.refreshToken || undefined,
         accountId: fa.accountId || undefined,
+        workspaceId: fa.workspaceId || undefined,
         email: fa.email || undefined,
         planType: normalizeCodexModelTier(fa.planType) || undefined,
         baseUrl: fa.baseUrl || envBaseUrl,
         proxyUrl: fa.proxyUrl || envProxyUrl || undefined,
+        configPath: fa.configPath,
         source: "file",
         tokenData: null,
         cooldownUntil: 0,
@@ -281,6 +312,7 @@ export class CodexService implements OnModuleInit {
             accessToken: fa.accessToken || "",
             refreshToken: fa.refreshToken || "",
             accountId: fa.accountId || "",
+            workspaceId: fa.workspaceId || "",
             email: fa.email || "",
             expire: fa.expire || "",
           })
@@ -357,10 +389,12 @@ export class CodexService implements OnModuleInit {
         accessToken: fa.accessToken || undefined,
         refreshToken: fa.refreshToken || undefined,
         accountId: fa.accountId || undefined,
+        workspaceId: fa.workspaceId || undefined,
         email: fa.email || undefined,
         planType: normalizeCodexModelTier(fa.planType) || undefined,
         baseUrl: fa.baseUrl || envBaseUrl,
         proxyUrl: fa.proxyUrl || envProxyUrl || undefined,
+        configPath: fa.configPath,
         source: "file",
         tokenData: null,
         cooldownUntil: 0,
@@ -382,6 +416,7 @@ export class CodexService implements OnModuleInit {
             accessToken: fa.accessToken || "",
             refreshToken: fa.refreshToken || "",
             accountId: fa.accountId || "",
+            workspaceId: fa.workspaceId || "",
             email: fa.email || "",
             expire: fa.expire || "",
           })
@@ -415,6 +450,7 @@ export class CodexService implements OnModuleInit {
         id: [
           account.email || "",
           account.accountId || "",
+          account.workspaceId || "",
           account.apiKey || "",
           account.baseUrl,
         ].join("\0"),
@@ -429,7 +465,9 @@ export class CodexService implements OnModuleInit {
         planType: account.planType,
         email: account.email,
         accountId: account.accountId,
+        workspaceId: account.workspaceId,
         modelCooldowns,
+        rateLimits: account.rateLimits,
       }
     })
 
@@ -439,10 +477,15 @@ export class CodexService implements OnModuleInit {
       configured: this.accounts.length > 0,
       total: entries.length,
       available: entries.filter(
-        (entry) => entry.state === "ready" || entry.state === "degraded"
+        (entry) =>
+          entry.state === "ready" ||
+          entry.state === "degraded" ||
+          entry.state === "model_cooldown"
       ).length,
       ready: entries.filter((entry) => entry.state === "ready").length,
       degraded: entries.filter((entry) => entry.state === "degraded").length,
+      modelCooldown: entries.filter((entry) => entry.state === "model_cooldown")
+        .length,
       cooling: entries.filter((entry) => entry.state === "cooldown").length,
       disabled: entries.filter((entry) => entry.state === "disabled").length,
       unavailable: 0,
@@ -453,6 +496,19 @@ export class CodexService implements OnModuleInit {
 
   getModelTier(): CodexModelTier | null {
     return this.getHighestLoadedModelTier() || this.configuredModelTier
+  }
+
+  supportsModel(modelName: string): boolean {
+    const normalized = modelName.toLowerCase().trim()
+    if (!normalized) {
+      return false
+    }
+
+    return this.accounts.some(
+      (slot) =>
+        !isAccountDisabled(slot) &&
+        this.isModelSupportedBySlot(slot, normalized)
+    )
   }
 
   private resolveConfiguredModelTier(): CodexModelTier | null {
@@ -495,7 +551,10 @@ export class CodexService implements OnModuleInit {
   /**
    * Load all Codex accounts from codex-accounts.json.
    */
-  private loadAllCodexAccountsFromFile(): PersistedCodexAccountRecord[] {
+  private loadAllCodexAccountsFromFile(): LoadedCodexAccountRecord[] {
+    const loadedRecords: LoadedCodexAccountRecord[] = []
+    const loadedPaths: string[] = []
+
     for (const configPath of CODEX_ACCOUNTS_CONFIG_PATHS) {
       if (!fs.existsSync(configPath)) continue
 
@@ -504,11 +563,16 @@ export class CodexService implements OnModuleInit {
           accounts?: PersistedCodexAccountRecord[]
         }
         if (Array.isArray(data.accounts) && data.accounts.length > 0) {
-          this.accountsFilePath = configPath
+          loadedPaths.push(configPath)
           this.logger.log(
             `Loaded ${data.accounts.length} Codex account(s) from ${configPath}`
           )
-          return data.accounts
+          loadedRecords.push(
+            ...data.accounts.map((account) => ({
+              ...account,
+              configPath,
+            }))
+          )
         }
       } catch (err) {
         this.logger.warn(
@@ -517,7 +581,79 @@ export class CodexService implements OnModuleInit {
       }
     }
 
-    return []
+    if (loadedRecords.length === 0) {
+      return []
+    }
+
+    const mergedRecords = this.mergeLoadedAccountRecords(loadedRecords)
+    const preferredConfigPath =
+      mergedRecords[mergedRecords.length - 1]?.configPath ||
+      loadedPaths[loadedPaths.length - 1] ||
+      CODEX_ACCOUNTS_DEFAULT_PATH
+
+    this.accountsFilePath = preferredConfigPath
+
+    if (
+      loadedPaths.length > 1 ||
+      mergedRecords.length !== loadedRecords.length
+    ) {
+      this.logger.log(
+        `Merged ${mergedRecords.length} Codex account(s) from ${loadedPaths.join(", ")}`
+      )
+    }
+
+    return mergedRecords
+  }
+
+  private mergeLoadedAccountRecords(
+    records: LoadedCodexAccountRecord[]
+  ): LoadedCodexAccountRecord[] {
+    const merged = new Map<string, LoadedCodexAccountRecord>()
+
+    records.forEach((record, index) => {
+      const key = this.getLoadedAccountOverrideKey(record, index)
+      if (merged.has(key)) {
+        merged.delete(key)
+      }
+      merged.set(key, record)
+    })
+
+    return Array.from(merged.values())
+  }
+
+  private getLoadedAccountOverrideKey(
+    account: LoadedCodexAccountRecord,
+    index: number
+  ): string {
+    const email = account.email?.trim().toLowerCase()
+    const accountId = account.accountId?.trim()
+    if (email && accountId) {
+      return `email:${email}:${accountId}`
+    }
+    if (email) {
+      return `email:${email}`
+    }
+
+    const apiKey = account.apiKey?.trim()
+    if (apiKey) {
+      return `api_key:${apiKey}`
+    }
+
+    const refreshToken = account.refreshToken?.trim()
+    if (refreshToken) {
+      return `refresh_token:${refreshToken}`
+    }
+
+    const accessToken = account.accessToken?.trim()
+    if (accessToken) {
+      return `access_token:${accessToken}`
+    }
+
+    if (accountId) {
+      return `account_id:${accountId}`
+    }
+
+    return `path:${account.configPath}:${index}`
   }
 
   /**
@@ -534,6 +670,9 @@ export class CodexService implements OnModuleInit {
       accountId:
         tokenData.accountId?.trim() ||
         this.authService.getAccountIdFromIdToken(idToken),
+      workspaceId:
+        tokenData.workspaceId?.trim() ||
+        this.authService.getWorkspaceIdFromIdToken(idToken),
       email: tokenData.email?.trim() || "",
       expire:
         tokenData.expire?.trim() || this.inferTokenExpiry(accessToken, idToken),
@@ -563,6 +702,10 @@ export class CodexService implements OnModuleInit {
       tokenData.accountId ||
       slot.accountId ||
       this.authService.getAccountIdFromIdToken(tokenData.idToken)
+    slot.workspaceId =
+      tokenData.workspaceId ||
+      slot.workspaceId ||
+      this.authService.getWorkspaceIdFromIdToken(tokenData.idToken)
     slot.email = tokenData.email || slot.email
     slot.planType =
       this.authService.getPlanTypeFromTokenData(tokenData) || slot.planType
@@ -600,6 +743,142 @@ export class CodexService implements OnModuleInit {
     )
   }
 
+  private getConversationId(dto: CreateMessageDto): string {
+    return typeof dto._conversationId === "string"
+      ? dto._conversationId.trim()
+      : ""
+  }
+
+  private hashIdentityPart(value: string): string {
+    return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)
+  }
+
+  private getSlotStickyKey(slot: CodexAccountSlot): string {
+    const apiKey = slot.apiKey?.trim()
+    if (apiKey) {
+      return `api_key:${apiKey}\0base:${slot.baseUrl}`
+    }
+
+    const accountId = this.getSlotAccountId(slot).trim()
+    if (accountId) {
+      return `account_id:${accountId}\0base:${slot.baseUrl}`
+    }
+
+    const email = slot.email?.trim().toLowerCase()
+    if (email) {
+      return `email:${email}\0base:${slot.baseUrl}`
+    }
+
+    const refreshToken =
+      slot.tokenData?.refreshToken?.trim() || slot.refreshToken?.trim()
+    if (refreshToken) {
+      return `refresh:${this.hashIdentityPart(refreshToken)}\0base:${slot.baseUrl}`
+    }
+
+    const accessToken =
+      slot.tokenData?.accessToken?.trim() || slot.accessToken?.trim()
+    if (accessToken) {
+      return `access:${this.hashIdentityPart(accessToken)}\0base:${slot.baseUrl}`
+    }
+
+    return `label:${slot.label || ""}\0base:${slot.baseUrl}`
+  }
+
+  private purgeExpiredConversationBindings(now: number = Date.now()): void {
+    for (const [conversationId, binding] of this.conversationSlotBindings) {
+      if (binding.expire <= now) {
+        this.conversationSlotBindings.delete(conversationId)
+      }
+    }
+  }
+
+  private bindConversationToSlot(
+    conversationId: string,
+    slot: CodexAccountSlot
+  ): void {
+    const normalizedConversationId = conversationId.trim()
+    if (!normalizedConversationId) return
+
+    this.purgeExpiredConversationBindings()
+    this.conversationSlotBindings.set(normalizedConversationId, {
+      slotKey: this.getSlotStickyKey(slot),
+      expire: Date.now() + this.CONVERSATION_SLOT_TTL_MS,
+    })
+  }
+
+  private getStickyConversationSlot(
+    conversationId: string,
+    modelName: string
+  ): CodexAccountSlot | null {
+    const normalizedConversationId = conversationId.trim()
+    if (!normalizedConversationId) {
+      return null
+    }
+
+    const now = Date.now()
+    this.purgeExpiredConversationBindings(now)
+
+    const binding = this.conversationSlotBindings.get(normalizedConversationId)
+    if (!binding) {
+      return null
+    }
+
+    const normalizedModelName = modelName.toLowerCase().trim()
+    const slot =
+      this.accounts.find(
+        (candidate) => this.getSlotStickyKey(candidate) === binding.slotKey
+      ) || null
+
+    if (
+      !slot ||
+      !this.isModelSupportedBySlot(slot, normalizedModelName) ||
+      !isAccountAvailableForModel(slot, normalizedModelName, now)
+    ) {
+      this.conversationSlotBindings.delete(normalizedConversationId)
+      return null
+    }
+
+    binding.expire = now + this.CONVERSATION_SLOT_TTL_MS
+    this.conversationSlotBindings.set(normalizedConversationId, binding)
+    return slot
+  }
+
+  private getOAuthCacheIdentity(
+    dto: CreateMessageDto,
+    slot: CodexAccountSlot
+  ): string {
+    const slotKey = this.getSlotStickyKey(slot)
+    const conversationId = this.getConversationId(dto)
+
+    if (conversationId) {
+      return `oauth:${slotKey}:conversation:${conversationId}:model:${dto.model}`
+    }
+
+    return `oauth:${slotKey}:model:${dto.model}`
+  }
+
+  private isModelSupportedBySlot(
+    slot: CodexAccountSlot,
+    modelName: string
+  ): boolean {
+    if (this.isApiKeyMode(slot)) {
+      return true
+    }
+
+    return isChatGptCodexModelSupported(modelName)
+  }
+
+  private hasSupportingAccount(modelName: string): boolean {
+    const normalized = modelName.toLowerCase().trim()
+    if (!normalized) {
+      return false
+    }
+
+    return this.accounts.some((slot) =>
+      this.isModelSupportedBySlot(slot, normalized)
+    )
+  }
+
   private getAccountLabel(slot: CodexAccountSlot): string {
     return slot.label || slot.email || "slot"
   }
@@ -631,7 +910,7 @@ export class CodexService implements OnModuleInit {
       return "cooldown"
     }
     if (modelCooldowns.length > 0) {
-      return "degraded"
+      return "model_cooldown"
     }
     return "ready"
   }
@@ -643,19 +922,27 @@ export class CodexService implements OnModuleInit {
    * @returns The slot, or null if all accounts are in cooldown
    */
   private pickNextAvailableAccount(model: string): CodexAccountSlot | null {
-    const result = pickAvailableAccount(this.accounts, model, this.accountIndex)
+    const now = Date.now()
+    const normalized = model.toLowerCase().trim()
 
-    if (!result) {
-      // All accounts in cooldown
-      this.logger.warn(
-        `[Codex] All ${this.accounts.length} account(s) are in cooldown for model=${model}`
-      )
-      return null
+    for (let offset = 0; offset < this.accounts.length; offset++) {
+      const index = (this.accountIndex + offset) % this.accounts.length
+      const slot = this.accounts[index]!
+
+      if (!this.isModelSupportedBySlot(slot, normalized)) {
+        continue
+      }
+
+      if (isAccountAvailableForModel(slot, normalized, now)) {
+        this.accountIndex = (index + 1) % this.accounts.length
+        return slot
+      }
     }
 
-    const slot = result.account
-    this.accountIndex = (result.index + 1) % this.accounts.length
-    return slot
+    this.logger.warn(
+      `[Codex] All supporting account(s) are in cooldown for model=${normalized}`
+    )
+    return null
   }
 
   /**
@@ -679,7 +966,8 @@ export class CodexService implements OnModuleInit {
     if (!slot.tokenData) return
 
     try {
-      const filePath = this.accountsFilePath || CODEX_ACCOUNTS_DEFAULT_PATH
+      const filePath =
+        slot.configPath || this.accountsFilePath || CODEX_ACCOUNTS_DEFAULT_PATH
       const payload: { accounts: PersistedCodexAccountRecord[] } = {
         accounts: [],
       }
@@ -731,6 +1019,8 @@ export class CodexService implements OnModuleInit {
         refreshToken: slot.tokenData.refreshToken,
         idToken: slot.tokenData.idToken,
         accountId: this.getSlotAccountId(slot) || undefined,
+        workspaceId:
+          slot.workspaceId || slot.tokenData.workspaceId || undefined,
         planType: this.getSlotPlanType(slot) || undefined,
         expire: slot.tokenData.expire || undefined,
       }
@@ -750,6 +1040,7 @@ export class CodexService implements OnModuleInit {
 
       fs.mkdirSync(path.dirname(filePath), { recursive: true })
       fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8")
+      slot.configPath = filePath
       slot.persistedMatch = {
         apiKey: slot.apiKey,
         email: slot.email,
@@ -878,13 +1169,16 @@ export class CodexService implements OnModuleInit {
     slot: CodexAccountSlot,
     token: string,
     stream: boolean,
-    cacheHeaders?: Record<string, string>
+    cacheHeaders?: Record<string, string>,
+    options?: {
+      omitAccountId?: boolean
+    }
   ): Record<string, string> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
       Version: CODEX_CLIENT_VERSION,
-      Session_id: this.sessionId,
+      Session_id: crypto.randomUUID(),
       "User-Agent": CODEX_USER_AGENT,
       Connection: "Keep-Alive",
       Accept: stream ? "text/event-stream" : "application/json",
@@ -895,7 +1189,9 @@ export class CodexService implements OnModuleInit {
       headers["Originator"] = "codex_cli_rs"
 
       // Add account ID if available
-      const accountId = this.getSlotAccountId(slot)
+      const accountId = options?.omitAccountId
+        ? ""
+        : this.getSlotAccountId(slot)
       if (accountId) {
         headers["Chatgpt-Account-Id"] = accountId
       }
@@ -972,6 +1268,34 @@ export class CodexService implements OnModuleInit {
     }
   }
 
+  private extractErrorCode(errorBody: string): string | null {
+    const trimmed = errorBody.trim()
+    if (!trimmed) {
+      return null
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>
+      const detail =
+        parsed.detail && typeof parsed.detail === "object"
+          ? (parsed.detail as Record<string, unknown>)
+          : undefined
+      const error =
+        parsed.error && typeof parsed.error === "object"
+          ? (parsed.error as Record<string, unknown>)
+          : undefined
+
+      const code = detail?.code ?? error?.code
+      return typeof code === "string" && code.trim() ? code.trim() : null
+    } catch {
+      return null
+    }
+  }
+
+  private isDeactivatedWorkspaceError(errorBody: string): boolean {
+    return this.extractErrorCode(errorBody) === "deactivated_workspace"
+  }
+
   private createCodexApiError(
     statusCode: number,
     errorBody: string
@@ -995,6 +1319,114 @@ export class CodexService implements OnModuleInit {
     return new CodexApiError(statusCode, message)
   }
 
+  private toNumber(value: unknown): number {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value)
+      return Number.isFinite(parsed) ? parsed : 0
+    }
+    return 0
+  }
+
+  private parseCodexSsePayload(line: string): Record<string, unknown> | null {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith("data:")) {
+      return null
+    }
+
+    const jsonStr = trimmed.slice(5).trim()
+    if (!jsonStr || jsonStr === "[DONE]") {
+      return null
+    }
+
+    try {
+      const parsed = JSON.parse(jsonStr) as Record<string, unknown>
+      return parsed && typeof parsed === "object" ? parsed : null
+    } catch {
+      return null
+    }
+  }
+
+  private logCodexUsage(
+    transport: "http" | "websocket",
+    modelName: string,
+    cacheId: string,
+    slot: CodexAccountSlot,
+    event: Record<string, unknown> | null,
+    requestStartedAt?: number
+  ): void {
+    if (!event || event.type !== "response.completed") {
+      return
+    }
+
+    const response =
+      event.response && typeof event.response === "object"
+        ? (event.response as Record<string, unknown>)
+        : null
+    const usage =
+      response?.usage && typeof response.usage === "object"
+        ? (response.usage as Record<string, unknown>)
+        : null
+
+    const totalInputTokens = this.toNumber(usage?.input_tokens)
+    const outputTokens = this.toNumber(usage?.output_tokens)
+    const cachedTokens =
+      usage?.input_tokens_details &&
+      typeof usage.input_tokens_details === "object"
+        ? this.toNumber(
+            (usage.input_tokens_details as Record<string, unknown>)
+              .cached_tokens
+          )
+        : 0
+    const cacheCreationTokens =
+      typeof usage?.cache_creation_input_tokens === "number"
+        ? this.toNumber(usage.cache_creation_input_tokens)
+        : 0
+    const webSearchRequests =
+      usage?.server_tool_use &&
+      typeof usage.server_tool_use === "object" &&
+      typeof (usage.server_tool_use as Record<string, unknown>)
+        .web_search_requests === "number"
+        ? this.toNumber(
+            (usage.server_tool_use as Record<string, unknown>)
+              .web_search_requests
+          )
+        : 0
+    const inputTokens = Math.max(0, totalInputTokens - cachedTokens)
+    const durationMs =
+      typeof requestStartedAt === "number"
+        ? Math.max(0, Date.now() - requestStartedAt)
+        : 0
+
+    const message =
+      `[Codex][Cache] transport=${transport} model=${modelName} ` +
+      `cache=${cacheId || "(none)"} input=${inputTokens} ` +
+      `cached=${cachedTokens} cacheWrite=${cacheCreationTokens} ` +
+      `output=${outputTokens} duration=${durationMs}ms`
+
+    this.usageStats.recordCodexUsage({
+      transport,
+      modelName,
+      accountKey: this.getSlotStickyKey(slot),
+      accountLabel: this.getAccountLabel(slot),
+      inputTokens,
+      cachedInputTokens: cachedTokens,
+      cacheCreationInputTokens: cacheCreationTokens,
+      outputTokens,
+      webSearchRequests,
+      durationMs,
+    })
+
+    if (cachedTokens > 0) {
+      this.logger.log(message)
+      return
+    }
+
+    this.logger.debug(message)
+  }
+
   /**
    * Build the Codex request URL.
    * Uses the selected slot's baseUrl.
@@ -1011,22 +1443,22 @@ export class CodexService implements OnModuleInit {
    * Get cache ID for the current request.
    */
   private getCacheId(dto: CreateMessageDto, slot: CodexAccountSlot): string {
-    // Extract user ID from metadata if available
     const metadata = dto as unknown as {
       metadata?: { user_id?: string }
     }
-    const userId = metadata?.metadata?.user_id
+    const userId = metadata?.metadata?.user_id?.trim()
 
     if (userId) {
       return this.cacheService.getOrCreateCacheId(dto.model, userId)
     }
 
-    // Fallback: use API key-based cache
     if (slot.apiKey) {
       return this.cacheService.getCacheIdFromApiKey(slot.apiKey)
     }
 
-    return ""
+    return this.cacheService.getCacheIdFromIdentity(
+      this.getOAuthCacheIdentity(dto, slot)
+    )
   }
 
   private createAllAccountsRateLimitedError(modelName: string): CodexApiError {
@@ -1040,12 +1472,32 @@ export class CodexService implements OnModuleInit {
     )
   }
 
-  private selectRequestSlot(modelName: string): CodexAccountSlot {
+  private selectRequestSlot(
+    modelName: string,
+    conversationId?: string
+  ): CodexAccountSlot {
     if (this.accounts.length === 0) {
       throw new Error(
         "Codex backend not configured: no API key or access token"
       )
     }
+    if (!this.hasSupportingAccount(modelName)) {
+      throw new CodexApiError(
+        400,
+        `Model ${modelName} is not supported by the configured Codex account(s).`
+      )
+    }
+
+    if (conversationId) {
+      const stickySlot = this.getStickyConversationSlot(
+        conversationId,
+        modelName
+      )
+      if (stickySlot) {
+        return stickySlot
+      }
+    }
+
     const slot = this.pickNextAvailableAccount(modelName)
     if (!slot) {
       throw this.createAllAccountsRateLimitedError(modelName)
@@ -1059,7 +1511,7 @@ export class CodexService implements OnModuleInit {
    * Send a non-streaming message through Codex.
    */
   async sendClaudeMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
-    return this.executeWithCooldownRetry(dto, false)
+    return this.executeWithCooldownRetry(dto, 1)
   }
 
   /**
@@ -1068,8 +1520,11 @@ export class CodexService implements OnModuleInit {
    */
   private async executeWithCooldownRetry(
     dto: CreateMessageDto,
-    isRetry: boolean,
-    slot: CodexAccountSlot = this.selectRequestSlot(dto.model)
+    attempt: number = 1,
+    slot: CodexAccountSlot = this.selectRequestSlot(
+      dto.model,
+      this.getConversationId(dto)
+    )
   ): Promise<AnthropicResponse> {
     const modelName = dto.model
     const token = await this.getBearerToken(slot)
@@ -1078,6 +1533,7 @@ export class CodexService implements OnModuleInit {
         "Codex backend not configured: no API key or access token"
       )
     }
+    this.bindConversationToSlot(this.getConversationId(dto), slot)
 
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
     let codexRequest = translateClaudeToCodex(dto, modelName) as Record<
@@ -1110,11 +1566,35 @@ export class CodexService implements OnModuleInit {
           )
         } catch (e) {
           if (e instanceof CodexWebSocketUpgradeError) {
-            if (e.shouldFallbackToHttp()) {
+            if (
+              !this.isApiKeyMode(slot) &&
+              this.isDeactivatedWorkspaceError(e.body)
+            ) {
+              this.logger.warn(
+                `[Codex] WebSocket returned deactivated_workspace for ${this.getAccountLabel(slot)}, retrying over HTTP without Chatgpt-Account-Id`
+              )
+              result = await this.sendViaHttp(
+                slot,
+                token,
+                codexRequest,
+                modelName,
+                reverseToolMap,
+                cacheId,
+                true
+              )
+            } else if (e.shouldFallbackToHttp()) {
               this.logger.warn(
                 "WebSocket upgrade rejected, falling back to HTTP"
               )
               this.webSocketRejected = true
+              result = await this.sendViaHttp(
+                slot,
+                token,
+                codexRequest,
+                modelName,
+                reverseToolMap,
+                cacheId
+              )
             } else {
               throw this.createCodexApiError(
                 e.statusCode || 502,
@@ -1124,15 +1604,6 @@ export class CodexService implements OnModuleInit {
           } else {
             throw e
           }
-          // Fallback to HTTP after WebSocket rejection
-          result = await this.sendViaHttp(
-            slot,
-            token,
-            codexRequest,
-            modelName,
-            reverseToolMap,
-            cacheId
-          )
         }
       } else {
         result = await this.sendViaHttp(
@@ -1161,14 +1632,14 @@ export class CodexService implements OnModuleInit {
           this.getAccountLabel(slot)
         )
 
-        // Auto-retry once on 429 if another account is available
-        if (statusCode === 429 && !isRetry && this.accounts.length > 1) {
+        // Auto-retry on 429 if another account is available
+        if (statusCode === 429 && attempt < this.accounts.length) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
             this.logger.log(
-              `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying with ${this.getAccountLabel(nextSlot)}`
+              `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying with ${this.getAccountLabel(nextSlot)} (attempt ${attempt + 1}/${this.accounts.length})`
             )
-            return this.executeWithCooldownRetry(dto, true, nextSlot)
+            return this.executeWithCooldownRetry(dto, attempt + 1, nextSlot)
           }
         }
       }
@@ -1185,12 +1656,16 @@ export class CodexService implements OnModuleInit {
     codexRequest: Record<string, unknown>,
     modelName: string,
     reverseToolMap: Map<string, string>,
-    cacheId: string
+    cacheId: string,
+    omitAccountId: boolean = false
   ): Promise<AnthropicResponse> {
+    const requestStartedAt = Date.now()
     const requestBody = JSON.stringify(codexRequest)
     const url = this.buildUrl(slot, "responses")
-    const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
-    const headers = this.buildHeaders(slot, token, true, cacheHeaders)
+    const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
+    const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
+      omitAccountId,
+    })
 
     this.logger.log(
       `[Codex] Non-stream request: model=${modelName}, url=${url}`
@@ -1216,10 +1691,30 @@ export class CodexService implements OnModuleInit {
         `[Codex] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
 
+      if (
+        !omitAccountId &&
+        !this.isApiKeyMode(slot) &&
+        this.isDeactivatedWorkspaceError(errorBody)
+      ) {
+        this.logger.warn(
+          `[Codex] deactivated_workspace for ${this.getAccountLabel(slot)}, retrying without Chatgpt-Account-Id`
+        )
+        return this.sendViaHttp(
+          slot,
+          token,
+          codexRequest,
+          modelName,
+          reverseToolMap,
+          cacheId,
+          true
+        )
+      }
+
       throw this.createCodexApiError(response.status, errorBody)
     }
 
     // Read the full SSE stream and find response.completed
+    this.captureCodexRateLimitHeaders(response.headers, slot)
     const fullBody = await response.text()
     const lines = fullBody.split("\n")
 
@@ -1233,6 +1728,14 @@ export class CodexService implements OnModuleInit {
       try {
         const event = JSON.parse(jsonStr) as Record<string, unknown>
         if (event.type === "response.completed") {
+          this.logCodexUsage(
+            "http",
+            modelName,
+            cacheId,
+            slot,
+            event,
+            requestStartedAt
+          )
           const result = translateCodexToClaudeNonStream(event, reverseToolMap)
           if (result) {
             this.logger.log(
@@ -1260,9 +1763,10 @@ export class CodexService implements OnModuleInit {
     reverseToolMap: Map<string, string>,
     cacheId: string
   ): Promise<AnthropicResponse> {
+    const requestStartedAt = Date.now()
     const httpUrl = this.buildUrl(slot, "responses")
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
-    const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
+    const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
       this.isApiKeyMode(slot),
@@ -1283,6 +1787,14 @@ export class CodexService implements OnModuleInit {
     try {
       const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
       const completedEvent = await this.wsService.sendViaWebSocket(ws, wsBody)
+      this.logCodexUsage(
+        "websocket",
+        modelName,
+        cacheId,
+        slot,
+        completedEvent as Record<string, unknown>,
+        requestStartedAt
+      )
 
       const result = translateCodexToClaudeNonStream(
         completedEvent as Record<string, unknown>,
@@ -1310,13 +1822,16 @@ export class CodexService implements OnModuleInit {
   async *sendClaudeMessageStream(
     dto: CreateMessageDto
   ): AsyncGenerator<string, void, unknown> {
-    yield* this.executeStreamWithCooldownRetry(dto, false)
+    yield* this.executeStreamWithCooldownRetry(dto, 1)
   }
 
   private async *executeStreamWithCooldownRetry(
     dto: CreateMessageDto,
-    isRetry: boolean,
-    slot: CodexAccountSlot = this.selectRequestSlot(dto.model)
+    attempt: number = 1,
+    slot: CodexAccountSlot = this.selectRequestSlot(
+      dto.model,
+      this.getConversationId(dto)
+    )
   ): AsyncGenerator<string, void, unknown> {
     const modelName = dto.model
     const token = await this.getBearerToken(slot)
@@ -1325,6 +1840,7 @@ export class CodexService implements OnModuleInit {
         "Codex backend not configured: no API key or access token"
       )
     }
+    this.bindConversationToSlot(this.getConversationId(dto), slot)
 
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
     let codexRequest = translateClaudeToCodex(dto, modelName) as Record<
@@ -1362,6 +1878,29 @@ export class CodexService implements OnModuleInit {
           return
         } catch (e) {
           if (e instanceof CodexWebSocketUpgradeError) {
+            if (
+              !this.isApiKeyMode(slot) &&
+              this.isDeactivatedWorkspaceError(e.body)
+            ) {
+              this.logger.warn(
+                `[Codex] WebSocket returned deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream over HTTP without Chatgpt-Account-Id`
+              )
+              for await (const event of this.streamViaHttp(
+                slot,
+                token,
+                codexRequest,
+                modelName,
+                reverseToolMap,
+                cacheId,
+                true
+              )) {
+                emittedEvents = true
+                yield event
+              }
+              markAccountSuccess(slot, modelName)
+              return
+            }
+
             if (e.shouldFallbackToHttp()) {
               this.logger.warn(
                 "WebSocket upgrade rejected, falling back to HTTP for streaming"
@@ -1402,18 +1941,22 @@ export class CodexService implements OnModuleInit {
           this.getAccountLabel(slot)
         )
 
+        // Auto-retry on 429 if another account is available
         if (
           statusCode === 429 &&
-          !isRetry &&
-          !emittedEvents &&
-          this.accounts.length > 1
+          attempt < this.accounts.length &&
+          !emittedEvents
         ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
             this.logger.log(
-              `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying streamed request with ${this.getAccountLabel(nextSlot)}`
+              `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying streamed request with ${this.getAccountLabel(nextSlot)} (attempt ${attempt + 1}/${this.accounts.length})`
             )
-            yield* this.executeStreamWithCooldownRetry(dto, true, nextSlot)
+            yield* this.executeStreamWithCooldownRetry(
+              dto,
+              attempt + 1,
+              nextSlot
+            )
             return
           }
         }
@@ -1431,12 +1974,16 @@ export class CodexService implements OnModuleInit {
     codexRequest: Record<string, unknown>,
     modelName: string,
     reverseToolMap: Map<string, string>,
-    cacheId: string
+    cacheId: string,
+    omitAccountId: boolean = false
   ): AsyncGenerator<string, void, unknown> {
+    const requestStartedAt = Date.now()
     const requestBody = JSON.stringify(codexRequest)
     const url = this.buildUrl(slot, "responses")
-    const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
-    const headers = this.buildHeaders(slot, token, true, cacheHeaders)
+    const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
+    const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
+      omitAccountId,
+    })
 
     this.logger.log(`[Codex] Stream request: model=${modelName}, url=${url}`)
 
@@ -1460,12 +2007,35 @@ export class CodexService implements OnModuleInit {
         `[Codex] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
 
+      if (
+        !omitAccountId &&
+        !this.isApiKeyMode(slot) &&
+        this.isDeactivatedWorkspaceError(errorBody)
+      ) {
+        this.logger.warn(
+          `[Codex] deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream without Chatgpt-Account-Id`
+        )
+        yield* this.streamViaHttp(
+          slot,
+          token,
+          codexRequest,
+          modelName,
+          reverseToolMap,
+          cacheId,
+          true
+        )
+        return
+      }
+
       throw this.createCodexApiError(response.status, errorBody)
     }
 
     if (!response.body) {
       throw new Error("Codex response has no body")
     }
+
+    // Capture rate-limit headers from successful response
+    this.captureCodexRateLimitHeaders(response.headers, slot)
 
     // Stream SSE events
     const state = createStreamState()
@@ -1487,6 +2057,15 @@ export class CodexService implements OnModuleInit {
           const trimmed = line.trim()
           if (!trimmed) continue
 
+          this.logCodexUsage(
+            "http",
+            modelName,
+            cacheId,
+            slot,
+            this.parseCodexSsePayload(trimmed),
+            requestStartedAt
+          )
+
           const claudeEvents = translateCodexSseEvent(
             trimmed,
             state,
@@ -1500,6 +2079,14 @@ export class CodexService implements OnModuleInit {
 
       // Process remaining buffer
       if (buffer.trim()) {
+        this.logCodexUsage(
+          "http",
+          modelName,
+          cacheId,
+          slot,
+          this.parseCodexSsePayload(buffer.trim()),
+          requestStartedAt
+        )
         const claudeEvents = translateCodexSseEvent(
           buffer.trim(),
           state,
@@ -1531,9 +2118,10 @@ export class CodexService implements OnModuleInit {
     reverseToolMap: Map<string, string>,
     cacheId: string
   ): AsyncGenerator<string, void, unknown> {
+    const requestStartedAt = Date.now()
     const httpUrl = this.buildUrl(slot, "responses")
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
-    const cacheHeaders = this.cacheService.buildCacheHeaders(cacheId)
+    const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
       this.isApiKeyMode(slot),
@@ -1557,6 +2145,15 @@ export class CodexService implements OnModuleInit {
       const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
 
       for await (const msg of this.wsService.streamViaWebSocket(ws, wsBody)) {
+        this.logCodexUsage(
+          "websocket",
+          modelName,
+          cacheId,
+          slot,
+          msg as Record<string, unknown>,
+          requestStartedAt
+        )
+
         // Convert WebSocket message to SSE line for the translator
         const sseLine = `data: ${JSON.stringify(msg)}`
         const claudeEvents = translateCodexSseEvent(
@@ -1577,6 +2174,83 @@ export class CodexService implements OnModuleInit {
     )
   }
 
+  // ── Rate Limit Header Parsing ───────────────────────────────────────
+
+  /**
+   * Parse x-codex-* rate limit headers from Codex API responses.
+   * Headers follow the pattern:
+   *   x-codex-primary-used-percent / x-codex-primary-window-minutes / x-codex-primary-reset-at
+   *   x-codex-secondary-used-percent / x-codex-secondary-window-minutes / x-codex-secondary-reset-at
+   */
+  private captureCodexRateLimitHeaders(
+    headers: Headers,
+    slot: CodexAccountSlot
+  ): void {
+    try {
+      const primary = this.parseRateLimitWindow(headers, "primary")
+      const secondary = this.parseRateLimitWindow(headers, "secondary")
+
+      if (!primary && !secondary) {
+        return
+      }
+
+      const snapshot: CodexRateLimitSnapshot = {
+        updatedAt: Date.now(),
+      }
+      if (primary) {
+        snapshot.primary = primary
+      }
+      if (secondary) {
+        snapshot.secondary = secondary
+      }
+
+      slot.rateLimits = snapshot
+
+      const label = this.getAccountLabel(slot)
+      const parts: string[] = []
+      if (primary) {
+        const left = Math.max(0, 100 - primary.usedPercent).toFixed(0)
+        parts.push(`5h=${left}% left`)
+      }
+      if (secondary) {
+        const left = Math.max(0, 100 - secondary.usedPercent).toFixed(0)
+        parts.push(`weekly=${left}% left`)
+      }
+      this.logger.log(`[Codex][RateLimit] ${label}: ${parts.join(", ")}`)
+    } catch {
+      // Non-critical: silently ignore parse failures
+    }
+  }
+
+  private parseRateLimitWindow(
+    headers: Headers,
+    tier: "primary" | "secondary"
+  ): CodexRateLimitWindow | null {
+    const usedPercentStr = headers.get(`x-codex-${tier}-used-percent`)
+    if (!usedPercentStr) {
+      return null
+    }
+
+    const usedPercent = parseFloat(usedPercentStr)
+    if (!Number.isFinite(usedPercent)) {
+      return null
+    }
+
+    const windowMinutesStr = headers.get(`x-codex-${tier}-window-minutes`)
+    const windowMinutes = windowMinutesStr
+      ? parseInt(windowMinutesStr, 10)
+      : null
+
+    const resetsAtStr = headers.get(`x-codex-${tier}-reset-at`)
+    const resetsAt = resetsAtStr ? parseInt(resetsAtStr, 10) : null
+
+    return {
+      usedPercent,
+      windowMinutes: Number.isFinite(windowMinutes) ? windowMinutes : null,
+      resetsAt: Number.isFinite(resetsAt) ? resetsAt : null,
+    }
+  }
+
   // ── Availability ─────────────────────────────────────────────────────
 
   /**
@@ -1584,5 +2258,134 @@ export class CodexService implements OnModuleInit {
    */
   checkAvailability(): Promise<boolean> {
     return Promise.resolve(this.isAvailable())
+  }
+
+  // ── Rate Limit Probing ────────────────────────────────────────────────
+
+  /**
+   * Probe rate limits for accounts.
+   * When force=false (default), only probes accounts without existing data.
+   * When force=true, re-probes all non-disabled accounts to refresh data.
+   *
+   * Sends a lightweight completions request with max_output_tokens=1 and
+   * immediately aborts the stream to capture x-codex-* rate limit headers.
+   */
+  async probeRateLimits(force = false): Promise<number> {
+    const slotsToProbe = this.accounts.filter(
+      (slot) => (force || !slot.rateLimits) && !isAccountDisabled(slot)
+    )
+
+    if (slotsToProbe.length === 0) {
+      return 0
+    }
+
+    this.logger.log(
+      `[Codex] Probing rate limits for ${slotsToProbe.length} account(s)...`
+    )
+
+    let probed = 0
+
+    // Probe sequentially to avoid parallel token refresh races
+    for (const slot of slotsToProbe) {
+      const label = this.getAccountLabel(slot)
+      try {
+        let token = await this.getBearerToken(slot)
+        if (!token) {
+          this.logger.warn(
+            `[Codex] Probe skipped for ${label}: no bearer token`
+          )
+          continue
+        }
+
+        // Send the smallest valid streaming responses request we can. The
+        // ChatGPT Codex backend rejects max_output_tokens on this endpoint, but
+        // it still returns x-codex-* headers on the initial 200 response.
+        // Abort immediately after headers are captured to avoid spending quota.
+        const agent = this.buildProxyAgent(slot)
+
+        const doProbe = async (bearerToken: string): Promise<Response> => {
+          const abortController = new AbortController()
+          const timeout = setTimeout(() => abortController.abort(), 15_000)
+          const url = this.buildUrl(slot, "responses")
+          const headers = this.buildHeaders(slot, bearerToken, true)
+          const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              model: "gpt-5-codex-mini",
+              instructions: "",
+              input: [
+                {
+                  type: "message",
+                  role: "user",
+                  content: [{ type: "input_text", text: "." }],
+                },
+              ],
+              stream: true,
+              store: false,
+              parallel_tool_calls: false,
+              reasoning: { effort: "low", summary: "auto" },
+            }),
+            signal: abortController.signal,
+          }
+          if (agent) {
+            fetchOptions.dispatcher = agent
+          }
+          const resp = await fetch(url, fetchOptions)
+          // Capture rate limit headers BEFORE aborting the stream
+          this.captureCodexRateLimitHeaders(resp.headers, slot)
+          // Now abort the stream to avoid generating output
+          abortController.abort()
+          clearTimeout(timeout)
+          return resp
+        }
+
+        const response = await doProbe(token)
+
+        // If 401/403, force token refresh and retry once
+        if (
+          (response.status === 401 || response.status === 403) &&
+          slot.tokenData?.refreshToken
+        ) {
+          this.logger.log(
+            `[Codex] Probe ${label}: forcing token refresh after HTTP ${response.status}`
+          )
+          try {
+            const refreshed = await this.authService.refreshTokensWithRetry(
+              slot.tokenData.refreshToken,
+              2,
+              { persist: false, updateState: false }
+            )
+            this.applyTokenDataToSlot(slot, refreshed)
+            this.persistSlotTokens(slot)
+            if (refreshed.accessToken) {
+              token = refreshed.accessToken
+              await doProbe(token)
+            }
+          } catch (refreshErr) {
+            this.logger.warn(
+              `[Codex] Probe ${label}: token refresh failed: ${(refreshErr as Error).message}`
+            )
+          }
+        }
+
+        // Headers were already captured inside doProbe before abort
+        if (slot.rateLimits) {
+          this.logger.log(`[Codex] Probe ${label}: rate limits captured`)
+        } else {
+          this.logger.warn(
+            `[Codex] Probe ${label}: no x-codex-* headers in response (HTTP ${response.status})`
+          )
+        }
+        probed++
+      } catch (err) {
+        this.logger.warn(
+          `[Codex] Rate limit probe failed for ${label}: ${(err as Error).message}`
+        )
+      }
+    }
+
+    this.logger.log(`[Codex] Rate limit probe completed: ${probed} account(s)`)
+    return probed
   }
 }

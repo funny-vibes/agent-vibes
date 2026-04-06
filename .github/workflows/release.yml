@@ -9,8 +9,27 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  # ── Build SEA binaries on each platform ────────────────────────────
+  build-sea:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon (M1+)
+            platform: darwin
+            arch: arm64
+          - os: macos-13 # Intel Mac
+            platform: darwin
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
 
@@ -18,29 +37,265 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: cd apps/protocol-bridge && npm run build
+      - name: Build SEA binary (Unix)
+        if: runner.os != 'Windows'
+        working-directory: apps/protocol-bridge
+        run: bash scripts/build-sea.sh --clean
 
-      - name: Create release tarball
+      - name: Build SEA binary (Windows)
+        if: runner.os == 'Windows'
+        working-directory: apps/protocol-bridge
+        shell: pwsh
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          tar -czf agent-vibes-${VERSION}.tar.gz \
-            --exclude='node_modules' \
-            --exclude='.git' \
-            --exclude='.history' \
-            --exclude='scripts/capture/traffic_dumps' \
-            --exclude='apps/protocol-bridge/certs' \
-            --exclude='apps/protocol-bridge/.env.local' \
-            --exclude='apps/protocol-bridge/data/accounts.json' \
-            .
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          # Windows SEA build (PowerShell equivalent of build-sea.sh)
+          node esbuild.sea.js
+
+          # Sync migration assets
+          $srcMigrations = "src\persistence\migrations"
+          $dstMigrations = "dist\persistence\migrations"
+          New-Item -ItemType Directory -Force -Path $dstMigrations | Out-Null
+          Copy-Item "$srcMigrations\*.sql" $dstMigrations -Force
+          $migrationCount = (Get-ChildItem "$dstMigrations\*.sql").Count
+          Write-Host "Synced $migrationCount migration(s)"
+
+          # Generate SEA config from dist migrations
+          node scripts/generate-sea-config.mjs
+          node --experimental-sea-config dist/sea-config.generated.json
+
+          $nodeBin = (Get-Command node).Source
+          $binaryName = "agent-vibes-bridge-win32-x64.exe"
+          Copy-Item $nodeBin "dist\$binaryName"
+
+          npx -y postject "dist\$binaryName" NODE_SEA_BLOB dist\sea-prep.blob `
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+
+          $size = (Get-Item "dist\$binaryName").Length / 1MB
+          Write-Host "✅ SEA binary ready: dist\$binaryName ($([math]::Round($size))MB)"
+
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
+        working-directory: apps/protocol-bridge
+        run: |
+          BINARY=$(ls dist/agent-vibes-bridge-* | head -1)
+          chmod +x "$BINARY"
+          # Start server, wait 5s, check health, then kill
+          PORT=19999 USE_HTTP2=false "$BINARY" &
+          PID=$!
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:19999/health || echo "000")
+          kill $PID 2>/dev/null || true
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Health check failed (HTTP $STATUS)"
+            exit 1
+          fi
+          echo "✅ Smoke test passed"
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: apps/protocol-bridge
+        shell: pwsh
+        run: |
+          $binary = "dist\agent-vibes-bridge-win32-x64.exe"
+          $env:PORT = "19999"
+          $env:USE_HTTP2 = "false"
+          $proc = Start-Process -FilePath $binary -PassThru -NoNewWindow
+          Start-Sleep -Seconds 5
+          try {
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:19999/health" -UseBasicParsing -TimeoutSec 5
+            if ($response.StatusCode -eq 200) {
+              Write-Host "✅ Smoke test passed"
+            } else {
+              Write-Host "❌ Health check failed (HTTP $($response.StatusCode))"
+              exit 1
+            }
+          } catch {
+            Write-Host "❌ Health check failed: $_"
+            exit 1
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-${{ matrix.platform }}-${{ matrix.arch }}
+          path: apps/protocol-bridge/dist/agent-vibes-bridge-*
+          retention-days: 7
+
+  # ── Build platform-specific VS Code extensions ──────────────────────
+  build-extension:
+    needs: build-sea
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download all bridge artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bridge-binaries
+          merge-multiple: true
+
+      - name: Place bridge binaries for each platform
+        working-directory: apps/vscode-extension
+        run: |
+          declare -A PLATFORM_MAP=(
+            ["darwin-arm64"]=""
+            ["darwin-x64"]=""
+            ["linux-x64"]=""
+            ["win32-x64"]=".exe"
+          )
+
+          for target in "${!PLATFORM_MAP[@]}"; do
+            ext="${PLATFORM_MAP[$target]}"
+            dir="bridge/${target}"
+            mkdir -p "$dir"
+
+            # Find the matching binary from downloaded artifacts
+            src=$(find ../../bridge-binaries -name "agent-vibes-bridge-${target}*" -type f | head -1)
+            if [[ -z "$src" ]]; then
+              echo "❌ No bridge binary found for ${target}"
+              exit 1
+            fi
+
+            cp "$src" "${dir}/agent-vibes-bridge${ext}"
+            [[ -z "$ext" ]] && chmod +x "${dir}/agent-vibes-bridge"
+
+            # Copy worker.js
+            cp ../protocol-bridge/src/llm/native/worker.js "${dir}/worker.js"
+            echo "✅ ${target}: $(du -sh "${dir}/agent-vibes-bridge${ext}" | cut -f1)"
+          done
+
+      - name: Build extension code
+        run: |
+          npm --workspace apps/chatgpt-register run build
+          node apps/vscode-extension/esbuild.config.mjs --production
+
+      - name: Sync assets
+        working-directory: apps/vscode-extension
+        run: |
+          node scripts/sync-chatgpt-register-assets.mjs
+          node scripts/sync-readme.mjs
+
+      - name: Package platform-specific extensions
+        working-directory: apps/vscode-extension
+        run: |
+          TARGETS=("darwin-arm64" "darwin-x64" "linux-x64" "win32-x64")
+          for target in "${TARGETS[@]}"; do
+            echo "📦 Packaging for ${target}..."
+
+            # Keep only the target platform's bridge directory
+            for other in "${TARGETS[@]}"; do
+              if [[ "$other" != "$target" ]]; then
+                rm -rf "bridge/${other}"
+              fi
+            done
+
+            npx @vscode/vsce package --no-dependencies --target "$target"
+
+            # Restore all bridge directories for next iteration
+            for other in "${TARGETS[@]}"; do
+              if [[ "$other" != "$target" && -d "../../bridge-binaries" ]]; then
+                ext=""
+                [[ "$other" == "win32-x64" ]] && ext=".exe"
+                dir="bridge/${other}"
+                mkdir -p "$dir"
+                src=$(find ../../bridge-binaries -name "agent-vibes-bridge-${other}*" -type f | head -1)
+                [[ -n "$src" ]] && cp "$src" "${dir}/agent-vibes-bridge${ext}"
+                [[ -z "$ext" && -f "${dir}/agent-vibes-bridge" ]] && chmod +x "${dir}/agent-vibes-bridge"
+                cp ../protocol-bridge/src/llm/native/worker.js "${dir}/worker.js"
+              fi
+            done
+          done
+          echo ""
+          ls -lh *.vsix
+
+      - name: Upload extension artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-all-platforms
+          path: apps/vscode-extension/*.vsix
+          retention-days: 7
+
+  # ── Create GitHub Release with all binaries ────────────────────────
+  release:
+    needs: [build-sea, build-extension]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bridge binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          pattern: bridge-*
+          merge-multiple: true
+
+      - name: Download extension packages
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix-all-platforms
+          path: extensions
+
+      - name: List release assets
+        run: |
+          echo "── Bridge binaries ──"
+          ls -lh binaries/
+          echo ""
+          echo "── VS Code extensions ──"
+          ls -lh extensions/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: agent-vibes-${{ env.VERSION }}.tar.gz
+          files: |
+            binaries/agent-vibes-bridge-*
+            extensions/*.vsix
           generate_release_notes: true
+          body: |
+            ## Agent Vibes
+
+            ### VS Code Extension (.vsix)
+
+            Install directly in Cursor / VS Code:
+            ```bash
+            cursor --install-extension agent-vibes-<platform>-<version>.vsix --force
+            ```
+
+            | Platform | Extension |
+            |----------|-----------|
+            | macOS Apple Silicon | `agent-vibes-darwin-arm64-*.vsix` |
+            | macOS Intel | `agent-vibes-darwin-x64-*.vsix` |
+            | Linux x64 | `agent-vibes-linux-x64-*.vsix` |
+            | Windows x64 | `agent-vibes-win32-x64-*.vsix` |
+
+            ### Protocol Bridge Standalone Binaries
+
+            | Platform | Binary |
+            |----------|--------|
+            | macOS Apple Silicon | `agent-vibes-bridge-darwin-arm64` |
+            | macOS Intel | `agent-vibes-bridge-darwin-x64` |
+            | Linux x64 | `agent-vibes-bridge-linux-x64` |
+            | Windows x64 | `agent-vibes-bridge-win32-x64.exe` |
+
+            ```bash
+            # Standalone install (macOS/Linux)
+            mkdir -p ~/.agent-vibes/bin
+            cp agent-vibes-bridge-* ~/.agent-vibes/bin/agent-vibes-bridge
+            chmod +x ~/.agent-vibes/bin/agent-vibes-bridge
+            ```

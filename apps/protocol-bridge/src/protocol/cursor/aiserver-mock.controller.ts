@@ -118,7 +118,11 @@ export class AiserverMockController {
     }
 
     if (resolved.family === "gpt") {
-      return this.isGptBackendAvailable()
+      if (this.openaiCompatService.isAvailable()) {
+        return true
+      }
+
+      return this.codexService.supportsModel(modelId)
     }
 
     if (resolved.family === "gemini") {
@@ -134,6 +138,35 @@ export class AiserverMockController {
         canPublicClaudeModelUseGoogle(modelId) &&
         this.googleModelCache.isValidModel(resolved.cloudCodeId))
     )
+  }
+
+  private deriveLocalTabName(userRequest: string): string {
+    const normalized = userRequest.replace(/\s+/g, " ").trim()
+    if (!normalized) {
+      return ""
+    }
+
+    const firstLine = normalized.split("\n")[0]?.trim() || ""
+    if (!firstLine) {
+      return ""
+    }
+
+    const cleaned = firstLine
+      .replace(/[`*_#>[\](){}]/g, " ")
+      .replace(/[“”"'`]+/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[.。,，!！?？;；:：]+$/g, "")
+
+    if (!cleaned) {
+      return ""
+    }
+
+    if (/[\u3400-\u9fff]/.test(cleaned)) {
+      return cleaned.replace(/\s+/g, "").slice(0, 16)
+    }
+
+    return cleaned.split(/\s+/).slice(0, 6).join(" ").slice(0, 80).trim()
   }
 
   private buildCursorModels(req?: FastifyRequest) {
@@ -458,22 +491,18 @@ export class AiserverMockController {
   }
 
   @Post("aiserver.v1.AiService/NameTab")
-  async handleNameTab(
-    @Req() req: FastifyRequest,
-    @Res() res: FastifyReply
-  ): Promise<void> {
+  handleNameTab(@Req() req: FastifyRequest, @Res() res: FastifyReply): void {
     try {
       const body = req.body as Buffer | undefined
       if (body && body.length > 0) {
         const tabReq = fromBinary(NameTabRequestSchema, body)
 
-        // Convert proto ConversationMessage[] → Cloud Code contents format
-        const contents = tabReq.messages
-          .filter((m) => m.text.trim().length > 0)
-          .map((m) => ({ role: "user" as const, parts: [{ text: m.text }] }))
+        const firstUserMessage = tabReq.messages.find(
+          (m) => m.text.trim().length > 0
+        )
 
-        if (contents.length > 0) {
-          const tabName = await this.googleService.generateTabName(contents)
+        if (firstUserMessage) {
+          const tabName = this.deriveLocalTabName(firstUserMessage.text)
           if (tabName) {
             const response = create(NameTabResponseSchema, {
               name: tabName,

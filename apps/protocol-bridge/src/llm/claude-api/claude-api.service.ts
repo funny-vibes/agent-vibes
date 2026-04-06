@@ -7,12 +7,10 @@ import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse } from "../../shared/anthropic"
+import { UsageStatsService } from "../../usage/usage-stats.service"
 import { applyPromptCachingOptimizations } from "./prompt-caching"
-import {
-  getAccountConfigPathCandidates,
-  resolveLegacyAccountStatePath as resolveLegacyAccountStateJsonPath,
-  resolveRuntimeDataPath,
-} from "../../shared/protocol-bridge-paths"
+import { getAccountConfigPathCandidates } from "../../shared/protocol-bridge-paths"
+import { PersistenceService } from "../../persistence"
 import {
   type CursorDisplayModel,
   detectModelFamily,
@@ -28,7 +26,6 @@ import {
   markAccountSuccess,
 } from "../shared/account-cooldown"
 import {
-  BACKEND_ACCOUNT_STATE_DB_FILENAME,
   BackendAccountStateStore,
   type PersistedBackendAccountState,
 } from "../shared/backend-account-state-store"
@@ -156,18 +153,18 @@ export class ClaudeApiService implements OnModuleInit {
   private accountIndex = 0
   private forceModelPrefix = false
   private accountsConfigPath: string | null = null
-  private accountStatePath: string = resolveRuntimeDataPath(
-    BACKEND_ACCOUNT_STATE_DB_FILENAME
-  )
-  private legacyAccountStatePath: string = resolveLegacyAccountStateJsonPath(
-    "claude-api-account-state.json"
-  )
-  private accountStateStore = new BackendAccountStateStore(
-    this.accountStatePath,
-    this.logger
-  )
+  private accountStateStore: BackendAccountStateStore
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly persistence: PersistenceService,
+    private readonly usageStats: UsageStatsService
+  ) {
+    this.accountStateStore = new BackendAccountStateStore(
+      this.persistence,
+      this.logger
+    )
+  }
 
   async onModuleInit(): Promise<void> {
     const fileAccounts = this.loadAllAccountsFromFile()
@@ -421,15 +418,20 @@ export class ClaudeApiService implements OnModuleInit {
       configured: this.accounts.length > 0,
       total: entries.length,
       available: entries.filter(
-        (entry) => entry.state === "ready" || entry.state === "degraded"
+        (entry) =>
+          entry.state === "ready" ||
+          entry.state === "degraded" ||
+          entry.state === "model_cooldown"
       ).length,
       ready: entries.filter((entry) => entry.state === "ready").length,
       degraded: entries.filter((entry) => entry.state === "degraded").length,
+      modelCooldown: entries.filter((entry) => entry.state === "model_cooldown")
+        .length,
       cooling: entries.filter((entry) => entry.state === "cooldown").length,
       disabled: entries.filter((entry) => entry.state === "disabled").length,
       unavailable: 0,
       configPath: this.accountsConfigPath,
-      statePath: this.accountStatePath,
+      statePath: "~/.agent-vibes/pgdata/agent-vibes.db",
       entries,
     }
   }
@@ -609,6 +611,7 @@ export class ClaudeApiService implements OnModuleInit {
     attemptedCandidates: Set<string>,
     candidate: ClaudeApiCandidate = this.nextCandidate(dto.model)
   ): Promise<AnthropicResponse> {
+    const requestStartedAt = Date.now()
     attemptedCandidates.add(this.buildCandidateKey(candidate))
     const request = this.buildRequestBody(dto, candidate)
     const url = this.buildMessagesUrl(candidate.account.baseUrl)
@@ -664,6 +667,12 @@ export class ClaudeApiService implements OnModuleInit {
 
       const result = (await response.json()) as AnthropicResponse
       this.markAccountHealthy(candidate.account, candidate.upstreamModel)
+      this.recordClaudeApiUsage(
+        candidate,
+        "messages",
+        result.usage as Record<string, unknown> | null | undefined,
+        requestStartedAt
+      )
       return result
     } catch (error) {
       const nextCandidate = this.shouldRetryWithNextCandidate(
@@ -694,6 +703,7 @@ export class ClaudeApiService implements OnModuleInit {
     attemptedCandidates: Set<string>,
     candidate: ClaudeApiCandidate = this.nextCandidate(dto.model)
   ): AsyncGenerator<string, void, unknown> {
+    const requestStartedAt = Date.now()
     attemptedCandidates.add(this.buildCandidateKey(candidate))
     const request = this.buildRequestBody(dto, candidate)
     const url = this.buildMessagesUrl(candidate.account.baseUrl)
@@ -775,6 +785,13 @@ export class ClaudeApiService implements OnModuleInit {
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
+      const streamUsage = {
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        outputTokens: 0,
+        webSearchRequests: 0,
+      }
 
       try {
         while (true) {
@@ -797,6 +814,7 @@ export class ClaudeApiService implements OnModuleInit {
             const chunk = buffer.slice(0, boundary + 2)
             buffer = buffer.slice(boundary + 2)
             emittedEvents = true
+            this.mergeClaudeStreamUsage(streamUsage, chunk)
             yield chunk.endsWith("\n\n") ? chunk : `${chunk}\n\n`
             boundary = buffer.indexOf("\n\n")
           }
@@ -805,10 +823,25 @@ export class ClaudeApiService implements OnModuleInit {
         const trailing = buffer.trim()
         if (trailing) {
           emittedEvents = true
+          this.mergeClaudeStreamUsage(streamUsage, trailing)
           yield trailing.endsWith("\n\n") ? trailing : `${trailing}\n\n`
         }
 
         this.markAccountHealthy(candidate.account, candidate.upstreamModel)
+        this.recordClaudeApiUsage(
+          candidate,
+          "messages",
+          {
+            input_tokens: streamUsage.inputTokens,
+            cache_read_input_tokens: streamUsage.cachedInputTokens,
+            cache_creation_input_tokens: streamUsage.cacheCreationInputTokens,
+            output_tokens: streamUsage.outputTokens,
+            server_tool_use: {
+              web_search_requests: streamUsage.webSearchRequests,
+            },
+          },
+          requestStartedAt
+        )
         return
       } catch (error) {
         this.markAccountTemporaryFailure(
@@ -911,6 +944,190 @@ export class ClaudeApiService implements OnModuleInit {
     )
   }
 
+  private recordClaudeApiUsage(
+    candidate: ClaudeApiCandidate,
+    transport: string,
+    usage:
+      | {
+          input_tokens?: number
+          cache_read_input_tokens?: number
+          cache_creation_input_tokens?: number
+          output_tokens?: number
+          server_tool_use?: {
+            web_search_requests?: number
+          }
+        }
+      | Record<string, unknown>
+      | null
+      | undefined,
+    requestStartedAt?: number
+  ): void {
+    const usageRecord =
+      usage && typeof usage === "object"
+        ? (usage as Record<string, unknown>)
+        : null
+    const serverToolUse =
+      usageRecord?.server_tool_use &&
+      typeof usageRecord.server_tool_use === "object"
+        ? (usageRecord.server_tool_use as Record<string, unknown>)
+        : null
+    this.usageStats.recordClaudeApiUsage({
+      transport,
+      modelName: candidate.upstreamModel,
+      accountKey: candidate.account.stateKey,
+      accountLabel: candidate.account.label || candidate.account.baseUrl,
+      inputTokens:
+        typeof usageRecord?.input_tokens === "number"
+          ? usageRecord.input_tokens
+          : 0,
+      cachedInputTokens:
+        typeof usageRecord?.cache_read_input_tokens === "number"
+          ? usageRecord.cache_read_input_tokens
+          : 0,
+      cacheCreationInputTokens:
+        typeof usageRecord?.cache_creation_input_tokens === "number"
+          ? usageRecord.cache_creation_input_tokens
+          : 0,
+      outputTokens:
+        typeof usageRecord?.output_tokens === "number"
+          ? usageRecord.output_tokens
+          : 0,
+      webSearchRequests:
+        typeof serverToolUse?.web_search_requests === "number"
+          ? serverToolUse.web_search_requests
+          : 0,
+      durationMs:
+        typeof requestStartedAt === "number"
+          ? Math.max(0, Date.now() - requestStartedAt)
+          : 0,
+    })
+  }
+
+  private mergeClaudeStreamUsage(
+    target: {
+      inputTokens: number
+      cachedInputTokens: number
+      cacheCreationInputTokens: number
+      outputTokens: number
+      webSearchRequests: number
+    },
+    chunk: string
+  ): void {
+    const lines = chunk.split("\n")
+    let eventType = ""
+    let dataLine = ""
+
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        eventType = line.slice(6).trim()
+      } else if (line.startsWith("data:")) {
+        dataLine = line.slice(5).trim()
+      }
+    }
+
+    if (!dataLine) return
+
+    try {
+      const payload = JSON.parse(dataLine) as Record<string, unknown>
+      if (eventType === "message_start") {
+        const message =
+          payload.message && typeof payload.message === "object"
+            ? (payload.message as Record<string, unknown>)
+            : null
+        const usage =
+          message?.usage && typeof message.usage === "object"
+            ? (message.usage as Record<string, unknown>)
+            : null
+        if (typeof usage?.input_tokens === "number") {
+          target.inputTokens = Math.max(0, Math.round(usage.input_tokens))
+        }
+        if (
+          typeof usage?.cache_read_input_tokens === "number" &&
+          usage.cache_read_input_tokens > 0
+        ) {
+          target.cachedInputTokens = Math.max(
+            0,
+            Math.round(usage.cache_read_input_tokens)
+          )
+        }
+        if (
+          typeof usage?.cache_creation_input_tokens === "number" &&
+          usage.cache_creation_input_tokens > 0
+        ) {
+          target.cacheCreationInputTokens = Math.max(
+            0,
+            Math.round(usage.cache_creation_input_tokens)
+          )
+        }
+        if (typeof usage?.output_tokens === "number") {
+          target.outputTokens = Math.max(0, Math.round(usage.output_tokens))
+        }
+        const serverToolUse =
+          usage?.server_tool_use && typeof usage.server_tool_use === "object"
+            ? (usage.server_tool_use as Record<string, unknown>)
+            : null
+        if (
+          typeof serverToolUse?.web_search_requests === "number" &&
+          serverToolUse.web_search_requests > 0
+        ) {
+          target.webSearchRequests = Math.max(
+            0,
+            Math.round(serverToolUse.web_search_requests)
+          )
+        }
+        return
+      }
+
+      if (eventType !== "message_delta") {
+        return
+      }
+
+      const usage =
+        payload.usage && typeof payload.usage === "object"
+          ? (payload.usage as Record<string, unknown>)
+          : null
+      if (typeof usage?.input_tokens === "number") {
+        target.inputTokens = Math.max(0, Math.round(usage.input_tokens))
+      }
+      if (
+        typeof usage?.cache_read_input_tokens === "number" &&
+        usage.cache_read_input_tokens > 0
+      ) {
+        target.cachedInputTokens = Math.max(
+          0,
+          Math.round(usage.cache_read_input_tokens)
+        )
+      }
+      if (
+        typeof usage?.cache_creation_input_tokens === "number" &&
+        usage.cache_creation_input_tokens > 0
+      ) {
+        target.cacheCreationInputTokens = Math.max(
+          0,
+          Math.round(usage.cache_creation_input_tokens)
+        )
+      }
+      if (typeof usage?.output_tokens === "number") {
+        target.outputTokens = Math.max(0, Math.round(usage.output_tokens))
+      }
+      const serverToolUse =
+        usage?.server_tool_use && typeof usage.server_tool_use === "object"
+          ? (usage.server_tool_use as Record<string, unknown>)
+          : null
+      if (
+        typeof serverToolUse?.web_search_requests === "number" &&
+        serverToolUse.web_search_requests > 0
+      ) {
+        target.webSearchRequests = Math.max(
+          0,
+          Math.round(serverToolUse.web_search_requests)
+        )
+      }
+    } catch {
+      // Ignore malformed SSE fragments for analytics bookkeeping
+    }
+  }
+
   private nextRetryCandidate(
     model: string,
     attemptedCandidates: Set<string>
@@ -952,7 +1169,7 @@ export class ClaudeApiService implements OnModuleInit {
       return "cooldown"
     }
     if (modelCooldowns.length > 0) {
-      return "degraded"
+      return "model_cooldown"
     }
     return "ready"
   }
@@ -977,24 +1194,9 @@ export class ClaudeApiService implements OnModuleInit {
     return normalized || DEFAULT_ANTHROPIC_BASE_URL
   }
 
-  private resolveAccountStateDbPath(configPath?: string | null): string {
-    return resolveRuntimeDataPath(BACKEND_ACCOUNT_STATE_DB_FILENAME, configPath)
-  }
-
-  private resolveLegacyAccountStatePath(configPath?: string | null): string {
-    return resolveLegacyAccountStateJsonPath(
-      "claude-api-account-state.json",
-      configPath
-    )
-  }
-
-  private configureAccountStateStore(configPath?: string | null): void {
-    this.accountStatePath = this.resolveAccountStateDbPath(configPath)
-    this.legacyAccountStatePath = this.resolveLegacyAccountStatePath(configPath)
-    this.accountStateStore = new BackendAccountStateStore(
-      this.accountStatePath,
-      this.logger
-    )
+  private configureAccountStateStore(_configPath?: string | null): void {
+    // No-op: PersistenceService handles the unified DB path.
+    // Kept for interface compatibility.
   }
 
   private normalizeModels(
@@ -1428,10 +1630,7 @@ export class ClaudeApiService implements OnModuleInit {
     string,
     PersistedClaudeApiAccountState
   > {
-    return this.accountStateStore.loadStates(
-      "claude-api",
-      this.legacyAccountStatePath
-    )
+    return this.accountStateStore.loadStates("claude-api")
   }
 
   private applyPersistedAccountState(

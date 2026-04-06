@@ -1,0 +1,263 @@
+{
+  "name": "agent-vibes",
+  "displayName": "Agent Vibes",
+  "publisher": "funny-vibes",
+  "description": "Unified AI Agent Gateway — Route Antigravity, Claude, and GPT backends through Cursor IDE and Claude Code CLI with protocol-native translation.",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "homepage": "https://github.com/funny-vibes/agent-vibes#readme",
+  "bugs": {
+    "url": "https://github.com/funny-vibes/agent-vibes/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/funny-vibes/agent-vibes.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI"
+  ],
+  "keywords": [
+    "agent",
+    "cursor",
+    "codex",
+    "claude",
+    "chatgpt",
+    "antigravity",
+    "vibe-coding",
+    "vibecoding",
+    "gemini",
+    "llm"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml/badge.svg?branch=main",
+      "href": "https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml",
+      "description": "CI Status"
+    },
+    {
+      "url": "https://img.shields.io/badge/License-MIT-blue.svg",
+      "href": "https://github.com/funny-vibes/agent-vibes/blob/main/LICENSE",
+      "description": "MIT License"
+    },
+    {
+      "url": "https://img.shields.io/badge/Node.js-≥24-339933?logo=nodedotjs&logoColor=white",
+      "href": "https://nodejs.org/",
+      "description": "Node.js ≥ 24"
+    }
+  ],
+  "preview": true,
+  "markdown": "github",
+  "qna": "https://github.com/funny-vibes/agent-vibes/discussions",
+  "sponsor": {
+    "url": "https://github.com/sponsors/funny-vibes"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "icon": "resources/icon.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentVibes.startServer",
+        "title": "Start Server",
+        "category": "Agent Vibes",
+        "icon": "$(play)"
+      },
+      {
+        "command": "agentVibes.stopServer",
+        "title": "Stop Server",
+        "category": "Agent Vibes",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "agentVibes.restartServer",
+        "title": "Restart Server",
+        "category": "Agent Vibes",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "agentVibes.syncAntigravityIDE",
+        "title": "Sync Antigravity IDE Credentials",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.syncAntigravityTools",
+        "title": "Sync Antigravity Tool Credentials",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.syncClaude",
+        "title": "Sync Claude Credentials",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.syncCodex",
+        "title": "Sync Codex Credentials",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.generateCert",
+        "title": "Generate SSL Certificates",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.enableForwarding",
+        "title": "Enable Port Forwarding",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.disableForwarding",
+        "title": "Disable Port Forwarding",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.forwardingStatus",
+        "title": "Port Forwarding Status",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.openDashboard",
+        "title": "Open Dashboard",
+        "category": "Agent Vibes",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "agentVibes.collectDiagnostics",
+        "title": "Collect Diagnostics",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.openConfig",
+        "title": "Edit Configuration",
+        "category": "Agent Vibes",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "agentVibes.patchCursor",
+        "title": "Apply Cursor Patch",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.restoreCursor",
+        "title": "Restore Cursor Original",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.refreshDashboard",
+        "title": "Refresh Dashboard",
+        "category": "Agent Vibes",
+        "icon": "$(refresh)"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Vibes",
+      "properties": {
+        "agentVibes.language": {
+          "type": "string",
+          "default": "en",
+          "enum": [
+            "en",
+            "zh"
+          ],
+          "enumDescriptions": [
+            "English",
+            "中文"
+          ],
+          "description": "Dashboard display language"
+        },
+        "agentVibes.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the proxy server when IDE launches"
+        },
+        "agentVibes.port": {
+          "type": "number",
+          "default": 8000,
+          "description": "Proxy server port"
+        },
+        "agentVibes.healthCheckInterval": {
+          "type": "number",
+          "default": 30,
+          "description": "Health check polling interval in seconds (0 to disable)"
+        },
+        "agentVibes.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging"
+        },
+        "agentVibes.dataDir": {
+          "type": "string",
+          "default": "",
+          "description": "Custom data directory path (default: ~/.agent-vibes)"
+        },
+        "agentVibes.antigravityAccountsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path for antigravity-accounts.json. If empty, uses <dataDir>/data/antigravity-accounts.json"
+        },
+        "agentVibes.codexAccountsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path for codex-accounts.json. If empty, uses <dataDir>/data/codex-accounts.json"
+        },
+        "agentVibes.openaiCompatAccountsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path for openai-compat-accounts.json. If empty, uses <dataDir>/data/openai-compat-accounts.json"
+        },
+        "agentVibes.claudeApiAccountsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path for claude-api-accounts.json. If empty, uses <dataDir>/data/claude-api-accounts.json"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build:chatgpt-register && node esbuild.config.mjs --production",
+    "build:bridge": "node scripts/build-bridge.mjs",
+    "build:chatgpt-register": "npm --workspace ../chatgpt-register run build",
+    "sync:bridge": "node scripts/sync-bridge-assets.mjs",
+    "sync:chatgpt-register": "node scripts/sync-chatgpt-register-assets.mjs",
+    "verify:bridge": "node scripts/sync-bridge-assets.mjs --verify-only",
+    "restart:bridge": "node scripts/restart-bridge-after-pack.mjs",
+    "sync:readme": "node scripts/sync-readme.mjs",
+    "prepare:pack": "npm run build && npm run build:bridge && npm run sync:bridge && npm run sync:chatgpt-register && npm run sync:readme",
+    "prepare:pack:fast": "npm run build && npm run verify:bridge && npm run sync:chatgpt-register && npm run sync:readme",
+    "dev": "node esbuild.config.mjs --watch",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "test": "jest --passWithNoTests",
+    "types": "tsc --noEmit",
+    "package": "npm run prepare:pack && npx @vscode/vsce package --no-dependencies",
+    "package:fast": "npm run prepare:pack:fast && npx @vscode/vsce package --no-dependencies",
+    "pack": "npm run package && cursor --install-extension agent-vibes-0.1.0.vsix --force && npm run restart:bridge",
+    "pack:fast": "npm run package:fast && cursor --install-extension agent-vibes-0.1.0.vsix --force && npm run restart:bridge",
+    "clean": "node ../../scripts/rm-paths.js dist node_modules .turbo"
+  },
+  "dependencies": {
+    "node-forge": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/node-forge": "^1.3.11",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6"
+  },
+  "prettier": "@workspace/prettier-config"
+}

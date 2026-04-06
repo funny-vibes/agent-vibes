@@ -1,8 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common"
-import Database from "better-sqlite3"
-import * as fs from "fs"
-import * as path from "path"
 import { randomUUID } from "crypto"
+import { PersistenceService } from "../../persistence"
 
 export interface KnowledgeBaseItem {
   id: string
@@ -23,24 +21,13 @@ interface KnowledgeBaseRow {
 @Injectable()
 export class KnowledgeBaseService implements OnModuleDestroy {
   private readonly logger = new Logger(KnowledgeBaseService.name)
-  private readonly dbPath: string
-  private db: Database.Database | null = null
 
-  constructor() {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp"
-    const dataDir = path.join(homeDir, ".protocol-bridge")
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true })
-    }
-    this.dbPath = path.join(dataDir, "knowledge-base.db")
-    this.initDatabase()
+  constructor(private readonly persistence: PersistenceService) {
+    this.logger.log("Knowledge Base service initialized")
   }
 
   onModuleDestroy(): void {
-    if (this.db) {
-      this.db.close()
-      this.db = null
-    }
+    // PersistenceService handles DB cleanup
   }
 
   private toKnowledgeBaseItem(row: KnowledgeBaseRow): KnowledgeBaseItem {
@@ -53,39 +40,11 @@ export class KnowledgeBaseService implements OnModuleDestroy {
     }
   }
 
-  private initDatabase(): void {
-    try {
-      this.db = new Database(this.dbPath)
-      this.db.pragma("journal_mode = WAL")
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS knowledge_base (
-          id TEXT PRIMARY KEY,
-          knowledge TEXT NOT NULL,
-          title TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          is_generated INTEGER NOT NULL DEFAULT 0
-        );
-      `)
-      this.logger.log(
-        `Knowledge Base persistence initialized at ${this.dbPath}`
-      )
-    } catch (error) {
-      this.logger.error(
-        `Failed to initialize knowledge base persistence: ${String(error)}`
-      )
-      this.db = null
-    }
-  }
-
   list(): KnowledgeBaseItem[] {
-    if (!this.db) return []
     try {
-      const rows = this.db
-        .prepare<
-          [],
-          KnowledgeBaseRow
-        >("SELECT * FROM knowledge_base ORDER BY created_at DESC")
-        .all()
+      const rows = this.persistence
+        .prepare("SELECT * FROM knowledge_base ORDER BY created_at DESC")
+        .all() as unknown as KnowledgeBaseRow[]
       return rows.map((row) => this.toKnowledgeBaseItem(row))
     } catch (error) {
       this.logger.error(`Failed to list knowledge base items: ${String(error)}`)
@@ -94,14 +53,10 @@ export class KnowledgeBaseService implements OnModuleDestroy {
   }
 
   get(id: string): KnowledgeBaseItem | null {
-    if (!this.db) return null
     try {
-      const row = this.db
-        .prepare<
-          [string],
-          KnowledgeBaseRow
-        >("SELECT * FROM knowledge_base WHERE id = ?")
-        .get(id)
+      const row = this.persistence
+        .prepare("SELECT * FROM knowledge_base WHERE id = ?")
+        .get(id) as KnowledgeBaseRow | undefined
       if (!row) return null
       return this.toKnowledgeBaseItem(row)
     } catch (error) {
@@ -117,25 +72,32 @@ export class KnowledgeBaseService implements OnModuleDestroy {
     title: string,
     isGenerated: boolean = false
   ): KnowledgeBaseItem | null {
-    if (!this.db) return null
     try {
+      // Deduplicate: if an item with identical knowledge content already exists,
+      // return the existing item instead of creating a duplicate.
+      // This prevents rule accumulation across Cursor restarts where the IDE
+      // may re-sync items from the official server before the proxy takes over.
+      const existing = this.persistence
+        .prepare("SELECT * FROM knowledge_base WHERE knowledge = ? LIMIT 1")
+        .get(knowledge) as KnowledgeBaseRow | undefined
+      if (existing) {
+        this.logger.debug(
+          `Knowledge base item already exists (id=${existing.id}), skipping duplicate add`
+        )
+        return this.toKnowledgeBaseItem(existing)
+      }
+
       const id = randomUUID()
       const createdAt = new Date().toISOString()
 
-      this.db
+      this.persistence
         .prepare(
           `INSERT INTO knowledge_base (id, knowledge, title, created_at, is_generated)
            VALUES (?, ?, ?, ?, ?)`
         )
         .run(id, knowledge, title, createdAt, isGenerated ? 1 : 0)
 
-      return {
-        id,
-        knowledge,
-        title,
-        createdAt,
-        isGenerated,
-      }
+      return { id, knowledge, title, createdAt, isGenerated }
     } catch (error) {
       this.logger.error(`Failed to add knowledge base item: ${String(error)}`)
       return null
@@ -143,13 +105,10 @@ export class KnowledgeBaseService implements OnModuleDestroy {
   }
 
   update(id: string, knowledge: string, title: string): boolean {
-    if (!this.db) return false
     try {
-      const result = this.db
+      const result = this.persistence
         .prepare(
-          `UPDATE knowledge_base
-           SET knowledge = ?, title = ?
-           WHERE id = ?`
+          `UPDATE knowledge_base SET knowledge = ?, title = ? WHERE id = ?`
         )
         .run(knowledge, title, id)
 
@@ -163,9 +122,8 @@ export class KnowledgeBaseService implements OnModuleDestroy {
   }
 
   remove(id: string): boolean {
-    if (!this.db) return false
     try {
-      const result = this.db
+      const result = this.persistence
         .prepare("DELETE FROM knowledge_base WHERE id = ?")
         .run(id)
 

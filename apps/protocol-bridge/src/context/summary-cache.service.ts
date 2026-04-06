@@ -4,10 +4,8 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from "@nestjs/common"
-import Database from "better-sqlite3"
 import * as crypto from "crypto"
-import * as fs from "fs"
-import * as path from "path"
+import { PersistenceService } from "../persistence"
 import { TokenCounterService } from "./token-counter.service"
 import { UnifiedMessage, extractText } from "./types"
 
@@ -35,67 +33,29 @@ interface CachedSummary {
 @Injectable()
 export class SummaryCacheService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SummaryCacheService.name)
-  private db: Database.Database | null = null
-  private readonly dbPath: string
 
-  constructor(private readonly tokenCounter: TokenCounterService) {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp"
-    const dataDir = path.join(homeDir, ".protocol-bridge")
-
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true })
-    }
-
-    this.dbPath = path.join(dataDir, "summary-cache.db")
-  }
+  constructor(
+    private readonly tokenCounter: TokenCounterService,
+    private readonly persistence: PersistenceService
+  ) {}
 
   onModuleInit() {
-    this.initDatabase()
+    // Cleanup old entries (older than 7 days)
+    this.cleanupOldEntries(7)
+    this.logger.log("Summary cache initialized")
   }
 
   onModuleDestroy() {
-    if (this.db) {
-      this.db.close()
-    }
-  }
-
-  private initDatabase(): void {
-    try {
-      this.db = new Database(this.dbPath)
-      this.db.pragma("journal_mode = WAL")
-
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS summaries (
-          hash TEXT PRIMARY KEY,
-          summary_text TEXT NOT NULL,
-          token_count INTEGER NOT NULL,
-          message_count INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          last_used_at INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_summaries_last_used
-          ON summaries(last_used_at);
-      `)
-
-      this.logger.log(`Summary cache initialized at ${this.dbPath}`)
-
-      // Cleanup old entries (older than 7 days)
-      this.cleanupOldEntries(7)
-    } catch (error) {
-      this.logger.error(`Failed to initialize summary cache: ${String(error)}`)
-    }
+    // PersistenceService handles DB cleanup
   }
 
   /**
    * Generate hash for truncated messages
-   * Uses content of messages to create a stable hash
    */
   generateHash(messages: UnifiedMessage[]): string {
     const content = messages
       .map((m) => {
         const text = extractText(m.content)
-        // Use role + first 200 chars of content for hash
         return `${m.role}:${text.slice(0, 200)}`
       })
       .join("|")
@@ -111,12 +71,10 @@ export class SummaryCacheService implements OnModuleInit, OnModuleDestroy {
    * Get cached summary for truncated messages
    */
   getCachedSummary(truncatedMessages: UnifiedMessage[]): CachedSummary | null {
-    if (!this.db) return null
-
     const hash = this.generateHash(truncatedMessages)
 
     try {
-      const row = this.db
+      const row = this.persistence
         .prepare(
           `SELECT hash, summary_text, token_count, message_count, created_at
            FROM summaries WHERE hash = ?`
@@ -125,7 +83,7 @@ export class SummaryCacheService implements OnModuleInit, OnModuleDestroy {
 
       if (row) {
         // Update last_used_at
-        this.db
+        this.persistence
           .prepare(`UPDATE summaries SET last_used_at = ? WHERE hash = ?`)
           .run(Date.now(), hash)
 
@@ -144,14 +102,12 @@ export class SummaryCacheService implements OnModuleInit, OnModuleDestroy {
    * Store summary in cache
    */
   storeSummary(truncatedMessages: UnifiedMessage[], summaryText: string): void {
-    if (!this.db) return
-
     const hash = this.generateHash(truncatedMessages)
     const tokenCount = this.tokenCounter.countText(summaryText)
     const now = Date.now()
 
     try {
-      this.db
+      this.persistence
         .prepare(
           `INSERT OR REPLACE INTO summaries
            (hash, summary_text, token_count, message_count, created_at, last_used_at)
@@ -171,12 +127,11 @@ export class SummaryCacheService implements OnModuleInit, OnModuleDestroy {
    * Cleanup old cache entries
    */
   private cleanupOldEntries(daysToKeep: number): void {
-    if (!this.db) return
-
+    if (!this.persistence.isReady) return
     const cutoffTime = Date.now() - daysToKeep * 24 * 60 * 60 * 1000
 
     try {
-      const result = this.db
+      const result = this.persistence
         .prepare(`DELETE FROM summaries WHERE last_used_at < ?`)
         .run(cutoffTime)
 
@@ -194,10 +149,8 @@ export class SummaryCacheService implements OnModuleInit, OnModuleDestroy {
    * Get cache stats
    */
   getStats(): { totalEntries: number; totalTokens: number } {
-    if (!this.db) return { totalEntries: 0, totalTokens: 0 }
-
     try {
-      const row = this.db
+      const row = this.persistence
         .prepare(
           `SELECT COUNT(*) as count, COALESCE(SUM(token_count), 0) as tokens FROM summaries`
         )

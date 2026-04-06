@@ -1,0 +1,2652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <title>Agent Vibes Dashboard</title>
+  <style>
+    /* ── Design tokens (matching sidebar) ── */
+    :root {
+      --bg: var(--vscode-editor-background);
+      --bg-2: var(--vscode-sideBar-background, #1e1e2e);
+      --fg: var(--vscode-editor-foreground);
+      --fg-2: var(--vscode-descriptionForeground, rgba(255,255,255,0.56));
+      --fg-3: color-mix(in srgb, var(--fg) 32%, transparent);
+      --border: var(--vscode-panel-border, rgba(255,255,255,0.1));
+      --line: color-mix(in srgb, var(--fg) 8%, transparent);
+      --focus: var(--vscode-focusBorder, #007acc);
+      --input-bg: var(--vscode-input-background, rgba(255,255,255,0.06));
+      --input-border: var(--vscode-input-border, rgba(255,255,255,0.12));
+      --input-fg: var(--vscode-input-foreground, #ccc);
+
+      --good: #34d399;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --muted: #64748b;
+
+      --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
+      --text-xs: 10px; --text-sm: 11px; --text-base: 12px; --text-lg: 13px;
+      --text-xl: 16px; --text-2xl: 20px; --text-3xl: 28px;
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif);
+      font-size: var(--text-base);
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--fg);
+      overflow-x: hidden;
+    }
+
+    button, input, textarea, select { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
+
+    /* ── Layout ── */
+    .shell {
+      width: min(1120px, calc(100vw - 32px));
+      max-width: none;
+      margin: 0 auto;
+      padding: var(--sp-4) var(--sp-3) var(--sp-8);
+    }
+
+    /* ── Tab bar ── */
+    .tabs {
+      display: flex; gap: 0;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: var(--sp-4);
+      position: sticky; top: 0; z-index: 10;
+      background: var(--bg);
+    }
+    .tab {
+      padding: var(--sp-3) var(--sp-4);
+      border: none; background: transparent;
+      color: var(--fg-2); font-size: var(--text-lg); font-weight: 600;
+      border-bottom: 2px solid transparent;
+      transition: color 120ms ease, border-color 120ms ease;
+    }
+    .tab:hover { color: var(--fg); }
+    .tab.active { color: var(--fg); border-bottom-color: var(--focus); }
+
+    .pane { display: none; }
+    .pane.active { display: block; }
+
+    /* ── Section ── */
+    .section + .section { border-top: 1px solid var(--line); padding-top: var(--sp-4); margin-top: var(--sp-4); }
+    .section-head {
+      display: flex; align-items: baseline; justify-content: space-between;
+      margin-bottom: var(--sp-3);
+    }
+    .section-title {
+      font-size: var(--text-xs); font-weight: 700;
+      letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-2);
+    }
+    .section-aside { font-size: var(--text-sm); color: var(--fg-2); }
+
+    /* ── Dot indicators ── */
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+    .dot-good { background: var(--good); }
+    .dot-warn { background: var(--warn); }
+    .dot-bad { background: var(--bad); }
+
+    /* ── Progress bar ── */
+    .progress-row {
+      display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4);
+    }
+    .progress-track {
+      flex: 1; height: 4px; border-radius: 999px;
+      background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; border-radius: inherit;
+      background: var(--good);
+      transition: width 400ms ease;
+    }
+    .progress-label { font-size: var(--text-sm); color: var(--fg-2); white-space: nowrap; }
+
+    /* ── Status grid (single row) ── */
+    .status-grid {
+      display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--sp-2);
+    }
+    @media (max-width: 640px) { .status-grid { grid-template-columns: repeat(2, 1fr); } }
+    .status-card {
+      display: flex; align-items: center; gap: var(--sp-3);
+      padding: var(--sp-3); border-radius: var(--radius); background: var(--input-bg);
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    }
+    .status-card-body { flex: 1; min-width: 0; }
+    .status-card-label { font-size: var(--text-sm); color: var(--fg-2); }
+    .status-card-value { font-size: var(--text-base); font-weight: 700; margin-top: 1px; }
+    .status-card-action { flex-shrink: 0; }
+
+    /* ── Setup checklist ── */
+    .setup-list { margin-top: var(--sp-4); }
+    .setup-item {
+      display: flex; align-items: flex-start; gap: var(--sp-3);
+      padding: var(--sp-2) 0;
+    }
+    .setup-item + .setup-item { border-top: 1px solid var(--line); }
+    .setup-icon {
+      width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0; margin-top: 1px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; font-weight: 700; color: #fff;
+    }
+    .setup-icon-done { background: var(--good); }
+    .setup-icon-action { background: var(--warn); }
+    .setup-icon-pending { background: var(--muted); }
+    .setup-body { flex: 1; min-width: 0; }
+    .setup-title { font-size: var(--text-base); font-weight: 600; }
+    .setup-desc { font-size: var(--text-sm); color: var(--fg-2); margin-top: 1px; }
+    .setup-action { flex-shrink: 0; align-self: center; }
+    .health-banner {
+      display: flex; align-items: center; gap: var(--sp-3);
+      padding: var(--sp-3); border-radius: var(--radius); background: var(--input-bg);
+      border-left: 3px solid var(--muted);
+      margin-bottom: var(--sp-4);
+    }
+    .health-banner-good { border-left-color: var(--good); }
+    .health-banner-warn { border-left-color: var(--warn); }
+    .health-banner-bad { border-left-color: var(--bad); }
+    .health-banner-body { min-width: 0; }
+    .health-banner-title { font-size: var(--text-base); font-weight: 700; }
+    .health-banner-desc { font-size: var(--text-sm); color: var(--fg-2); margin-top: 1px; }
+    .c-good { color: var(--good); }
+    .c-warn { color: var(--warn); }
+    .c-bad { color: var(--bad); }
+
+    /* ── Backend cards (sidebar style) ── */
+    .backends { display: grid; gap: var(--sp-4); }
+    .be {
+      padding: var(--sp-3) var(--sp-4);
+      border-radius: var(--radius);
+      border-left: 3px solid var(--muted);
+      background: var(--input-bg);
+      display: flex;
+      flex-direction: column;
+      gap: var(--sp-3);
+      min-height: 100px;
+    }
+    .be-ag { border-left-color: var(--good); }
+    .be-cx { border-left-color: var(--warn); }
+    .be-oai { border-left-color: #60a5fa; }
+    .be-cl { border-left-color: #f87171; }
+    .be-top { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); }
+    .be-top-left { display: flex; align-items: baseline; gap: var(--sp-3); }
+    .be-name { font-size: var(--text-lg); font-weight: 700; position: relative; cursor: pointer; }
+    .be-name:hover { text-decoration: underline; color: var(--focus); }
+    .be-name:hover::after { content: ' \279C'; font-size: var(--text-sm); opacity: 0.5; }
+    .be-count { font-size: var(--text-sm); font-weight: 700; color: var(--fg-2); min-width: 20px; text-align: right; }
+    .be-status { font-size: var(--text-sm); color: var(--fg-2); }
+
+    /* ── Buttons ── */
+    .btn-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); }
+    .btn {
+      display: inline-flex; align-items: center; height: 28px;
+      padding: 0 var(--sp-3); border-radius: var(--radius);
+      border: 1px solid transparent;
+      font-size: var(--text-sm); font-weight: 600;
+      transition: opacity 120ms ease, background 120ms ease;
+    }
+    .btn:hover:not(:disabled) { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+    .btn-primary { background: var(--focus); color: #fff; border-color: var(--focus); }
+    .btn-secondary { background: var(--input-bg); color: var(--fg); border-color: var(--border); }
+    .btn-ghost { background: transparent; color: var(--fg-2); border-color: transparent; }
+    .btn-ghost:hover:not(:disabled) { background: var(--input-bg); color: var(--fg); }
+    .btn-danger { background: transparent; color: var(--bad); border-color: transparent; font-size: var(--text-xs); }
+    .btn-danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent); }
+
+    /* ── Logs path row ── */
+    .log-path-bar {
+      margin-bottom: var(--sp-3);
+      padding-bottom: var(--sp-2);
+    }
+    .log-path-value {
+      display: inline-block;
+      max-width: 100%;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: var(--text-sm);
+      word-break: break-all;
+      color: var(--fg-2);
+      cursor: pointer;
+      border-radius: var(--radius);
+      padding: 2px 4px;
+      transition: background 120ms ease, color 120ms ease;
+    }
+    .log-path-value:hover {
+      color: var(--fg);
+      background: var(--input-bg);
+    }
+
+    /* ── Accounts: channel sections ── */
+    .ch-section { margin-bottom: var(--sp-6); }
+    .ch-head {
+      display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-3);
+    }
+    .ch-bar {
+      width: 3px; height: 16px; border-radius: 2px; flex-shrink: 0;
+    }
+    .ch-bar-ag { background: var(--good); }
+    .ch-bar-cx { background: var(--warn); }
+    .ch-bar-oai { background: #60a5fa; }
+    .ch-bar-cl { background: #f87171; }
+    .ch-name { font-size: var(--text-lg); font-weight: 700; flex: 1; }
+    .ch-count { font-size: var(--text-sm); font-weight: 600; color: var(--fg-2); }
+    .ch-meta {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: var(--text-xs); color: var(--fg-3);
+      margin-bottom: var(--sp-2); word-break: break-all;
+    }
+    .ch-actions { display: flex; gap: var(--sp-1); }
+
+    .acct {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: var(--sp-2); padding: var(--sp-2) 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .acct:last-child { border-bottom: none; }
+    .acct-info { flex: 1; min-width: 0; }
+    .acct-name { font-size: var(--text-base); font-weight: 600; }
+    .acct-detail {
+      font-size: var(--text-sm); color: var(--fg-2);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .acct-empty { padding: var(--sp-3) 0; color: var(--fg-2); font-size: var(--text-sm); }
+
+    /* ── Accounts sidebar layout ── */
+    .acct-layout { display: flex; gap: 0; min-height: 500px; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .acct-sidebar { width: 160px; flex-shrink: 0; border-right: 1px solid var(--line); overflow-y: auto; background: var(--bg); }
+    .acct-detail-panel { flex: 1; padding: var(--sp-5); overflow-y: auto; }
+    .acct-group-title {
+      display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3);
+      font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--fg-3); border-bottom: 1px solid var(--line); background: var(--card);
+    }
+    .acct-group-title .ch-bar { width: 3px; height: 12px; border-radius: 2px; }
+    .acct-group-add {
+      margin-left: auto; font-size: 14px; font-weight: 700; cursor: pointer; border: none;
+      background: none; color: var(--fg-2); padding: 0 4px; line-height: 1;
+    }
+    .acct-group-add:hover { color: var(--fg-1); }
+    .acct-item {
+      display: flex; align-items: center; gap: var(--sp-2); padding: 8px var(--sp-3);
+      cursor: pointer; border-bottom: 1px solid var(--line); transition: background .1s;
+      font-size: var(--text-sm); color: var(--fg-1);
+    }
+    .acct-item:hover { background: rgba(255,255,255,.04); }
+    .acct-item.selected { background: rgba(59,130,246,.12); border-left: 2px solid var(--focus); }
+    .acct-item .dot { width: 6px; height: 6px; flex-shrink: 0; }
+    .acct-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--fg-3); font-size: var(--text-sm); }
+    .detail-header { margin-bottom: var(--sp-4); }
+    .detail-email { font-size: var(--text-lg); font-weight: 700; }
+    .detail-meta { font-size: var(--text-xs); color: var(--fg-3); margin-top: 2px; }
+    .detail-badges { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); }
+    .detail-section { margin-top: var(--sp-5); }
+    .detail-section-title { font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--fg-3); margin-bottom: var(--sp-2); }
+    .quota-row { margin-bottom: var(--sp-3); }
+    .quota-label { display: flex; justify-content: space-between; font-size: var(--text-sm); margin-bottom: 4px; }
+    .quota-label span:first-child { font-weight: 600; color: var(--fg-1); }
+    .quota-label span:last-child { color: var(--fg-2); }
+
+    /* ── Key-value rows ── */
+    .kv {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: var(--sp-2); padding: var(--sp-2) 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .kv:last-child { border-bottom: none; }
+    .kv-key { font-size: var(--text-base); font-weight: 600; }
+    .kv-val { font-size: var(--text-sm); color: var(--fg-2); text-align: right; max-width: 56%; word-break: break-all; }
+    .kv-hint { font-size: var(--text-xs); color: var(--fg-3); margin-top: 2px; }
+
+    /* ── Toggle switch ── */
+    .toggle {
+      display: inline-flex; align-items: center; gap: var(--sp-2); cursor: pointer;
+    }
+    .toggle-track {
+      width: 32px; height: 18px; border-radius: 9px;
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      transition: background 160ms ease, border-color 160ms ease;
+      position: relative;
+    }
+    .toggle-track::after {
+      content: ''; position: absolute; top: 2px; left: 2px;
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--fg-2);
+      transition: transform 160ms ease, background 160ms ease;
+    }
+    .toggle.on .toggle-track { background: var(--focus); border-color: var(--focus); }
+    .toggle.on .toggle-track::after { transform: translateX(14px); background: #fff; }
+    .toggle-label { font-size: var(--text-sm); color: var(--fg-2); user-select: none; }
+    .toggle:hover .toggle-track { border-color: color-mix(in srgb, var(--focus) 60%, transparent); }
+
+    /* ── Log viewer (borderless terminal style) ── */
+    .log-box {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: var(--text-sm); line-height: 1.6;
+      max-height: 80vh; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+      color: var(--fg-2);
+    }
+    .log-line { margin: 0; }
+    .log-line-info { color: var(--fg); }
+    .log-line-warn { color: var(--warn); }
+    .log-line-error { color: var(--bad); }
+    .log-line-debug { color: var(--muted); }
+
+    /* ── Tests tab ── */
+    .test-list { display: grid; gap: var(--sp-2); }
+    .test-item {
+      border-radius: var(--radius); background: var(--input-bg);
+      overflow: hidden;
+    }
+    .test-header {
+      display: flex; align-items: center; gap: var(--sp-3);
+      padding: var(--sp-3); cursor: default;
+    }
+    .test-icon {
+      width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; font-weight: 700; color: #fff;
+    }
+    .test-icon-idle { background: var(--muted); }
+    .test-icon-running { background: var(--focus); animation: pulse 1s infinite; }
+    .test-icon-pass { background: var(--good); }
+    .test-icon-fail { background: var(--bad); }
+    .test-icon-warn { background: var(--warn); }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .btn-loading { opacity: 0.7; pointer-events: none; cursor: not-allowed; }
+    .btn-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
+    .test-body { flex: 1; min-width: 0; }
+    .test-name { font-size: var(--text-base); font-weight: 600; }
+    .test-desc { font-size: var(--text-sm); color: var(--fg-2); margin-top: 1px; }
+    .test-run { flex-shrink: 0; }
+    .test-output {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: var(--text-xs); line-height: 1.6;
+      /* Align output with the test title/description body, not the status icon */
+      padding: 0 var(--sp-3) var(--sp-3) calc(var(--sp-3) + 20px + var(--sp-3));
+      color: var(--fg-2);
+      max-height: 200px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .test-output:empty { display: none; }
+
+    /* ── Settings two-panel ── */
+    .settings-layout {
+      display: flex; gap: 0; min-height: 400px;
+    }
+    .settings-nav {
+      width: 180px; flex-shrink: 0;
+      border-right: 1px solid var(--line);
+      padding-right: var(--sp-3);
+    }
+    .settings-nav-item {
+      display: block; width: 100%; text-align: left;
+      padding: var(--sp-2) var(--sp-3); border: none; background: transparent;
+      color: var(--fg-2); font-size: var(--text-base); font-weight: 600;
+      border-radius: var(--radius); cursor: pointer;
+      transition: background 120ms ease, color 120ms ease;
+      margin-bottom: 2px;
+    }
+    .settings-nav-item:hover { background: var(--input-bg); color: var(--fg); }
+    .settings-nav-item.active { background: var(--input-bg); color: var(--fg); border-left: 2px solid var(--focus); }
+    .settings-content {
+      flex: 1; min-width: 0; padding-left: var(--sp-6);
+    }
+    .settings-group { display: none; }
+    .settings-group.active { display: block; }
+    .settings-group-title {
+      font-size: var(--text-lg); font-weight: 700; margin-bottom: var(--sp-4);
+    }
+    .settings-group-desc {
+      font-size: var(--text-sm); color: var(--fg-2); margin-bottom: var(--sp-4);
+    }
+    .setting-item {
+      padding: var(--sp-3) 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .setting-item:last-child { border-bottom: none; }
+    .setting-top {
+      display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3);
+    }
+    .setting-label { font-size: var(--text-base); font-weight: 600; }
+    .setting-desc { font-size: var(--text-sm); color: var(--fg-2); margin-top: 2px; }
+    .setting-val {
+      font-size: var(--text-sm); color: var(--fg-2); text-align: right;
+      max-width: 60%; word-break: break-all;
+      font-family: var(--vscode-editor-font-family, monospace);
+    }
+    .setting-input {
+      width: 120px; padding: var(--sp-1) var(--sp-2); text-align: right;
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      border-radius: var(--radius); color: var(--input-fg); font-size: var(--text-sm);
+    }
+    .setting-input:focus { outline: none; border-color: var(--focus); }
+    .setting-input-wide {
+      width: 100%; margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3); text-align: left;
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      border-radius: var(--radius); color: var(--input-fg); font-size: var(--text-sm);
+      font-family: var(--vscode-editor-font-family, monospace);
+    }
+    .setting-input-wide:focus { outline: none; border-color: var(--focus); }
+    .setting-badge {
+      display: inline-block; padding: 1px 6px; border-radius: 999px;
+      font-size: var(--text-xs); font-weight: 600;
+    }
+    .setting-badge-ok { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+    .setting-badge-warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+    .setting-badge-info { background: color-mix(in srgb, #60a5fa 16%, transparent); color: #60a5fa; }
+    @media (max-width: 640px) {
+      .settings-layout { flex-direction: column; }
+      .settings-nav { width: 100%; border-right: none; border-bottom: 1px solid var(--line); padding: 0 0 var(--sp-2) 0; display: flex; gap: var(--sp-1); overflow-x: auto; }
+      .settings-content { padding-left: 0; padding-top: var(--sp-4); }
+    }
+
+    /* ── Dialog overlay ── */
+    .overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.5); z-index: 100;
+      justify-content: center; align-items: center;
+    }
+    .overlay.open { display: flex; }
+    .dialog {
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: var(--sp-6);
+      width: 560px; max-width: 92%; max-height: 80vh; overflow-y: auto;
+    }
+    .oauth-tabs {
+      display: flex; gap: 2px; border-radius: 8px; padding: 2px;
+      background: var(--card); margin-bottom: var(--sp-4);
+    }
+    .oauth-tab {
+      flex: 1; padding: 6px 16px; border-radius: 6px; border: none;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      background: transparent; color: var(--fg-2); transition: all .15s;
+    }
+    .oauth-tab:hover { color: var(--fg-1); background: rgba(255,255,255,.05); }
+    .oauth-tab.active { background: var(--bg); color: var(--fg-1); box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+    .dlg-body { min-height: 200px; }
+    .dialog-title { font-size: var(--text-xl); font-weight: 700; margin-bottom: var(--sp-4); text-align: center; }
+    .field { margin-bottom: var(--sp-3); }
+    .field label { display: block; font-size: var(--text-sm); font-weight: 600; color: var(--fg-2); margin-bottom: var(--sp-1); }
+    .field input, .field select, .field textarea {
+      width: 100%; padding: var(--sp-2) var(--sp-3);
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      border-radius: var(--radius); color: var(--input-fg); font-size: var(--text-lg);
+    }
+    .field textarea {
+      min-height: 160px; resize: vertical;
+      font-family: var(--vscode-editor-font-family, monospace); font-size: var(--text-sm);
+    }
+    .field input:focus, .field textarea:focus { outline: none; border-color: var(--focus); }
+    .field-hint { font-size: var(--text-xs); color: var(--fg-3); margin-top: var(--sp-1); }
+    .dialog-actions { display: flex; gap: var(--sp-2); justify-content: flex-end; margin-top: var(--sp-4); }
+
+    /* ── Fade-in animation ── */
+    .pane.active { animation: fade-up 260ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+    @keyframes fade-up {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 920px) {
+      .shell {
+        width: calc(100vw - 20px);
+        padding-left: var(--sp-2);
+        padding-right: var(--sp-2);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="tabs">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="accounts">Accounts</button>
+      <button class="tab" data-tab="analytics">Analytics</button>
+      <button class="tab" data-tab="settings">Settings</button>
+      <button class="tab" data-tab="tests">Diagnostics</button>
+      <button class="tab" data-tab="logs">Logs</button>
+    </nav>
+
+    <!-- ── Overview ── -->
+    <div id="pane-overview" class="pane active">
+      <!-- Branding -->
+      <div style="display:flex;align-items:center;gap:var(--sp-4);margin-bottom:var(--sp-6)">
+        <img id="overview-logo" src="" alt="Agent Vibes" style="width:48px;height:48px;border-radius:50%;flex-shrink:0" />
+        <div>
+          <div style="font-size:var(--text-2xl);font-weight:800;letter-spacing:-0.02em">Agent Vibes</div>
+          <div style="font-size:var(--text-sm);color:var(--fg-2)">Unified AI Agent Gateway - Happy vibing!</div>
+        </div>
+      </div>
+      <!-- Status -->
+      <div class="section">
+        <div class="section-head">
+          <span class="section-title">Status</span>
+          <span class="section-aside" id="status-progress-text"></span>
+        </div>
+        <div class="progress-row" id="status-progress-bar" style="display:none">
+          <div class="progress-track"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+        </div>
+        <div id="overview-health-banner"></div>
+        <div class="status-grid" id="status-grid"></div>
+        <div class="setup-list" id="setup-list"></div>
+      </div>
+      <!-- Actions -->
+      <div class="section">
+        <div class="section-head"><span class="section-title">Actions</span></div>
+        <div class="btn-row" id="hero-actions"></div>
+      </div>
+      <!-- Backends: cards with actions -->
+      <div class="section">
+        <div class="section-head"><span class="section-title">Backends</span></div>
+        <div class="backends" id="overview-backends"></div>
+      </div>
+
+    </div>
+
+    <!-- ── Accounts ── -->
+    <div id="pane-accounts" class="pane">
+      <div class="section">
+        <div class="section-head">
+          <span class="section-title">Accounts</span>
+          <div style="display:flex;gap:var(--sp-2);align-items:center">
+            <button class="btn btn-ghost" onclick="refreshPoolStatus()" title="Refresh Status">Refresh</button>
+          </div>
+        </div>
+        <div id="pool-summary" style="margin-bottom:var(--sp-4)"></div>
+      </div>
+      <div class="acct-layout">
+        <div class="acct-sidebar" id="acct-sidebar"></div>
+        <div class="acct-detail-panel" id="acct-detail"><div class="detail-empty">Select an account to view details</div></div>
+      </div>
+    </div>
+
+    <!-- ── Analytics ── -->
+    <div id="pane-analytics" class="pane">
+      <div class="section">
+        <div class="section-head">
+          <span class="section-title">Token Usage</span>
+          <button class="btn btn-ghost" onclick="refreshUsageSummary()">Refresh</button>
+        </div>
+        <div id="analytics-banner" style="margin-bottom:var(--sp-3)"></div>
+        <div id="analytics-summary"></div>
+      </div>
+      <div class="section">
+        <div class="section-head"><span class="section-title">Session Runtime</span></div>
+        <div id="analytics-session-summary" style="margin-bottom:var(--sp-3)"></div>
+        <div id="analytics-sessions"></div>
+      </div>
+      <div class="section">
+        <div class="section-head"><span class="section-title">By Backend</span></div>
+        <div class="backends" id="analytics-backends"></div>
+      </div>
+      <div class="section">
+        <div class="section-head"><span class="section-title">By Route</span></div>
+        <div class="backends" id="analytics-routes"></div>
+      </div>
+      <div class="section">
+        <div class="section-head"><span class="section-title">Top Models</span></div>
+        <div id="analytics-models"></div>
+      </div>
+      <div class="section">
+        <div class="section-head"><span class="section-title">Top Accounts</span></div>
+        <div id="analytics-accounts"></div>
+      </div>
+      <div class="section">
+        <div class="section-head"><span class="section-title">Recent Activity</span></div>
+        <div id="analytics-recent"></div>
+      </div>
+    </div>
+
+    <!-- ── Tests ── -->
+    <div id="pane-tests" class="pane">
+      <div class="section">
+        <div class="section-head">
+          <span class="section-title">Diagnostics</span>
+          <button class="btn btn-primary" onclick="runAllTests()">Run All</button>
+        </div>
+        <div class="test-list" id="tests-root"></div>
+      </div>
+    </div>
+
+    <!-- ── Logs ── -->
+    <div id="pane-logs" class="pane">
+      <div class="log-path-bar">
+        <div class="log-path-value" id="log-file-path" onclick="copyLogPath()" title="Click to copy log file path" aria-label="Click to copy log file path">Loading...</div>
+      </div>
+      <div class="section">
+        <div class="section-head">
+          <span class="section-title">Bridge Log</span>
+          <div style="display:flex;gap:var(--sp-2);align-items:center">
+            <label class="toggle" id="log-debug-toggle" onclick="toggleDebugMode(this)" title="Enable verbose debug logging (requires bridge restart)">
+              <span class="toggle-label">Debug</span>
+              <div class="toggle-track"></div>
+            </label>
+            <label class="toggle" id="log-heartbeat-toggle" onclick="toggleHeartbeatFilter(this)" title="Show/hide heartbeat lines">
+              <span class="toggle-label">Heartbeat</span>
+              <div class="toggle-track"></div>
+            </label>
+            <div class="auto-refresh-group" style="display:flex;align-items:center;gap:var(--sp-1)">
+              <label class="toggle" id="log-auto-refresh-toggle" onclick="toggleAutoRefresh(this)" title="Auto-refresh logs every 3 seconds">
+                <span class="toggle-label">Auto</span>
+                <div class="toggle-track"></div>
+              </label>
+            </div>
+            <button class="btn btn-ghost" onclick="refreshLogs()">Refresh</button>
+          </div>
+        </div>
+        <div class="log-box" id="log-box"><span style="color:var(--fg-2)">Click Refresh to load logs...</span></div>
+      </div>
+    </div>
+
+    <!-- ── Settings ── -->
+    <div id="pane-settings" class="pane">
+      <div class="settings-layout">
+        <nav class="settings-nav" id="settings-nav"></nav>
+        <div class="settings-content" id="settings-content"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Add Account Dialog -->
+  <div class="overlay" id="dlg">
+    <div class="dialog">
+      <div class="dialog-title" id="dlg-title">Add Account</div>
+      <div id="dlg-fields"></div>
+      <div class="dialog-actions">
+        <button class="btn btn-ghost" onclick="closeDlg()">Cancel</button>
+        <button class="btn btn-primary" id="dlg-ok" onclick="submitDlg()">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    let curCh = null;
+    let allData = {};
+    let usageSummaryData = null;
+    let currentLogFilePath = '';
+    let currentLogFileExists = false;
+
+    const CH = {
+      antigravity: {
+        label: 'Antigravity', barCls: 'ch-bar-ag', beCls: 'be-ag', color: '#34d399',
+        mode: 'sync',
+        sync: [
+          { label: 'Sync Antigravity IDE', cmd: 'agentVibes.syncAntigravityIDE' },
+          { label: 'Sync Antigravity Tool', cmd: 'agentVibes.syncAntigravityTools' },
+        ],
+        fields: [],
+        name: a => a.email || 'Synced account',
+        info: a => { const t = a.accessToken || a.token?.access_token || ''; return t ? t.slice(0, 24) + '...' : 'No token'; },
+      },
+      codex: {
+        label: 'Codex (OpenAI)', barCls: 'ch-bar-cx', beCls: 'be-cx', color: '#fbbf24',
+        mode: 'codex-oauth',
+        sync: [{ label: 'Sync Codex', cmd: 'agentVibes.syncCodex' }],
+        fields: [],
+        name: a => {
+          var base = a.email || a.accountId || 'Unknown';
+          if (a.accountId) base += ' (' + a.accountId.slice(0, 8) + ')';
+          return base;
+        },
+        info: a => (a.planType || 'unknown') + ' | ' + ((a.accessToken || '').slice(0, 20) || '--') + '...',
+      },
+      'openai-compat': {
+        label: 'OpenAI-Compatible', barCls: 'ch-bar-oai', beCls: 'be-oai', color: '#60a5fa',
+        mode: 'form',
+        fields: [
+          { key: 'label', label: 'Label', type: 'text', ph: 'e.g. claude-proxy' },
+          { key: 'baseUrl', label: 'Base URL', type: 'text', ph: 'https://api.example.com' },
+          { key: 'apiKey', label: 'API Key', type: 'text' },
+          { key: 'proxyUrl', label: 'Proxy URL (optional)', type: 'text', ph: 'http://127.0.0.1:7897' },
+        ],
+        name: a => a.label || a.baseUrl || 'Unknown',
+        info: a => a.baseUrl || '',
+      },
+      'claude-api': {
+        label: 'Claude API', barCls: 'ch-bar-cl', beCls: 'be-cl', color: '#f87171',
+        mode: 'form',
+        fields: [
+          { key: 'label', label: 'Label', type: 'text' },
+          { key: 'apiKey', label: 'API Key', type: 'text', ph: 'sk-ant-...' },
+          { key: 'proxyUrl', label: 'Proxy URL (optional)', type: 'text' },
+        ],
+        name: a => a.label || 'Unnamed',
+        info: a => a.apiKey ? a.apiKey.slice(0, 16) + '...' : '',
+      },
+    };
+
+    function getChannelState(data, key) {
+      const raw = data[key];
+      if (Array.isArray(raw)) return { accounts: raw, filePath: '', exists: false, source: 'default' };
+      return {
+        accounts: Array.isArray(raw?.accounts) ? raw.accounts : [],
+        filePath: typeof raw?.filePath === 'string' ? raw.filePath : '',
+        exists: Boolean(raw?.exists),
+        source: raw?.source === 'custom' ? 'custom' : 'default',
+      };
+    }
+
+    // ── Tabs ──
+    document.querySelectorAll('.tab').forEach(t => {
+      t.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+        t.classList.add('active');
+        const pane = document.getElementById('pane-' + t.dataset.tab);
+        pane.classList.add('active');
+        if (t.dataset.tab === 'logs') refreshLogs();
+        if (t.dataset.tab === 'accounts') { refreshPoolStatus(); }
+        if (t.dataset.tab === 'analytics') refreshUsageSummary();
+      });
+    });
+
+    // ── Messages ──
+    window.addEventListener('message', e => {
+      const m = e.data;
+      if (m.type === 'statusUpdate') {
+        lastStatusData = m.data;
+        reconcilePendingCommand(m.data);
+        renderStatus(m.data);
+      }
+      if (m.type === 'accountsUpdate') { allData = m.data; renderAccounts(m.data); renderBackendSummary(m.data); }
+      if (m.type === 'settingsUpdate') renderSettings(m.data);
+      if (m.type === 'logsUpdate') {
+        currentLogFilePath = m.logFilePath || '';
+        currentLogFileExists = !!m.logFileExists;
+        renderLogFilePath(currentLogFilePath, currentLogFileExists);
+        renderLogs(m.data);
+        var dbgToggle = document.getElementById('log-debug-toggle');
+        if (dbgToggle) dbgToggle.classList.toggle('on', !!m.debugMode);
+      }
+      if (m.type === 'poolStatusUpdate') renderPoolStatus(m.data);
+      if (m.type === 'googleQuotaUpdate') renderGoogleQuota(m.data);
+      if (m.type === 'codexQuotaUpdate') renderCodexQuota(m.data);
+      if (m.type === 'usageSummaryUpdate') renderUsageSummary(m.data);
+      if (m.type === 'testResult') handleTestResult(m.data);
+      if (m.type === 'oauthStatus') handleOAuthStatus(m.data);
+      if (m.type === 'codexOAuthStatus') handleCodexOAuthStatus(m.data);
+      if (m.type === 'chatgptRegisterStatus') handleChatgptRegisterStatus(m.data);
+    });
+
+    // Fetch initial pool status once on load
+    setTimeout(function() {
+      refreshPoolStatus();
+    }, 0);
+
+    var lastStatusData = null;
+    var ACTION_META = {
+      'agentVibes.startServer': { label: 'Start', tone: 'primary' },
+      'agentVibes.stopServer': { label: 'Stop', tone: 'primary' },
+      'agentVibes.restartServer': { label: 'Restart', tone: 'secondary' },
+      'agentVibes.enableForwarding': { label: 'Enable forwarding', tone: 'primary' },
+      'agentVibes.disableForwarding': { label: 'Disable forwarding', tone: 'secondary' },
+    };
+    var ACTION_TIMEOUTS = {
+      'agentVibes.startServer': 60000,
+      'agentVibes.stopServer': 45000,
+      'agentVibes.restartServer': 60000,
+      'agentVibes.enableForwarding': 45000,
+      'agentVibes.disableForwarding': 45000,
+    };
+
+    function esc(v) {
+      return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function formatNumber(value) {
+      var num = Number(value || 0);
+      if (!isFinite(num)) return '--';
+      return num.toLocaleString();
+    }
+
+    function formatPercent(value) {
+      if (typeof value !== 'number' || !isFinite(value)) return '--';
+      return (Math.round(value * 10) / 10).toLocaleString() + '%';
+    }
+
+    function formatDateTime(value) {
+      if (!value) return '--';
+      var date = new Date(value);
+      if (isNaN(date.getTime())) return String(value);
+      return date.toLocaleString();
+    }
+
+    function formatConversationId(value) {
+      var text = String(value || '');
+      if (!text) return '--';
+      return text.length > 18 ? text.slice(0, 8) + '…' + text.slice(-6) : text;
+    }
+
+    function clearPendingCommand(refresh) {
+      if (window.__cmdPollTimer) {
+        clearInterval(window.__cmdPollTimer);
+        window.__cmdPollTimer = null;
+      }
+      window.__pendingCommand = null;
+      if (refresh) {
+        vscode.postMessage({ type: 'getAll' });
+      }
+    }
+
+    function startPendingPoll() {
+      if (window.__cmdPollTimer) return;
+      window.__cmdPollTimer = setInterval(function() {
+        if (!window.__pendingCommand) {
+          clearPendingCommand(false);
+          return;
+        }
+        vscode.postMessage({ type: 'getAll' });
+      }, 1000);
+    }
+
+    function beginPendingCommand(command) {
+      clearPendingCommand(false);
+      window.__pendingCommand = {
+        command: command,
+        startedAt: Date.now(),
+        initialBridge: lastStatusData ? lastStatusData.bridge : null,
+        initialForwarding: Boolean(lastStatusData && lastStatusData.forwarding),
+        sawBridgeLeaveRunning: lastStatusData ? lastStatusData.bridge !== 'Running' : false,
+      };
+      startPendingPoll();
+      vscode.postMessage({ type: 'getAll' });
+    }
+
+    function getPendingCommand() {
+      return window.__pendingCommand || null;
+    }
+
+    function getPendingTimeout(command) {
+      return ACTION_TIMEOUTS[command] || 45000;
+    }
+
+    function getPendingDisplayCommand(status) {
+      var pending = getPendingCommand();
+      if (!pending || !status) return null;
+
+      switch (pending.command) {
+        case 'agentVibes.stopServer':
+          if (status.bridge === 'Running' || status.bridge === 'starting') {
+            return 'agentVibes.stopServer';
+          }
+          if (pending.initialForwarding && status.forwarding) {
+            return 'agentVibes.disableForwarding';
+          }
+          return 'agentVibes.stopServer';
+        case 'agentVibes.startServer':
+          if (status.bridge !== 'Running') {
+            return 'agentVibes.startServer';
+          }
+          if (!status.forwarding) {
+            return 'agentVibes.enableForwarding';
+          }
+          return 'agentVibes.startServer';
+        case 'agentVibes.restartServer':
+          return 'agentVibes.restartServer';
+        case 'agentVibes.enableForwarding':
+        case 'agentVibes.disableForwarding':
+          return pending.command;
+        default:
+          return pending.command;
+      }
+    }
+
+    function reconcilePendingCommand(status) {
+      var pending = getPendingCommand();
+      if (!pending || !status) return;
+
+      if (pending.command === 'agentVibes.restartServer' && status.bridge !== 'Running') {
+        pending.sawBridgeLeaveRunning = true;
+      }
+
+      var done = false;
+      switch (pending.command) {
+        case 'agentVibes.stopServer':
+          done =
+            status.bridge !== 'Running' &&
+            status.bridge !== 'starting' &&
+            (!pending.initialForwarding || !status.forwarding);
+          break;
+        case 'agentVibes.startServer':
+          done = status.bridge === 'error' || (status.bridge === 'Running' && status.forwarding);
+          break;
+        case 'agentVibes.restartServer':
+          done =
+            status.bridge === 'error' ||
+            (pending.sawBridgeLeaveRunning && status.bridge === 'Running');
+          break;
+        case 'agentVibes.enableForwarding':
+          done = !!status.forwarding;
+          break;
+        case 'agentVibes.disableForwarding':
+          done = !status.forwarding;
+          break;
+      }
+
+      if (done) {
+        clearPendingCommand(false);
+        return;
+      }
+
+      if (Date.now() - pending.startedAt >= getPendingTimeout(pending.command)) {
+        clearPendingCommand(true);
+      }
+    }
+
+    function getActionState(command, pendingDisplayCommand, baseDisabled) {
+      if (!pendingDisplayCommand) {
+        return { loading: false, disabled: !!baseDisabled };
+      }
+      return {
+        loading: pendingDisplayCommand === command,
+        disabled: pendingDisplayCommand !== command || !!baseDisabled,
+      };
+    }
+
+    function actionBtn(label, command, tone = 'secondary', state = {}) {
+      if (!command) return '';
+      var loading = !!state.loading;
+      var disabled = !!state.disabled || loading;
+      var content = loading
+        ? '<span class="btn-spinner"></span>' + esc(label) + '…'
+        : esc(label);
+      var classes = 'btn btn-' + tone + (loading ? ' btn-loading' : '');
+      var attrs = disabled ? ' disabled' : '';
+      return '<button class="' + classes + '" onclick="runCmdWithLoading(this, \'' + esc(command) + '\')"'+ attrs + '>' + content + '</button>';
+    }
+
+    function renderActions(s) {
+      const actions = document.getElementById('hero-actions');
+      const btns = [];
+      const pendingDisplayCommand = getPendingDisplayCommand(s);
+      const renderedCommands = new Set();
+      const baseActions = [];
+
+      const isRunning = s.bridge === 'Running';
+      if (isRunning) {
+        baseActions.push({ label: 'Stop', command: 'agentVibes.stopServer', tone: 'primary' });
+      } else {
+        baseActions.push({ label: 'Start', command: 'agentVibes.startServer', tone: 'primary' });
+      }
+      baseActions.push({ label: 'Restart', command: 'agentVibes.restartServer', tone: 'secondary', disabled: !isRunning });
+
+      if (s.forwarding) {
+        baseActions.push({ label: 'Disable forwarding', command: 'agentVibes.disableForwarding', tone: 'secondary' });
+      } else {
+        baseActions.push({ label: 'Enable forwarding', command: 'agentVibes.enableForwarding', tone: isRunning ? 'primary' : 'secondary' });
+      }
+
+      if (pendingDisplayCommand && !baseActions.some(function(action) { return action.command === pendingDisplayCommand; })) {
+        var pendingMeta = ACTION_META[pendingDisplayCommand];
+        if (pendingMeta) {
+          btns.push(actionBtn(
+            pendingMeta.label,
+            pendingDisplayCommand,
+            pendingMeta.tone,
+            getActionState(pendingDisplayCommand, pendingDisplayCommand),
+          ));
+          renderedCommands.add(pendingDisplayCommand);
+        }
+      }
+
+      for (const action of baseActions) {
+        if (renderedCommands.has(action.command)) continue;
+        btns.push(actionBtn(
+          action.label,
+          action.command,
+          action.tone,
+          getActionState(action.command, pendingDisplayCommand, action.disabled),
+        ));
+      }
+
+      actions.innerHTML = btns.join('');
+    }
+
+    function switchTab(tabName) {
+      const tab = document.querySelector('.tab[data-tab="' + tabName + '"]');
+      if (tab) tab.click();
+    }
+
+    // ── Overview: status ──
+    function renderStatus(s) {
+      const isRunning = s.bridge === 'Running';
+      const setup = s.setup || null;
+      const overall = setup?.overallState || (isRunning ? 'ready' : 'setup');
+
+      // Progress bar — always visible
+      const completed = setup?.completedSteps ?? 0;
+      const total = setup?.totalSteps ?? 4;
+      const progressBar = document.getElementById('status-progress-bar');
+      const progressText = document.getElementById('status-progress-text');
+      progressBar.style.display = '';
+      document.getElementById('progress-fill').style.width = Math.round((completed / total) * 100) + '%';
+      progressText.textContent = completed + ' / ' + total;
+
+      renderActions(s);
+
+      // 5 status cards — user-facing info only
+      const grid = document.getElementById('status-grid');
+      const cards = [
+        { label: 'Health', value: isRunning ? 'Online' : 'Offline', tone: isRunning ? 'good' : 'warn' },
+        { label: 'SSL', value: s.hasCertificates ? 'Valid' : 'Missing', tone: s.hasCertificates ? 'good' : 'warn' },
+        { label: 'Forwarding', value: s.forwarding ? 'Active' : 'Idle', tone: s.forwarding ? 'good' : 'muted' },
+        { label: 'Port', value: String(s.port || '--'), tone: s.port ? 'good' : '' },
+        { label: 'Accounts', value: String(s.totalAccounts || 0), tone: s.totalAccounts > 0 ? 'good' : 'warn' },
+      ];
+      grid.innerHTML = cards.map(function(c) {
+        var dotCls = c.tone === 'good' ? 'dot-good' : c.tone === 'warn' ? 'dot-warn' : '';
+        return '<div class="status-card">' +
+          '<span class="status-dot dot ' + dotCls + '"></span>' +
+          '<div class="status-card-body">' +
+            '<div class="status-card-label">' + esc(c.label) + '</div>' +
+            '<div class="status-card-value">' + esc(c.value) + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      // Setup checklist removed — Actions section provides sufficient guidance
+      const setupList = document.getElementById('setup-list');
+      setupList.innerHTML = '';
+    }
+
+    // ── Overview: backends ──
+    function renderBackendSummary(data) {
+      const el = document.getElementById('overview-backends');
+      // Model mapping per backend
+      const BACKEND_MODELS = {
+        antigravity: ['Gemini Pro 3.1 High', 'Claude Opus 4.6'],
+        codex: ['GPT-5.4', 'Codex'],
+        'openai-compat': ['Custom Models'],
+        'claude-api': ['Claude Opus 4.6'],
+      };
+      let h = '';
+      for (const [k, d] of Object.entries(CH)) {
+        const n = getChannelState(data, k).accounts.length;
+        // Build action buttons like sidebar
+        let btns = '';
+        if (d.sync && d.sync.length > 0) {
+          for (const s of d.sync) {
+            btns += '<button class="btn btn-primary" onclick="runCmd(\'' + s.cmd + '\')">' + esc(s.label) + '</button>';
+          }
+        }
+
+        // Model tags
+        let modelTags = '';
+        if (n > 0 && BACKEND_MODELS[k]) {
+          modelTags = '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+          for (const m of BACKEND_MODELS[k]) {
+            modelTags += '<span class="setting-badge setting-badge-ok">' + esc(m) + '</span>';
+          }
+          modelTags += '</div>';
+        }
+
+        h += '<div class="be ' + d.beCls + '">' +
+          '<div class="be-top">' +
+            '<span class="be-name" style="cursor:pointer" onclick="switchTab(\'accounts\')">' + esc(d.label) + '</span>' +
+            '<button class="btn" onclick="openDlg(\'' + k + '\')" title="Add account" style="padding:0 8px;font-size:14px;font-weight:700;background:' + d.color + ';color:#000;border:none">+</button>' +
+          '</div>' +
+          (n === 0 ? '<div class="be-status">Not configured</div>' : '') +
+          modelTags +
+          (btns || n > 0 ? '<div class="btn-row" style="margin-top:0">' + btns + (n > 0 ? '<span class="be-status">' + n + ' account(s)</span>' : '') + '</div>' : '') +
+        '</div>';
+      }
+      el.innerHTML = h;
+      renderOverviewHealth();
+    }
+
+    // ── Accounts tab ──
+    var selectedChannel = 'antigravity';
+    var emailPrivacy = false;
+    var codexSubView = 'accounts'; // 'accounts' | 'register'
+    var registerDraft = null; // live form values preserved across re-renders
+    var antigravityDraft = { proxyUrl: '' };
+
+    function maskEmail(email) {
+      if (!emailPrivacy || !email) return email;
+      var at = email.indexOf('@');
+      if (at <= 1) return '******@' + (at >= 0 ? email.slice(at + 1) : '******');
+      return email.charAt(0) + '******' + email.slice(at);
+    }
+
+    function toggleEmailPrivacy() {
+      emailPrivacy = !emailPrivacy;
+      renderChannelDetail();
+    }
+
+    function renderAccounts(data) {
+      const sidebar = document.getElementById('acct-sidebar');
+      let h = '';
+
+      for (const [k, d] of Object.entries(CH)) {
+        const state = getChannelState(data, k);
+        const list = state.accounts;
+        const sel = selectedChannel === k;
+
+        h += '<div class="acct-item' + (sel ? ' selected' : '') + '" onclick="selectChannel(\'' + k + '\')">';
+        h += '<span class="ch-bar ' + d.barCls + '"></span>';
+        h += '<span class="acct-item-name">' + esc(d.label) + '</span>';
+        h += '<span style="font-size:var(--text-xs);color:var(--fg-3)">' + list.length + '</span>';
+        h += '</div>';
+      }
+      sidebar.innerHTML = h;
+      renderChannelDetail();
+    }
+
+    function selectChannel(channel) {
+      selectedChannel = channel;
+      codexSubView = 'accounts';
+      acctPage = 0;
+      // Update sidebar highlight
+      document.querySelectorAll('#acct-sidebar .acct-item').forEach(function(el) { el.classList.remove('selected'); });
+      var items = document.querySelectorAll('#acct-sidebar .acct-item');
+      var idx = 0;
+      for (var k in CH) {
+        if (k === channel && items[idx]) items[idx].classList.add('selected');
+        idx++;
+      }
+      renderChannelDetail();
+    }
+
+    function getPoolEntry(channel, index) {
+      if (!poolData || !poolData.backends) return null;
+      var poolKey = null;
+      for (var pk in POOL_BACKEND_MAP) {
+        if (POOL_BACKEND_MAP[pk] === channel) { poolKey = pk; break; }
+      }
+      if (!poolKey) return null;
+      var backend = poolData.backends[poolKey];
+      if (!backend || !backend.entries) return null;
+
+      // Match by email+accountId (preferred), then email/label, then index
+      if (allData) {
+        var d = CH[channel];
+        var state = getChannelState(allData, channel);
+        if (d && state.accounts[index]) {
+          var acct = state.accounts[index];
+          var acctName = d.name(acct);
+          var acctId = acct.accountId || '';
+
+          // Try exact match: email + accountId
+          if (acctName && acctId) {
+            for (var pi = 0; pi < backend.entries.length; pi++) {
+              if (backend.entries[pi].label === acctName && backend.entries[pi].accountId === acctId) {
+                return backend.entries[pi];
+              }
+            }
+          }
+
+          // Fallback: match by email/label only
+          if (acctName) {
+            for (var pi = 0; pi < backend.entries.length; pi++) {
+              if (backend.entries[pi].label === acctName) return backend.entries[pi];
+            }
+          }
+        }
+      }
+
+      // Fallback: index-based
+      return backend.entries[index] || null;
+    }
+
+    function getQuotaAccount(email) {
+      if (!googleQuotaData || !googleQuotaData.accounts) return null;
+      for (var i = 0; i < googleQuotaData.accounts.length; i++) {
+        if (googleQuotaData.accounts[i].email === email) return googleQuotaData.accounts[i];
+      }
+      return null;
+    }
+
+    function getCodexQuotaAccount(acct, poolEntry) {
+      if (!codexQuotaData || !codexQuotaData.accounts) return null;
+      var acctEmail = acct && acct.email ? String(acct.email).toLowerCase() : '';
+      var acctId = acct && acct.accountId ? String(acct.accountId) : '';
+      var poolLabel = poolEntry && poolEntry.label ? String(poolEntry.label) : '';
+      for (var i = 0; i < codexQuotaData.accounts.length; i++) {
+        var item = codexQuotaData.accounts[i];
+        var itemEmail = item && item.label ? String(item.label).toLowerCase() : '';
+        var itemId = item && item.accountId ? String(item.accountId) : '';
+        if (acctEmail && acctId && itemEmail === acctEmail && itemId === acctId) return item;
+        if (acctEmail && itemEmail === acctEmail) return item;
+        if (poolLabel && item && item.label === poolLabel) return item;
+      }
+      return (poolEntry && poolEntry.rateLimits) ? poolEntry : null;
+    }
+
+    // Key models to display for Antigravity accounts
+    var KEY_MODEL_FILTERS = [
+      { label: 'Gemini Pro 3.1 High', color: '#34d399', match: function(n) { var l = n.toLowerCase(); return l.indexOf('gemini') >= 0 && (l.indexOf('3.1') >= 0 || l.indexOf('pro') >= 0); } },
+      { label: 'Claude Opus 4.6', color: '#a78bfa', match: function(n) { var l = n.toLowerCase(); return l.indexOf('claude') >= 0 && l.indexOf('opus') >= 0; } },
+    ];
+
+    function findKeyModel(models, filter) {
+      if (!models) return null;
+      for (var i = 0; i < models.length; i++) {
+        var name = models[i].displayName || models[i].name || '';
+        if (filter.match(name)) return models[i];
+      }
+      return null;
+    }
+
+    var acctPage = 0;
+    var ACCT_PER_PAGE = 10;
+
+    function renderChannelDetail() {
+      var panel = document.getElementById('acct-detail');
+      if (!selectedChannel || !allData) {
+        panel.innerHTML = '<div class="detail-empty">Select a channel</div>';
+        return;
+      }
+
+      var d = CH[selectedChannel];
+      if (!d) return;
+      var state = getChannelState(allData, selectedChannel);
+      var list = state.accounts;
+      var totalPages = Math.max(1, Math.ceil(list.length / ACCT_PER_PAGE));
+      if (acctPage >= totalPages) acctPage = totalPages - 1;
+      if (acctPage < 0) acctPage = 0;
+      var startIdx = acctPage * ACCT_PER_PAGE;
+      var endIdx = Math.min(startIdx + ACCT_PER_PAGE, list.length);
+      var h = '';
+
+      // Channel header — title + file path only
+      h += '<div class="detail-header">';
+      h += '<div class="detail-email">' + esc(d.label) + '</div>';
+      if (state.filePath) {
+        h += '<div class="detail-meta" style="display:flex;align-items:center;gap:5px;margin-top:4px">';
+        h += '<svg onclick="openAccountFile(\'' + selectedChannel + '\')" style="cursor:pointer;flex-shrink:0;opacity:.45;transition:opacity .15s" onmouseover="this.style.opacity=.9" onmouseout="this.style.opacity=.45" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 8.5V14a1 1 0 01-1 1H3a1 1 0 01-1-1V2a1 1 0 011-1h5.5"/><polyline points="10 1 15 1 15 6"/><line x1="15" y1="1" x2="8" y2="8"/></svg>';
+        h += '<span>' + esc(state.filePath) + '</span>';
+        h += '</div>';
+      }
+      // Action bar — sync buttons + add
+      h += '<div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3)">';
+      if (d.sync && d.sync.length > 0) {
+        for (var si = 0; si < d.sync.length; si++) {
+          h += '<button class="btn btn-secondary" onclick="runCmd(\'' + d.sync[si].cmd + '\')">' + esc(d.sync[si].label) + '</button>';
+        }
+      }
+      h += '<button class="btn btn-primary" onclick="openDlg(\'' + selectedChannel + '\')">+ Add</button>';
+      // Register button hidden
+      // if (selectedChannel === 'codex') {
+      //   h += '<button class="btn btn-secondary" onclick="switchCodexSubView(\'register\')" style="background:var(--focus);color:#fff;border:none">Register</button>';
+      // }
+      h += '<button class="btn btn-ghost" onclick="toggleEmailPrivacy()" title="Toggle email privacy" style="margin-left:auto;padding:0 6px">' + (emailPrivacy ? '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2.5"/></svg>' : '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2.5"/><line x1="2" y1="14" x2="14" y2="2"/></svg>') + '</button>';
+      h += '</div>';
+      h += '</div>';
+
+      // ── Inline Register panel (replaces account list when active) ──
+      if (selectedChannel === 'codex' && codexSubView === 'register') {
+        // Snapshot live form values before re-render (survives auto-refresh)
+        snapshotRegisterDraft();
+        var defs = registerDraft || (allData && allData.chatgptRegisterDefaults) || {};
+        h += '<div style="border-top:1px solid var(--line);padding-top:var(--sp-4);margin-top:var(--sp-2)">';
+        h += '<div style="display:flex;align-items:center;gap:var(--sp-2);margin-bottom:var(--sp-3)">';
+        h += '<button class="btn btn-ghost" onclick="switchCodexSubView(\'accounts\')" style="padding:0 var(--sp-2)">← Back</button>';
+        h += '<span style="font-size:var(--text-lg);font-weight:700">GPT Register</span>';
+        h += '</div>';
+        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6;margin-bottom:var(--sp-3)">';
+        h += 'Connect to your self-hosted email provisioning service (CF Worker / custom API) to automatically register a ChatGPT account, complete the OAuth flow, and save the resulting Codex credentials.';
+        h += '</div>';
+        h += '<div class="field"><label>API URL</label>';
+        h += '<input type="text" id="f-reg-apiUrl" placeholder="https://your-worker.your-domain.workers.dev" value="' + esc(defs.apiUrl || '') + '" /></div>';
+        h += '<div class="field"><label>Admin Token</label>';
+        h += '<input type="text" id="f-reg-adminToken" placeholder="Worker admin token" value="' + esc(defs.adminToken || '') + '" /></div>';
+        h += '<div class="field"><label>Domains (one per line, prefix * to enable for random selection)</label>';
+        h += '<textarea id="f-reg-domains" style="min-height:60px" placeholder="*enabled-domain.com\nother-domain.com">' + esc(mergeDomainsForDisplay(defs)) + '</textarea></div>';
+        h += '<div style="margin-top:var(--sp-3)">';
+        h += '<button class="btn btn-primary" id="inline-reg-btn" onclick="startChatgptRegisterInline()">Start Registration</button>';
+        h += '</div>';
+        h += '<div id="chatgpt-register-status" style="margin-top:var(--sp-3)"></div>';
+        h += '</div>';
+
+        panel.innerHTML = h;
+        return;
+      }
+
+      // Account list (paginated)
+      if (list.length === 0) {
+        h += '<div style="color:var(--fg-3);font-size:var(--text-sm);padding:var(--sp-4) 0">No accounts configured</div>';
+      } else {
+        for (var i = startIdx; i < endIdx; i++) {
+          var acct = list[i];
+          var poolEntry = getPoolEntry(selectedChannel, i);
+          var quotaAcct = (selectedChannel === 'antigravity' && acct.email) ? getQuotaAccount(acct.email) : null;
+          var codexQuotaAcct = (selectedChannel === 'codex') ? getCodexQuotaAccount(acct, poolEntry) : null;
+
+          h += '<div style="padding:var(--sp-3) 0">';
+
+          // Account row: left=info, right=remove
+          h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)">';
+          h += '<div style="display:flex;align-items:center;gap:var(--sp-2);min-width:0;flex:1">';
+          if (poolEntry) {
+            h += '<span class="dot ' + stateDotCls(poolEntry.state) + '"></span>';
+          }
+          h += '<span style="font-weight:600;font-size:var(--text-base)">' + esc(maskEmail(d.name(acct))) + '</span>';
+          // Badges
+          if (poolEntry && poolEntry.planType) {
+            var planLabel = poolEntry.planType.charAt(0).toUpperCase() + poolEntry.planType.slice(1).toLowerCase();
+            h += '<span class="setting-badge ' + planBadgeCls(poolEntry.planType) + '">' + esc(planLabel) + '</span>';
+          }
+          if (quotaAcct && quotaAcct.tier) {
+            var tierRaw = String(quotaAcct.tier).replace(/^google\s*ai\s*/i, '');
+            var tier = tierRaw.toUpperCase();
+            var tierLabel = tierRaw.charAt(0).toUpperCase() + tierRaw.slice(1).toLowerCase();
+            h += '<span class="setting-badge ' + (tier === 'ULTRA' || tier.indexOf('ULTRA') >= 0 ? 'setting-badge-ok' : tier === 'PRO' || tier.indexOf('PRO') >= 0 ? 'setting-badge-warn' : '') + '">' + esc(tierLabel) + '</span>';
+          }
+          if (poolEntry) {
+            h += '<span style="font-size:var(--text-xs);color:var(--fg-2)">' + esc(stateLabel(poolEntry.state)) + '</span>';
+          }
+          h += '</div>';
+          h += '<button class="btn btn-danger" style="font-size:var(--text-xs);padding:2px 8px" onclick="rmAcct(\'' + selectedChannel + '\',' + i + ')">Remove</button>';
+          h += '</div>';
+
+          // Quota bars for Antigravity — always render key models, even at 0%
+          if (selectedChannel === 'antigravity' && quotaAcct && quotaAcct.models && quotaAcct.models.length > 0) {
+            for (var fi = 0; fi < KEY_MODEL_FILTERS.length; fi++) {
+              var filter = KEY_MODEL_FILTERS[fi];
+              var model = findKeyModel(quotaAcct.models, filter);
+              var pct = model && typeof model.percentage === 'number' ? model.percentage : 0;
+              var width = Math.max(0, Math.min(100, pct));
+
+              h += '<div style="margin-top:var(--sp-2)">';
+              h += '<div style="display:flex;justify-content:space-between;font-size:var(--text-xs);color:var(--fg-2);margin-bottom:3px">';
+              h += '<span>' + esc(filter.label) + '</span>';
+              h += '<span>' + esc(pct + '%') + (model && model.resetTime ? ' · ' + esc(formatRelativeTime(model.resetTime)) : '') + '</span>';
+              h += '</div>';
+              h += '<div class="progress-track" style="height:5px"><div class="progress-fill" style="width:' + width + '%;background:' + filter.color + '"></div></div>';
+              h += '</div>';
+            }
+          }
+
+          // Rate limit bars for Codex — prefer live pool status data, fall back
+          // to the dedicated quota endpoint payload if present.
+          if (selectedChannel === 'codex' && codexQuotaAcct && codexQuotaAcct.rateLimits) {
+            var rl = codexQuotaAcct.rateLimits;
+            var limits = [];
+            if (rl.primary) limits.push({ label: '5h limit', data: rl.primary, color: '#4fc3f7' });
+            if (rl.secondary) limits.push({ label: 'Weekly limit', data: rl.secondary, color: '#81c784' });
+            for (var li = 0; li < limits.length; li++) {
+              var lim = limits[li];
+              var leftPct = Math.max(0, +(100 - lim.data.usedPercent).toFixed(1));
+              var leftWidth = Math.max(0, Math.min(100, leftPct));
+              var resetInfo = '';
+              if (lim.data.resetsAt) {
+                var resetDate = parseDateValue(lim.data.resetsAt);
+                if (resetDate) {
+                  var resetHH = String(resetDate.getHours()).padStart(2, '0');
+                  var resetMM = String(resetDate.getMinutes()).padStart(2, '0');
+                  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                  resetInfo = ' (resets ' + resetHH + ':' + resetMM + ' on ' + resetDate.getDate() + ' ' + months[resetDate.getMonth()] + ')';
+                }
+              }
+              h += '<div style="margin-top:var(--sp-2)">';
+              h += '<div style="display:flex;justify-content:space-between;font-size:var(--text-xs);color:var(--fg-2);margin-bottom:3px">';
+              h += '<span>' + esc(lim.label) + '</span>';
+              h += '<span>' + esc(leftPct + '% left') + esc(resetInfo) + '</span>';
+              h += '</div>';
+              h += '<div class="progress-track" style="height:5px"><div class="progress-fill" style="width:' + leftWidth + '%;background:' + lim.color + '"></div></div>';
+              h += '</div>';
+            }
+          }
+
+          h += '</div>';
+        }
+
+        // Pagination footer
+        if (totalPages > 1) {
+          h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:var(--sp-3) 0;font-size:var(--text-xs);color:var(--fg-2)">';
+          h += '<span>' + (startIdx + 1) + '–' + endIdx + ' of ' + list.length + '</span>';
+          h += '<div style="display:flex;gap:var(--sp-2)">';
+          h += '<button class="btn btn-secondary" style="font-size:var(--text-xs);padding:2px 10px" onclick="acctPageNav(-1)"' + (acctPage <= 0 ? ' disabled' : '') + '>← Prev</button>';
+          h += '<button class="btn btn-secondary" style="font-size:var(--text-xs);padding:2px 10px" onclick="acctPageNav(1)"' + (acctPage >= totalPages - 1 ? ' disabled' : '') + '>Next →</button>';
+          h += '</div>';
+          h += '</div>';
+        }
+      }
+
+      panel.innerHTML = h;
+    }
+
+    function acctPageNav(delta) {
+      acctPage += delta;
+      renderChannelDetail();
+    }
+
+    // ── Settings tab ──
+    let activeSettingsGroup = 'bridge';
+
+    function renderSettings(data) {
+      // data is now a structured object with groups
+      const groups = (data.groups || []).filter(function(g) { return g.items && g.items.length > 0; });
+      const nav = document.getElementById('settings-nav');
+      const content = document.getElementById('settings-content');
+      if (groups.length > 0 && !groups.some(function(g) { return g.id === activeSettingsGroup; })) {
+        activeSettingsGroup = groups[0].id;
+      }
+
+      // Build nav
+      nav.innerHTML = groups.map(function(g) {
+        return '<button class="settings-nav-item' + (g.id === activeSettingsGroup ? ' active' : '') + '" data-group="' + esc(g.id) + '" onclick="switchSettingsGroup(\'' + esc(g.id) + '\')">' + esc(g.label) + '</button>';
+      }).join('');
+
+      // Build content groups
+      var ch = '';
+      for (var gi = 0; gi < groups.length; gi++) {
+        var g = groups[gi];
+        ch += '<div class="settings-group' + (g.id === activeSettingsGroup ? ' active' : '') + '" id="sg-' + esc(g.id) + '">';
+        ch += '<div class="settings-group-title">' + esc(g.label) + '</div>';
+        if (g.desc) ch += '<div class="settings-group-desc">' + esc(g.desc) + '</div>';
+        for (var si = 0; si < g.items.length; si++) {
+          var item = g.items[si];
+          ch += '<div class="setting-item">';
+          ch += '<div class="setting-top">';
+          ch += '<div><div class="setting-label">' + esc(item.label) + '</div>';
+          if (item.desc) ch += '<div class="setting-desc">' + esc(item.desc) + '</div>';
+          ch += '</div>';
+          // Right side: value or control
+          if (item.type === 'toggle') {
+            var on = Boolean(item.value);
+            ch += '<div class="toggle ' + (on ? 'on' : '') + '" data-key="' + esc(item.key) + '" onclick="toggleSetting(this)">';
+            ch += '<span class="toggle-label">' + (on ? 'On' : 'Off') + '</span>';
+            ch += '<div class="toggle-track"></div></div>';
+          } else if (item.type === 'number') {
+            ch += '<input class="setting-input" type="number" value="' + esc(item.value) + '" data-key="' + esc(item.key) + '" onchange="updateNumberSetting(this)" />';
+          } else if (item.type === 'select') {
+            ch += '<select class="setting-input" data-key="' + esc(item.key) + '" onchange="updateStringSetting(this)">';
+            if (item.options) {
+              for (var oi = 0; oi < item.options.length; oi++) {
+                var opt = item.options[oi];
+                ch += '<option value="' + esc(opt.value) + '"' + (opt.value === item.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
+              }
+            }
+            ch += '</select>';
+          } else if (item.type === 'badge') {
+            var badgeCls = item.tone === 'ok' ? 'setting-badge-ok' : item.tone === 'warn' ? 'setting-badge-warn' : '';
+            ch += '<span class="setting-badge ' + badgeCls + '">' + esc(item.value) + '</span>';
+          } else {
+            // readonly
+            ch += '<span class="setting-val">' + esc(item.value) + '</span>';
+          }
+          ch += '</div>'; // setting-top
+          // Path input (full-width below label)
+          if (item.type === 'path') {
+            ch += '<input class="setting-input-wide" type="text" value="' + esc(item.value) + '" placeholder="' + esc(item.placeholder || '') + '" data-key="' + esc(item.key) + '" onchange="updateStringSetting(this)" />';
+          }
+          ch += '</div>'; // setting-item
+        }
+        ch += '</div>'; // settings-group
+      }
+      content.innerHTML = ch;
+    }
+
+    function switchSettingsGroup(id) {
+      activeSettingsGroup = id;
+      document.querySelectorAll('.settings-nav-item').forEach(function(el) {
+        el.classList.toggle('active', el.dataset.group === id);
+      });
+      document.querySelectorAll('.settings-group').forEach(function(el) {
+        el.classList.toggle('active', el.id === 'sg-' + id);
+      });
+    }
+
+    function toggleSetting(el) {
+      const key = el.dataset.key;
+      const isOn = el.classList.contains('on');
+      const newVal = !isOn;
+      el.classList.toggle('on');
+      el.querySelector('.toggle-label').textContent = newVal ? 'On' : 'Off';
+      vscode.postMessage({ type: 'updateSetting', key: key, value: newVal });
+    }
+
+    function updateNumberSetting(el) {
+      var key = el.dataset.key;
+      var val = parseInt(el.value, 10);
+      if (!isNaN(val)) {
+        vscode.postMessage({ type: 'updateSetting', key: key, value: val });
+      }
+    }
+
+    function updateStringSetting(el) {
+      var key = el.dataset.key;
+      vscode.postMessage({ type: 'updateSetting', key: key, value: el.value.trim() });
+    }
+
+    // ── Dialog ──
+    var dlgOAuthTab = 'oauth'; // 'oauth' or 'token'
+
+    function openDlg(ch) {
+      curCh = ch;
+      const d = CH[ch];
+      const title = document.getElementById('dlg-title');
+      const fields = document.getElementById('dlg-fields');
+      const okBtn = document.getElementById('dlg-ok');
+
+      // Reset action bar visibility + default label
+      document.querySelector('#dlg .dialog-actions').style.display = '';
+      okBtn.style.display = '';
+      okBtn.disabled = false;
+
+      if (ch === 'antigravity') {
+        title.textContent = 'Add ' + d.label + ' Account';
+        antigravityDraft = { proxyUrl: '' };
+        dlgOAuthTab = 'oauth';
+        renderAntigravityDlg();
+      } else if (ch === 'codex') {
+        title.textContent = 'Add ' + d.label + ' Account';
+        codexOAuthTab = 'oauth';
+        renderCodexDlg();
+      } else if (d.mode === 'sync') {
+        title.textContent = 'Add ' + d.label + ' Token';
+        okBtn.textContent = 'Add';
+        okBtn.onclick = submitDlg;
+        fields.innerHTML =
+          '<div class="field"><label>Refresh Token</label>' +
+          '<textarea id="f-token" placeholder="Paste token(s)...\nSupports: single, JSON array, or multi-line"></textarea>' +
+          '<div class="field-hint">Format: 1//xxx (Google) or rt_xxx (OpenAI). Batch supported.</div></div>';
+      } else {
+        title.textContent = 'Add ' + d.label + ' Account';
+        okBtn.textContent = 'Add';
+        okBtn.onclick = submitDlg;
+        let fh = '';
+        for (const f of d.fields) {
+          fh += '<div class="field"><label>' + esc(f.label) + '</label>' +
+            '<input type="' + f.type + '" id="f-' + f.key + '" placeholder="' + esc(f.ph || '') + '" /></div>';
+        }
+        fields.innerHTML = fh;
+      }
+
+      document.getElementById('dlg').classList.add('open');
+      setTimeout(() => {
+        const el = document.querySelector('#dlg-fields input, #dlg-fields textarea');
+        if (el) el.focus();
+      }, 80);
+    }
+
+    function renderAntigravityDlg() {
+      const fields = document.getElementById('dlg-fields');
+      const okBtn = document.getElementById('dlg-ok');
+      const isOAuth = dlgOAuthTab === 'oauth';
+      let h = '';
+
+      // Tab bar
+      h += '<div class="oauth-tabs">';
+      h += '<button class="oauth-tab' + (isOAuth ? ' active' : '') + '" onclick="switchOAuthTab(\'oauth\')">Google OAuth</button>';
+      h += '<button class="oauth-tab' + (!isOAuth ? ' active' : '') + '" onclick="switchOAuthTab(\'token\')">Refresh Token</button>';
+      h += '</div>';
+
+      h += '<div class="dlg-body">';
+
+      if (isOAuth) {
+        h += '<div style="padding:var(--sp-3) 0">';
+        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6">';
+        h += 'Click the button below to open Google authorization in your browser. ';
+        h += 'After you sign in, the account will be saved automatically.';
+        h += '</div>';
+        h += '<div id="oauth-status" style="margin-top:var(--sp-3)"></div>';
+        h += '</div>';
+
+        // Update bottom action button for OAuth
+        okBtn.textContent = 'Start Authorization';
+        okBtn.disabled = false;
+        okBtn.onclick = startOAuth;
+      } else {
+        // Token content: textarea
+        h += '<div class="field"><label>Refresh Token</label>' +
+          '<textarea id="f-token" placeholder="Paste token(s)...\nSupports: single, JSON array, or multi-line"></textarea>' +
+          '<div class="field-hint">Format: 1//xxx (Google). Batch supported.</div></div>';
+
+        // Update bottom action button for Token
+        okBtn.textContent = 'Add';
+        okBtn.disabled = false;
+        okBtn.onclick = submitDlg;
+      }
+
+      h += '</div>';
+      fields.innerHTML = h;
+    }
+
+    function switchOAuthTab(tab) {
+      dlgOAuthTab = tab;
+      renderAntigravityDlg();
+      if (tab === 'token') {
+        setTimeout(function() {
+          var el = document.getElementById('f-token');
+          if (el) el.focus();
+        }, 80);
+      }
+    }
+
+    function startOAuth() {
+      var btn = document.getElementById('dlg-ok');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Opening browser...';
+      }
+      vscode.postMessage({
+        type: 'startOAuth'
+      });
+    }
+
+    function handleOAuthStatus(data) {
+      var el = document.getElementById('oauth-status');
+      if (!el) return;
+      var btn = document.getElementById('dlg-ok');
+
+      if (data.status === 'loading') {
+        el.innerHTML = '<div style="display:flex;align-items:center;gap:8px;padding:var(--sp-2) 0;color:var(--focus);font-size:var(--text-sm)"><span class="spinner"></span>' + esc(data.message) + '</div>';
+        if (btn) { btn.disabled = true; btn.textContent = 'Waiting...'; }
+      } else if (data.status === 'success') {
+        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--good);font-size:var(--text-sm);font-weight:600">' + esc(data.message) + '</div>';
+        if (btn) { btn.style.display = 'none'; }
+        setTimeout(function() { closeDlg(); }, 2000);
+      } else if (data.status === 'error') {
+        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--err);font-size:var(--text-sm)">' + esc(data.message) + '</div>';
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; btn.onclick = startOAuth; }
+      }
+    }
+
+    // ── Codex OAuth Dialog ──
+    var codexOAuthTab = 'oauth';
+
+    function renderCodexDlg() {
+      var fields = document.getElementById('dlg-fields');
+      var okBtn = document.getElementById('dlg-ok');
+      var isOAuth = codexOAuthTab === 'oauth';
+      var isRegister = codexOAuthTab === 'register';
+      var isToken = codexOAuthTab === 'token';
+      var h = '';
+
+      // Tab bar — only show when NOT in standalone register mode
+      if (!isRegister) {
+        h += '<div class="oauth-tabs">';
+        h += '<button class="oauth-tab' + (isOAuth ? ' active' : '') + '" onclick="switchCodexOAuthTab(\'oauth\')">OpenAI OAuth</button>';
+        h += '<button class="oauth-tab' + (isToken ? ' active' : '') + '" onclick="switchCodexOAuthTab(\'token\')">Manual Sync</button>';
+        h += '</div>';
+      }
+
+      h += '<div class="dlg-body">';
+
+      if (isOAuth) {
+        h += '<div style="padding:var(--sp-3) 0">';
+        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6">';
+        h += 'Click the button below to open OpenAI authorization in your browser.';
+        h += '</div>';
+        h += '<div id="codex-oauth-status" style="margin-top:var(--sp-3)"></div>';
+        h += '</div>';
+
+        okBtn.textContent = 'Start Authorization';
+        okBtn.disabled = false;
+        okBtn.onclick = startCodexOAuth;
+      } else if (isRegister) {
+        var defs = (allData && allData.chatgptRegisterDefaults) || {};
+        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6;padding:var(--sp-2) 0 var(--sp-3)">';
+        h += 'Connect to your self-hosted email provisioning service (CF Worker / custom API) to automatically register a ChatGPT account, complete the OAuth flow, and save the resulting Codex credentials.';
+        h += '</div>';
+        h += '<div class="field"><label>API URL</label>';
+        h += '<input type="text" id="f-reg-apiUrl" placeholder="https://your-worker.your-domain.workers.dev" value="' + esc(defs.apiUrl || '') + '" /></div>';
+        h += '<div class="field"><label>Admin Token</label>';
+        h += '<input type="text" id="f-reg-adminToken" placeholder="Worker admin token" value="' + esc(defs.adminToken || '') + '" /></div>';
+        h += '<div class="field"><label>Domains (one per line, prefix * to enable for random selection)</label>';
+        h += '<textarea id="f-reg-domains" style="min-height:60px" placeholder="*enabled-domain.com\nother-domain.com">' + esc(mergeDomainsForDisplay(defs)) + '</textarea></div>';
+        h += '<div id="chatgpt-register-status" style="margin-top:var(--sp-3)"></div>';
+
+        okBtn.textContent = 'Start Registration';
+        okBtn.disabled = false;
+        okBtn.onclick = startChatgptRegister;
+      } else {
+        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6;padding:var(--sp-2) 0 var(--sp-3)">';
+        h += 'Sync from your local Codex CLI configuration at <code>~/.codex/auth.json</code>.';
+        h += '</div>';
+
+        okBtn.textContent = 'Sync from CLI';
+        okBtn.disabled = false;
+        okBtn.onclick = function() {
+          vscode.postMessage({ type: 'runCommand', command: 'agentVibes.syncCodex' });
+          closeDlg();
+        };
+      }
+
+      h += '</div>';
+      fields.innerHTML = h;
+    }
+
+    function switchCodexOAuthTab(tab) {
+      codexOAuthTab = tab;
+      renderCodexDlg();
+    }
+
+    // ── Domain merge/parse helpers ──
+    // Merge domain + domains + enabledDomains into a single textarea value.
+    // Enabled domains get a * prefix; plain domains have no prefix.
+    // The single `domain` field is included as the first entry if not already in the list.
+    // When defs is a draft (string in .domains), pass it through as-is.
+    function mergeDomainsForDisplay(defs) {
+      // Draft mode: domains is already a merged string
+      if (typeof defs.domains === 'string') return defs.domains;
+      var allDomains = Array.isArray(defs.domains) ? defs.domains.slice() : [];
+      var enabled = Array.isArray(defs.enabledDomains) ? defs.enabledDomains : [];
+      // Include single domain if not already in list
+      var singleDomain = (defs.domain || '').trim();
+      if (singleDomain) {
+        var alreadyIn = false;
+        for (var x = 0; x < allDomains.length; x++) {
+          if (allDomains[x].toLowerCase() === singleDomain.toLowerCase()) { alreadyIn = true; break; }
+        }
+        if (!alreadyIn) allDomains.unshift(singleDomain);
+      }
+      var enabledSet = {};
+      for (var i = 0; i < enabled.length; i++) enabledSet[enabled[i].toLowerCase()] = true;
+      var lines = [];
+      for (var j = 0; j < allDomains.length; j++) {
+        var d = allDomains[j];
+        lines.push(enabledSet[d.toLowerCase()] ? '*' + d : d);
+      }
+      // Add enabled domains not in allDomains
+      for (var k = 0; k < enabled.length; k++) {
+        var found = false;
+        for (var m = 0; m < allDomains.length; m++) {
+          if (allDomains[m].toLowerCase() === enabled[k].toLowerCase()) { found = true; break; }
+        }
+        if (!found) lines.push('*' + enabled[k]);
+      }
+      return lines.join('\n');
+    }
+
+    // Parse merged textarea back into { domain, domains, enabledDomains } for postMessage.
+    // First non-starred entry becomes `domain`; all entries go into `domains`.
+    function parseMergedDomains(raw) {
+      var lines = (raw || '').split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+      var domains = [];
+      var enabled = [];
+      var domain = '';
+      for (var i = 0; i < lines.length; i++) {
+        if (lines[i].charAt(0) === '*') {
+          var d = lines[i].slice(1).trim();
+          if (d) { domains.push(d); enabled.push(d); }
+        } else {
+          domains.push(lines[i]);
+          if (!domain) domain = lines[i];
+        }
+      }
+      return { domain: domain, domains: domains.join('\n'), enabledDomains: enabled.join('\n') };
+    }
+
+    function openRegisterDlg() {
+      switchCodexSubView('register');
+    }
+
+    function snapshotRegisterDraft() {
+      // Capture current form values from DOM before re-render
+      var el = document.getElementById('f-reg-apiUrl');
+      if (!el) return; // form not in DOM yet
+      registerDraft = {
+        apiUrl: (document.getElementById('f-reg-apiUrl') || {}).value || '',
+        adminToken: (document.getElementById('f-reg-adminToken') || {}).value || '',
+        domains: (document.getElementById('f-reg-domains') || {}).value || '',
+      };
+      // Persist to backend so values survive panel close/reopen
+      var merged = parseMergedDomains(registerDraft.domains);
+      vscode.postMessage({ type: 'persistRegisterDefaults', data: {
+        apiUrl: registerDraft.apiUrl,
+        adminToken: registerDraft.adminToken,
+        domain: merged.domain,
+        domains: merged.domains,
+        enabledDomains: merged.enabledDomains,
+      }});
+    }
+
+    function switchCodexSubView(view) {
+      if (view === 'accounts') {
+        registerDraft = null; // clear draft when leaving register view
+      }
+      codexSubView = view;
+      renderChannelDetail();
+    }
+
+    function startChatgptRegisterInline() {
+      var btn = document.getElementById('inline-reg-btn');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Registering...';
+      }
+      var merged = parseMergedDomains((document.getElementById('f-reg-domains') || {}).value || '');
+      var data = {
+        apiUrl: (document.getElementById('f-reg-apiUrl') || {}).value || '',
+        adminToken: (document.getElementById('f-reg-adminToken') || {}).value || '',
+        domain: merged.domain,
+        domains: merged.domains,
+        enabledDomains: merged.enabledDomains,
+        randomSubdomain: false,
+      };
+      vscode.postMessage({ type: 'startChatgptRegister', data: data });
+    }
+
+    function startCodexOAuth() {
+      var btn = document.getElementById('dlg-ok');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Opening browser...';
+      }
+      vscode.postMessage({ type: 'startCodexOAuth', data: {} });
+    }
+
+    function handleCodexOAuthStatus(data) {
+      var el = document.getElementById('codex-oauth-status');
+      if (!el) return;
+      var btn = document.getElementById('dlg-ok');
+
+      if (data.status === 'loading') {
+        el.innerHTML = '<div style="display:flex;align-items:center;gap:8px;padding:var(--sp-2) 0;color:var(--focus);font-size:var(--text-sm)"><span class="spinner"></span>' + esc(data.message) + '</div>';
+        if (btn) { btn.disabled = true; btn.textContent = 'Waiting...'; }
+      } else if (data.status === 'success') {
+        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--good);font-size:var(--text-sm);font-weight:600">' + esc(data.message) + '</div>';
+        if (btn) { btn.style.display = 'none'; }
+        setTimeout(function() { closeDlg(); }, 2000);
+      } else if (data.status === 'error') {
+        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--err);font-size:var(--text-sm)">' + esc(data.message) + '</div>';
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; btn.onclick = startCodexOAuth; }
+      }
+    }
+
+    // ── ChatGPT Register ──
+    function startChatgptRegister() {
+      var btn = document.getElementById('dlg-ok');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Registering...';
+      }
+      var merged = parseMergedDomains((document.getElementById('f-reg-domains') || {}).value || '');
+      var data = {
+        apiUrl: (document.getElementById('f-reg-apiUrl') || {}).value || '',
+        adminToken: (document.getElementById('f-reg-adminToken') || {}).value || '',
+        domain: merged.domain,
+        domains: merged.domains,
+        enabledDomains: merged.enabledDomains,
+        randomSubdomain: false,
+      };
+      vscode.postMessage({ type: 'startChatgptRegister', data: data });
+    }
+
+    function handleChatgptRegisterStatus(data) {
+      var el = document.getElementById('chatgpt-register-status');
+      if (!el) return;
+      var btn = document.getElementById('inline-reg-btn') || document.getElementById('dlg-ok');
+
+      if (data.status === 'loading') {
+        var logHtml = '';
+        if (data.logs && data.logs.length > 0) {
+          var last = data.logs.slice(-5);
+          logHtml = '<div style="margin-top:var(--sp-2);font-family:var(--vscode-editor-font-family,monospace);font-size:var(--text-xs);color:var(--fg-3);max-height:120px;overflow-y:auto">';
+          for (var i = 0; i < last.length; i++) { logHtml += '<div>' + esc(last[i]) + '</div>'; }
+          logHtml += '</div>';
+        }
+        el.innerHTML = '<div style="display:flex;align-items:center;gap:8px;padding:var(--sp-2) 0;color:var(--focus);font-size:var(--text-sm)"><span class="btn-spinner"></span>' + esc(data.message) + '</div>' + logHtml;
+        if (btn) { btn.disabled = true; btn.textContent = 'Registering...'; }
+      } else if (data.status === 'success') {
+        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--good);font-size:var(--text-sm);font-weight:600">' + esc(data.message) + '</div>';
+        if (btn) { btn.disabled = false; btn.textContent = 'Start Registration'; }
+        // Auto-switch back to accounts view after success
+        setTimeout(function() { switchCodexSubView('accounts'); }, 2500);
+      } else if (data.status === 'error') {
+        var errLogHtml = '';
+        if (data.logs && data.logs.length > 0) {
+          errLogHtml = '<div style="margin-top:var(--sp-2);font-family:var(--vscode-editor-font-family,monospace);font-size:var(--text-xs);color:var(--fg-2);max-height:200px;overflow-y:auto;background:var(--input-bg);padding:var(--sp-2);border-radius:var(--radius)">';
+          for (var j = 0; j < data.logs.length; j++) { errLogHtml += '<div>' + esc(data.logs[j]) + '</div>'; }
+          errLogHtml += '</div>';
+        }
+        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--bad);font-size:var(--text-sm);font-weight:600">' + esc(data.message) + '</div>' + errLogHtml;
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+      }
+    }
+
+    function closeDlg() { document.getElementById('dlg').classList.remove('open'); curCh = null; }
+
+    function openAccountFile(channel) {
+      var state = getChannelState(allData, channel);
+      if (state && state.filePath) {
+        vscode.postMessage({ type: 'openFile', path: state.filePath });
+      }
+    }
+
+    function submitDlg() {
+      if (!curCh) return;
+      const d = CH[curCh];
+      if (d.mode === 'sync') {
+        const ta = document.getElementById('f-token');
+        const raw = (ta ? ta.value : '').trim();
+        if (!raw) return;
+        const payload = { type: 'addByToken', channel: curCh, raw };
+        if (curCh === 'antigravity') {
+          payload.data = { proxyUrl: antigravityDraft.proxyUrl || '' };
+        }
+        vscode.postMessage(payload);
+      } else {
+        const acct = {};
+        for (const f of d.fields) {
+          const el = document.getElementById('f-' + f.key);
+          if (el && el.value.trim()) acct[f.key] = el.value.trim();
+        }
+        vscode.postMessage({ type: 'addAccount', channel: curCh, data: acct });
+      }
+      closeDlg();
+    }
+
+    function rmAcct(ch, i) { vscode.postMessage({ type: 'removeAccount', channel: ch, index: i }); }
+    function runCmd(cmd) { vscode.postMessage({ type: 'runCommand', command: cmd }); }
+    function runCmdWithLoading(btn, cmd) {
+      if (getPendingCommand()) return;
+      beginPendingCommand(cmd);
+      vscode.postMessage({ type: 'runCommand', command: cmd });
+    }
+    function openAccountFile(ch) { vscode.postMessage({ type: 'openAccountFile', channel: ch }); }
+    function refreshLogs() { vscode.postMessage({ type: 'getLogs' }); }
+    function copyLogPath() {
+      if (!currentLogFilePath) return;
+      vscode.postMessage({ type: 'copyLogPath', raw: currentLogFilePath });
+
+      var pathEl = document.getElementById('log-file-path');
+      if (!pathEl) return;
+
+      pathEl.title = 'Copied';
+      pathEl.setAttribute('aria-label', 'Copied');
+
+      window.setTimeout(function() {
+        var label = currentLogFilePath ? 'Copy log file path' : 'No log file path available';
+        pathEl.title = label;
+        pathEl.setAttribute('aria-label', label);
+      }, 1200);
+    }
+
+    function renderLogFilePath(filePath, exists) {
+      var pathEl = document.getElementById('log-file-path');
+      if (!pathEl) return;
+
+      if (!filePath) {
+        pathEl.textContent = 'Unknown';
+        pathEl.title = 'No log file path available';
+        pathEl.setAttribute('aria-label', 'No log file path available');
+        return;
+      }
+
+      pathEl.textContent = filePath + (exists ? '' : ' (not found yet)');
+      pathEl.title = 'Copy log file path';
+      pathEl.setAttribute('aria-label', 'Copy log file path');
+    }
+
+    // ── Log state ──
+    let showHeartbeat = false;       // default: hide heartbeat noise
+    let autoRefreshEnabled = false;
+    let autoRefreshTimer = null;
+    const AUTO_REFRESH_INTERVAL = 3000; // 3 seconds
+    let rawLogLines = [];            // keep raw lines for re-render on filter toggle
+
+    function isHeartbeatLine(line) {
+      const lower = line.toLowerCase();
+      return lower.includes('heartbeat') ||
+             lower.includes('keepalive') ||
+             lower.includes('心跳');
+    }
+
+    function toggleDebugMode(el) {
+      var isOn = el.classList.contains('on');
+      var newVal = !isOn;
+      el.classList.toggle('on', newVal);
+      vscode.postMessage({ type: 'updateSetting', key: 'debugMode', value: newVal });
+    }
+
+    function toggleHeartbeatFilter(el) {
+      showHeartbeat = !showHeartbeat;
+      el.classList.toggle('on', showHeartbeat);
+      el.querySelector('.toggle-label').textContent = 'Heartbeat';
+      renderLogs(rawLogLines);
+    }
+
+    function toggleAutoRefresh(el) {
+      autoRefreshEnabled = !autoRefreshEnabled;
+      el.classList.toggle('on', autoRefreshEnabled);
+      el.querySelector('.toggle-label').textContent = 'Auto';
+      if (autoRefreshEnabled) {
+        refreshLogs();
+        autoRefreshTimer = setInterval(function() {
+          // Only refresh when logs tab is visible
+          const logsPane = document.getElementById('pane-logs');
+          if (logsPane && logsPane.classList.contains('active')) {
+            refreshLogs();
+          }
+        }, AUTO_REFRESH_INTERVAL);
+      } else {
+        if (autoRefreshTimer) {
+          clearInterval(autoRefreshTimer);
+          autoRefreshTimer = null;
+        }
+      }
+    }
+
+    function renderLogs(lines) {
+      rawLogLines = lines || [];
+      const box = document.getElementById('log-box');
+      if (!rawLogLines || rawLogLines.length === 0) {
+        box.innerHTML = '<span style="color:var(--fg-2)">No logs available</span>';
+        return;
+      }
+
+      // Collapse heartbeat lines: consecutive heartbeat lines → single summary
+      let h = '';
+      let i = 0;
+      while (i < rawLogLines.length) {
+        const line = rawLogLines[i];
+        if (isHeartbeatLine(line)) {
+          // Count consecutive heartbeat lines
+          let count = 0;
+          const startIdx = i;
+          while (i < rawLogLines.length && isHeartbeatLine(rawLogLines[i])) {
+            count++;
+            i++;
+          }
+          if (showHeartbeat) {
+            // Show all heartbeat lines when toggle is on
+            for (let j = startIdx; j < startIdx + count; j++) {
+              h += '<div class="log-line log-line-debug">' + esc(rawLogLines[j]) + '</div>';
+            }
+          } else {
+            // Collapsed summary
+            const firstLine = rawLogLines[startIdx];
+            if (count === 1) {
+              h += '<div class="log-line log-line-debug" style="opacity:0.5">💓 ' + esc(firstLine) + '</div>';
+            } else {
+              h += '<div class="log-line log-line-debug" style="opacity:0.5">💓 Heartbeat ×' + count + ' (collapsed)</div>';
+            }
+          }
+        } else {
+          let cls = 'log-line';
+          if (line.includes('[ERROR]') || line.includes('[error]')) cls += ' log-line-error';
+          else if (line.includes('[WARN]') || line.includes('[warn]')) cls += ' log-line-warn';
+          else if (line.includes('[DEBUG]') || line.includes('[debug]')) cls += ' log-line-debug';
+          else if (line.includes('[INFO]') || line.includes('[info]') || line.includes(' LOG ')) cls += ' log-line-info';
+          h += '<div class="' + cls + '">' + esc(line) + '</div>';
+          i++;
+        }
+      }
+      box.innerHTML = h;
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // ── Pool status (Accounts tab live data) ──
+    let poolData = null;
+
+    // Map bridge backend keys → dashboard channel keys
+    const POOL_BACKEND_MAP = {
+      google: 'antigravity',
+      codex: 'codex',
+      openaiCompat: 'openai-compat',
+      claudeApi: 'claude-api',
+    };
+
+    function refreshPoolStatus() {
+      vscode.postMessage({ type: 'getPoolStatus' });
+      vscode.postMessage({ type: 'getGoogleQuota' });
+      vscode.postMessage({ type: 'getCodexQuota', data: { force: true } });
+    }
+
+    function stateDotCls(state) {
+      if (state === 'ready') return 'dot-good';
+      if (state === 'cooldown' || state === 'degraded' || state === 'model_cooldown') return 'dot-warn';
+      if (state === 'disabled' || state === 'unavailable') return 'dot-bad';
+      return '';
+    }
+
+    function planBadgeCls(planType) {
+      if (!planType) return 'setting-badge-warn';
+      var p = String(planType).toLowerCase();
+      if (p === 'team' || p === 'enterprise') return 'setting-badge-info';
+      if (p === 'pro') return 'setting-badge-ok';
+      return 'setting-badge-warn';
+    }
+
+    function stateLabel(state) {
+      var labels = { ready: 'Ready', cooldown: 'Cooldown', degraded: 'Degraded', model_cooldown: 'Model Cooldown', disabled: 'Disabled', unavailable: 'Unavailable' };
+      return labels[state] || state || '--';
+    }
+
+    function formatRelativeTime(value) {
+      if (value == null) return '--';
+      var ts = null;
+      if (typeof value === 'number' && isFinite(value)) {
+        ts = value;
+      } else if (typeof value === 'string') {
+        var parsed = Date.parse(value);
+        if (!isNaN(parsed)) ts = parsed;
+      }
+      if (ts == null) return String(value);
+
+      var diffMs = ts - Date.now();
+      if (diffMs <= 0) return 'now';
+      var sec = Math.round(diffMs / 1000);
+      if (sec < 60) return 'in ' + sec + 's';
+      var min = Math.round(sec / 60);
+      if (min < 60) return 'in ' + min + 'm';
+      var hr = Math.round(min / 60);
+      if (hr < 24) return 'in ' + hr + 'h';
+      var day = Math.round(hr / 24);
+      return 'in ' + day + 'd';
+    }
+
+    function parseDateValue(value) {
+      if (value == null) return null;
+      if (typeof value === 'number' && isFinite(value)) {
+        return new Date(value * 1000);
+      }
+      if (typeof value === 'string') {
+        var trimmed = value.trim();
+        if (!trimmed) return null;
+        if (/^\d+$/.test(trimmed)) {
+          return new Date(Number(trimmed) * 1000);
+        }
+        var parsed = Date.parse(trimmed);
+        if (!isNaN(parsed)) return new Date(parsed);
+      }
+      return null;
+    }
+
+    function formatDurationMs(value) {
+      if (value == null || value === '' || !isFinite(Number(value))) return '--';
+      var ms = Math.max(0, Math.round(Number(value)));
+      if (ms < 1000) return ms + 'ms';
+      var sec = ms / 1000;
+      if (sec < 60) return (Math.round(sec * 10) / 10) + 's';
+      var min = Math.floor(sec / 60);
+      var remSec = Math.round((sec % 60) * 10) / 10;
+      if (min < 60) return min + 'm ' + remSec + 's';
+      var hr = Math.floor(min / 60);
+      var remMin = min % 60;
+      return hr + 'h ' + remMin + 'm';
+    }
+
+    let googleQuotaData = null;
+    let codexQuotaData = null;
+
+    function refreshGoogleQuota() {
+      vscode.postMessage({ type: 'getGoogleQuota' });
+    }
+
+    function renderCodexQuota(data) {
+      codexQuotaData = data;
+      renderChannelDetail();
+      renderOverviewHealth();
+    }
+
+    function refreshUsageSummary() {
+      vscode.postMessage({ type: 'getUsageSummary' });
+    }
+
+    function renderUsageSummary(data) {
+      usageSummaryData = data;
+
+      var banner = document.getElementById('analytics-banner');
+      var summary = document.getElementById('analytics-summary');
+      var sessionSummary = document.getElementById('analytics-session-summary');
+      var sessionList = document.getElementById('analytics-sessions');
+      var backends = document.getElementById('analytics-backends');
+      var routes = document.getElementById('analytics-routes');
+      var models = document.getElementById('analytics-models');
+      var accounts = document.getElementById('analytics-accounts');
+      var recent = document.getElementById('analytics-recent');
+      if (!banner || !summary || !sessionSummary || !sessionList || !backends || !routes || !models || !accounts || !recent) return;
+
+      if (!data || !data.backends || !data.totals) {
+        banner.innerHTML =
+          '<div class="health-banner health-banner-warn">' +
+            '<span class="dot dot-warn"></span>' +
+            '<div class="health-banner-body">' +
+              '<div class="health-banner-title">Bridge offline</div>' +
+              '<div class="health-banner-desc">Start the bridge to collect runtime token usage.</div>' +
+            '</div>' +
+          '</div>';
+        summary.innerHTML = '<div class="acct-empty">No analytics data available</div>';
+        sessionSummary.innerHTML = '';
+        sessionList.innerHTML = '';
+        backends.innerHTML = '';
+        routes.innerHTML = '';
+        models.innerHTML = '';
+        accounts.innerHTML = '';
+        recent.innerHTML = '';
+        return;
+      }
+
+      var backendMeta = {
+        codex: { label: 'Codex', cls: 'be-cx' },
+        google: { label: 'Antigravity', cls: 'be-ag' },
+        'openai-compat': { label: 'OpenAI-Compatible', cls: 'be-oai' },
+        'claude-api': { label: 'Claude API', cls: 'be-cl' },
+      };
+
+      function routeLabel(backend, transport) {
+        if (backend === 'codex') {
+          return transport === 'websocket' ? 'WebSocket' : 'HTTP';
+        }
+        if (backend === 'google') {
+          return transport === 'native' ? 'Native Worker' : transport;
+        }
+        if (backend === 'openai-compat') {
+          return transport === 'chat-completions'
+            ? 'Chat Completions'
+            : transport === 'responses'
+              ? 'Responses API'
+              : transport;
+        }
+        if (backend === 'claude-api') {
+          return transport === 'messages' ? 'Messages API' : transport;
+        }
+        return transport || '--';
+      }
+
+      function usageBreakdown(item) {
+        return (
+          'Ctx ' + formatNumber(item.totalContextTokens) +
+          ' · In ' + formatNumber(item.inputTokens) +
+          ' · Read ' + formatNumber(item.cachedInputTokens) +
+          ' · Write ' + formatNumber(item.cacheCreationInputTokens) +
+          ' · Out ' + formatNumber(item.outputTokens)
+        );
+      }
+
+      function extraBreakdown(item) {
+        return (
+          'Reuse ' + formatPercent(item.cacheReuseRate) +
+          ' · Search ' + formatNumber(item.webSearchRequests) +
+          ' · Avg ' + formatDurationMs(item.avgDurationMs) +
+          ' · Last ' + (item.lastSeenAt ? formatDateTime(item.lastSeenAt) : '--')
+        );
+      }
+
+      function renderSessionRuntime(runtime) {
+        var totals = runtime && runtime.totals ? runtime.totals : null;
+        var rows = runtime && Array.isArray(runtime.sessions) ? runtime.sessions : [];
+        if (!totals) {
+          sessionSummary.innerHTML = '';
+          sessionList.innerHTML = '<div class="acct-empty">No runtime session data available</div>';
+          return;
+        }
+
+        var runtimeCards = [
+          { label: 'Sessions', value: formatNumber(totals.totalSessions) },
+          { label: 'Active', value: formatNumber(totals.activeSessions) },
+          { label: 'Pending Tools', value: formatNumber(totals.pendingToolCalls) },
+          { label: 'Completed Tools', value: formatNumber(totals.completedToolCalls) },
+          { label: 'Tool Avg', value: formatDurationMs(totals.avgToolDurationMs) },
+          { label: 'Tool Total', value: formatDurationMs(totals.totalToolDurationMs) },
+          { label: 'Edited Files', value: formatNumber(totals.editedFiles) },
+          { label: 'Line Delta', value: '+' + formatNumber(totals.linesAdded) + ' / -' + formatNumber(totals.linesRemoved) },
+        ];
+
+        sessionSummary.innerHTML =
+          '<div class="status-grid" style="grid-template-columns:repeat(auto-fit,minmax(132px,1fr))">' +
+            runtimeCards.map(function(card) {
+              return '<div class="status-card"><div class="status-card-body"><div class="status-card-label">' + esc(card.label) + '</div><div class="status-card-value">' + esc(card.value) + '</div></div></div>';
+            }).join('') +
+          '</div>' +
+          '<div class="acct-detail" style="margin-top:var(--sp-2)">Loaded ' + esc(formatNumber(totals.loadedSessions)) + ' · Persisted-only ' + esc(formatNumber(totals.persistedOnlySessions)) + ' · Read files ' + esc(formatNumber(totals.readFiles)) + ' · Last ' + esc(totals.lastActivityAt ? formatDateTime(totals.lastActivityAt) : '--') + '</div>';
+
+        if (rows.length === 0) {
+          sessionList.innerHTML = '<div class="acct-empty">No active or persisted session runtime yet</div>';
+          return;
+        }
+
+        sessionList.innerHTML = rows.slice(0, 10).map(function(item) {
+          var badges = [
+            '<span class="setting-badge ' + (item.active ? 'setting-badge-ok' : 'setting-badge-warn') + '">' + esc(item.active ? 'Active' : 'Idle') + '</span>',
+            '<span class="setting-badge">' + esc(item.loaded ? 'Loaded' : 'Persisted') + '</span>'
+          ];
+          var budget = [];
+          if (item.usedContextTokens != null || item.contextTokenLimit != null) {
+            budget.push(
+              'Ctx ' + formatNumber(item.usedContextTokens) +
+              (item.contextTokenLimit != null ? ' / ' + formatNumber(item.contextTokenLimit) : '') +
+              (item.contextUsagePct != null ? ' (' + formatPercent(item.contextUsagePct) + ')' : '')
+            );
+          }
+          if (item.requestedMaxOutputTokens != null) {
+            budget.push('Max out ' + formatNumber(item.requestedMaxOutputTokens));
+          }
+          var activityDetail = [
+            'Tools ' + formatNumber(item.completedToolCalls),
+            'Pending ' + formatNumber(item.pendingToolCalls),
+            'Edit ' + formatNumber(item.editToolCalls),
+            'Shell ' + formatNumber(item.shellToolCalls),
+            'Read ' + formatNumber(item.readFiles),
+            'Files ' + formatNumber(item.editedFiles),
+            '+' + formatNumber(item.linesAdded) + ' / -' + formatNumber(item.linesRemoved)
+          ];
+          if (item.subAgentTurns > 0 || item.subAgentToolCalls > 0) {
+            activityDetail.push('Sub-agent ' + formatNumber(item.subAgentTurns) + ' turns / ' + formatNumber(item.subAgentToolCalls) + ' tools');
+          }
+
+          return '<div class="acct">' +
+            '<div class="acct-info">' +
+              '<div class="acct-name" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+                badges.join('') +
+                '<span>' + esc(item.model || '--') + '</span>' +
+                '<span class="acct-detail">' + esc(formatConversationId(item.conversationId)) + '</span>' +
+              '</div>' +
+              '<div class="acct-detail">' + esc((budget.length > 0 ? budget.join(' · ') + ' · ' : '') + activityDetail.join(' · ')) + '</div>' +
+            '</div>' +
+            '<div class="acct-detail" style="white-space:nowrap;text-align:right">Avg ' + esc(formatDurationMs(item.avgToolDurationMs)) + ' · Total ' + esc(formatDurationMs(item.totalToolDurationMs)) + '<br>Last ' + esc(formatDateTime(item.lastActivityAt)) + '</div>' +
+          '</div>';
+        }).join('');
+      }
+
+      var totals = data.totals || {};
+      var notes = Array.isArray(data.notes) ? data.notes : [];
+      var hasUsage = Number(totals.requests || 0) > 0;
+      var bannerTone = hasUsage ? 'good' : 'warn';
+      var trackedBackendCount = Object.keys(data.backends || {}).length;
+      var bannerTitle = hasUsage ? 'Usage analytics are active' : 'No tracked usage yet';
+      var bannerDesc = hasUsage
+        ? 'Window started ' + esc(formatDateTime(data.windowStartedAt)) + ' · Last update ' + esc(formatDateTime(data.lastUpdatedAt))
+        : 'Run requests through a tracked backend to populate token analytics.';
+      if (trackedBackendCount > 0) {
+        bannerDesc += ' · Tracking ' + trackedBackendCount + ' backend(s)';
+      }
+      if (notes.length > 0) bannerDesc += ' · ' + esc(notes.join(' '));
+
+      banner.innerHTML =
+        '<div class="health-banner health-banner-' + bannerTone + '">' +
+          '<span class="dot dot-' + bannerTone + '"></span>' +
+          '<div class="health-banner-body">' +
+            '<div class="health-banner-title">' + bannerTitle + '</div>' +
+            '<div class="health-banner-desc">' + bannerDesc + '</div>' +
+          '</div>' +
+        '</div>';
+
+      var cards = [
+        { label: 'Requests', value: formatNumber(totals.requests) },
+        { label: 'Context', value: formatNumber(totals.totalContextTokens) },
+        { label: 'Input', value: formatNumber(totals.inputTokens) },
+        { label: 'Cache Read', value: formatNumber(totals.cachedInputTokens) },
+        { label: 'Cache Write', value: formatNumber(totals.cacheCreationInputTokens) },
+        { label: 'Output', value: formatNumber(totals.outputTokens) },
+        { label: 'Web Search', value: formatNumber(totals.webSearchRequests) },
+        { label: 'Avg Duration', value: formatDurationMs(totals.avgDurationMs) },
+      ];
+
+      summary.innerHTML =
+        '<div class="status-grid" style="grid-template-columns:repeat(auto-fit,minmax(132px,1fr))">' +
+          cards.map(function(card) {
+            return '<div class="status-card"><div class="status-card-body"><div class="status-card-label">' + esc(card.label) + '</div><div class="status-card-value">' + esc(card.value) + '</div></div></div>';
+          }).join('') +
+        '</div>' +
+        '<div class="acct-detail" style="margin-top:var(--sp-2)">Total duration ' + esc(formatDurationMs(totals.totalDurationMs)) + ' · Cache hit ' + esc(formatPercent(totals.cacheHitRate)) + ' · Cache reuse ' + esc(formatPercent(totals.cacheReuseRate)) + '</div>';
+
+      renderSessionRuntime(data.runtimeSessions);
+
+      var backendCards = Object.entries(data.backends || {}).map(function(entry) {
+        var key = entry[0];
+        var backend = entry[1] || {};
+        var meta = backendMeta[key] || { label: key, cls: 'be-oai' };
+        var backendTotals = backend.totals || {};
+        var transportCount = Object.keys(backend.transports || {}).length;
+        return (
+          '<div class="be ' + meta.cls + '">' +
+            '<div class="be-top"><span class="be-name">' + esc(backend.label || meta.label) + '</span><span class="be-count">' + esc(formatNumber(backendTotals.requests)) + '</span></div>' +
+            '<div class="be-status">' + esc(usageBreakdown(backendTotals)) + '</div>' +
+            '<div class="acct-detail" style="margin-top:var(--sp-2)">Routes ' + esc(formatNumber(transportCount)) + ' · Search ' + esc(formatNumber(backendTotals.webSearchRequests)) + ' · Avg ' + esc(formatDurationMs(backendTotals.avgDurationMs)) + ' · Last ' + esc(backendTotals.lastSeenAt ? formatDateTime(backendTotals.lastSeenAt) : '--') + '</div>' +
+          '</div>'
+        );
+      });
+      backends.innerHTML = backendCards.length > 0
+        ? backendCards.join('')
+        : '<div class="acct-empty">No backend usage recorded yet</div>';
+
+      var routeCards = Array.isArray(data.routes) ? data.routes.slice(0, 12).map(function(item) {
+        var meta = backendMeta[item.backend] || { label: item.backend, cls: 'be-oai' };
+        return (
+          '<div class="be ' + meta.cls + '">' +
+            '<div class="be-top"><span class="be-name">' + esc(meta.label + ' · ' + routeLabel(item.backend, item.transport)) + '</span><span class="be-count">' + esc(formatNumber(item.requests)) + '</span></div>' +
+            '<div class="be-status">' + esc(usageBreakdown(item)) + '</div>' +
+            '<div class="acct-detail" style="margin-top:var(--sp-2)">' + esc(extraBreakdown(item)) + '</div>' +
+          '</div>'
+        );
+      }) : [];
+      routes.innerHTML = routeCards.length > 0
+        ? routeCards.join('')
+        : '<div class="acct-empty">No route-level usage yet</div>';
+
+      function renderUsageRows(items, labelKey, emptyText) {
+        if (!Array.isArray(items) || items.length === 0) {
+          return '<div class="acct-empty">' + esc(emptyText) + '</div>';
+        }
+        return items.slice(0, 10).map(function(item) {
+          var meta = backendMeta[item.backend] || { label: item.backend, cls: 'be-oai' };
+          var badge = '<span class="setting-badge setting-badge-ok">' + esc(meta.label) + '</span>';
+          var label = item[labelKey] || '--';
+          return '<div class="acct">' +
+            '<div class="acct-info">' +
+              '<div class="acct-name" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' + badge + '<span>' + esc(label) + '</span></div>' +
+              '<div class="acct-detail">' + esc(usageBreakdown(item)) + '</div>' +
+            '</div>' +
+            '<div class="acct-detail" style="white-space:nowrap;text-align:right">' + esc(extraBreakdown(item)) + '</div>' +
+          '</div>';
+        }).join('');
+      }
+
+      function renderRecentRows(items) {
+        if (!Array.isArray(items) || items.length === 0) {
+          return '<div class="acct-empty">No recent usage records yet</div>';
+        }
+        return items.slice(0, 12).map(function(item) {
+          var meta = backendMeta[item.backend] || { label: item.backend, cls: 'be-oai' };
+          var title = meta.label + ' · ' + (item.model || '--');
+          var detail =
+            (item.accountLabel || '--') +
+            ' · ' + routeLabel(item.backend, item.transport) +
+            ' · Ctx ' + formatNumber(item.totalContextTokens) +
+            ' · In ' + formatNumber(item.inputTokens) +
+            ' · Read ' + formatNumber(item.cachedInputTokens) +
+            ' · Write ' + formatNumber(item.cacheCreationInputTokens) +
+            ' · Out ' + formatNumber(item.outputTokens) +
+            ' · Search ' + formatNumber(item.webSearchRequests) +
+            ' · ' + formatDurationMs(item.durationMs);
+          return '<div class="acct">' +
+            '<div class="acct-info">' +
+              '<div class="acct-name">' + esc(title) + '</div>' +
+              '<div class="acct-detail">' + esc(detail) + '</div>' +
+            '</div>' +
+            '<div class="acct-detail" style="white-space:nowrap;text-align:right">' + esc(formatDateTime(item.recordedAt)) + '</div>' +
+          '</div>';
+        }).join('');
+      }
+
+      models.innerHTML = renderUsageRows(data.topModels, 'model', 'No model usage recorded yet');
+      accounts.innerHTML = renderUsageRows(data.topAccounts, 'label', 'No account usage recorded yet');
+      recent.innerHTML = renderRecentRows(data.recent);
+    }
+
+    function renderOverviewHealth() {
+      // No-op: models are now shown inline within backend cards
+    }
+
+    function renderCodexSummary(data) {
+      var container = document.getElementById('codex-summary-panel');
+      if (!container) return;
+      var backend = data && data.backends ? data.backends.codex : null;
+      if (!backend || !Array.isArray(backend.entries) || backend.entries.length === 0) {
+        container.innerHTML = '';
+        return;
+      }
+
+      var h = '<div style="margin-top:var(--sp-3);padding-top:var(--sp-2);border-top:1px solid var(--line)">';
+      h += '<div class="section-title" style="margin-bottom:var(--sp-2)">Codex Availability</div>';
+      h += '<div class="status-grid" style="grid-template-columns:repeat(5,1fr);margin-bottom:var(--sp-3)">' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Total</div><div class="status-card-value">' + esc(backend.total ?? 0) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Ready</div><div class="status-card-value">' + esc(backend.ready ?? 0) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Model Cooldown</div><div class="status-card-value">' + esc(backend.modelCooldown ?? 0) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Cooling</div><div class="status-card-value">' + esc(backend.cooling ?? 0) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Disabled</div><div class="status-card-value">' + esc(backend.disabled ?? 0) + '</div></div></div>' +
+      '</div>';
+
+      for (var i = 0; i < backend.entries.length; i++) {
+        var entry = backend.entries[i];
+        var dotCls = stateDotCls(entry.state);
+        var cooldownInfo = '';
+        if (entry.cooldownUntil && entry.cooldownUntil > Date.now()) {
+          cooldownInfo = ' · ' + formatRelativeTime(entry.cooldownUntil);
+        }
+        var modelCdCount = Array.isArray(entry.modelCooldowns)
+          ? entry.modelCooldowns.filter(function(mc) { return mc.cooldownUntil > Date.now(); }).length
+          : 0;
+        h += '<div style="padding:var(--sp-2) 0;border-top:1px solid var(--line)">';
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)">';
+        h += '<div style="display:flex;align-items:center;gap:var(--sp-2);min-width:0">' +
+          '<span class="dot ' + dotCls + '"></span>' +
+          '<span class="acct-name">' + esc(entry.label || entry.email || entry.accountId || 'Codex account') + '</span>' +
+          (entry.planType ? '<span class="setting-badge ' + planBadgeCls(entry.planType) + '">' + esc(entry.planType) + '</span>' : '') +
+          (entry.source ? '<span class="acct-detail">' + esc(entry.source) + '</span>' : '') +
+        '</div>';
+        h += '<div class="acct-detail">' + esc(stateLabel(entry.state)) + cooldownInfo + '</div>';
+        h += '</div>';
+        h += '<div class="acct-detail" style="margin-top:var(--sp-1)">';
+        h += (entry.email ? esc(entry.email) : 'No email');
+        if (entry.baseUrl) h += ' · ' + esc(entry.baseUrl);
+        if (entry.proxyUrl) h += ' · proxy';
+        if (modelCdCount > 0) h += ' · ' + modelCdCount + ' model cooldown(s)';
+        if (typeof entry.requestCount === 'number') h += ' · ' + entry.requestCount + ' req';
+        h += '</div>';
+        h += '</div>';
+      }
+      h += '</div>';
+      container.innerHTML = h;
+    }
+
+    function renderPoolStatus(data) {
+      poolData = data;
+      var summaryEl = document.getElementById('pool-summary');
+      if (!data || !data.backends) {
+        summaryEl.innerHTML = '<span style="color:var(--fg-2);font-size:var(--text-sm)">Bridge not running — click Refresh Status when online</span>';
+        // Clear pool entry overlays from account rows
+        document.querySelectorAll('.pool-entries').forEach(function(el) { el.innerHTML = ''; });
+        return;
+      }
+
+      // Summary cards
+      var totalReady = 0, totalCooling = 0, totalModelCooldown = 0, totalDisabled = 0, totalEntries = 0;
+      for (var bk in data.backends) {
+        var b = data.backends[bk];
+        totalReady += (b.ready || 0);
+        totalCooling += (b.cooling || 0);
+        totalModelCooldown += (b.modelCooldown || 0);
+        totalDisabled += (b.disabled || 0) + (b.unavailable || 0);
+        totalEntries += (b.total || 0);
+      }
+
+      summaryEl.innerHTML =
+        '<div class="status-grid" style="grid-template-columns:repeat(5,1fr)">' +
+          '<div class="status-card"><span class="status-dot dot dot-good"></span><div class="status-card-body"><div class="status-card-label">Ready</div><div class="status-card-value">' + totalReady + '</div></div></div>' +
+          '<div class="status-card"><span class="status-dot dot dot-warn"></span><div class="status-card-body"><div class="status-card-label">Cooldown</div><div class="status-card-value">' + totalCooling + '</div></div></div>' +
+          '<div class="status-card"><span class="status-dot dot dot-warn"></span><div class="status-card-body"><div class="status-card-label">Model Cooldown</div><div class="status-card-value">' + totalModelCooldown + '</div></div></div>' +
+          '<div class="status-card"><span class="status-dot dot dot-bad"></span><div class="status-card-body"><div class="status-card-label">Disabled</div><div class="status-card-value">' + totalDisabled + '</div></div></div>' +
+          '<div class="status-card"><span class="status-dot dot"></span><div class="status-card-body"><div class="status-card-label">Total</div><div class="status-card-value">' + totalEntries + '</div></div></div>' +
+        '</div>';
+
+      renderCodexSummary(data);
+      renderOverviewHealth();
+
+      // Refresh sidebar dots and detail panel with new pool data
+      if (allData) renderAccounts(allData);
+    }
+
+    function renderGoogleQuota(data) {
+      googleQuotaData = data;
+      // Refresh detail panel with new quota data
+      renderChannelDetail();
+      renderOverviewHealth();
+    }
+
+    // ── Tests tab ──
+    const TESTS = [
+      { id: 'proxy',      name: 'Proxy Bypass',        desc: 'Check system proxy bypass entries for Cursor domains (does not validate TUN/global proxy interception)' },
+      { id: 'ssl',        name: 'SSL Certificates',    desc: 'Validate local certificate files and SAN coverage for Cursor domains' },
+      { id: 'bridge',     name: 'Bridge Health',       desc: 'HTTPS health check against the local bridge' },
+      { id: 'h2',         name: 'End-to-End Cursor TLS', desc: 'Verify api2.cursor.sh resolves correctly and presents a valid certificate end-to-end' },
+      { id: 'forwarding', name: 'Traffic Forwarding',  desc: 'Verify hosts, loopback alias, and relay process' },
+      { id: 'dns',        name: 'DNS Resolution',      desc: 'Resolve Cursor domains via /etc/hosts to local IP' },
+      { id: 'accounts',   name: 'Backend Accounts',    desc: 'Check at least one account is configured' },
+    ];
+    const testState = {};
+
+    function initTests() {
+      const root = document.getElementById('tests-root');
+      root.innerHTML = TESTS.map(function(t) {
+        testState[t.id] = { status: 'idle', output: '' };
+        return '<div class="test-item" id="test-' + t.id + '">' +
+          '<div class="test-header">' +
+            '<div class="test-icon test-icon-idle" id="test-icon-' + t.id + '">·</div>' +
+            '<div class="test-body">' +
+              '<div class="test-name">' + esc(t.name) + '</div>' +
+              '<div class="test-desc">' + esc(t.desc) + '</div>' +
+            '</div>' +
+            '<div class="test-run">' +
+              '<button class="btn btn-secondary" id="test-btn-' + t.id + '" onclick="runTest(\'' + t.id + '\')">Run</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="test-output" id="test-out-' + t.id + '"></div>' +
+        '</div>';
+      }).join('');
+    }
+
+    function setTestStatus(id, status, icon) {
+      var iconEl = document.getElementById('test-icon-' + id);
+      if (!iconEl) return;
+      iconEl.className = 'test-icon test-icon-' + status;
+      iconEl.textContent = icon;
+    }
+
+    function appendTestOutput(id, text) {
+      var el = document.getElementById('test-out-' + id);
+      if (!el) return;
+      el.textContent += text + '\n';
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function runTest(id) {
+      var el = document.getElementById('test-out-' + id);
+      if (el) el.textContent = '';
+      setTestStatus(id, 'running', '⟳');
+      var btn = document.getElementById('test-btn-' + id);
+      if (btn) btn.disabled = true;
+      vscode.postMessage({ type: 'runTest', testId: id });
+    }
+
+    function runAllTests() {
+      TESTS.forEach(function(t) { runTest(t.id); });
+    }
+
+    function handleTestResult(data) {
+      var id = data.testId;
+      if (data.line) {
+        appendTestOutput(id, data.line);
+      }
+      if (data.status) {
+        var iconMap = { pass: '✓', fail: '✗', warn: '!' };
+        setTestStatus(id, data.status, iconMap[data.status] || '·');
+        var btn = document.getElementById('test-btn-' + id);
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    initTests();
+
+    vscode.postMessage({ type: 'getAll' });
+  </script>
+</body>
+</html>

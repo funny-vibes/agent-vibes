@@ -1,4 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common"
+import type { EnforceToolProtocolOptions } from "./message-integrity-guard"
 import { SummaryCacheService } from "./summary-cache.service"
 import { SummaryGeneratorService } from "./summary-generator.service"
 import { TokenCounterService } from "./token-counter.service"
@@ -55,6 +56,7 @@ export class ConversationTruncatorService {
       systemPromptTokens?: number
       maxTokens?: number
       pendingToolUseIds?: Iterable<string>
+      integrityMode?: EnforceToolProtocolOptions["mode"]
     }
   ): TruncationResult {
     const systemPromptTokens = options?.systemPromptTokens || 0
@@ -109,7 +111,8 @@ export class ConversationTruncatorService {
 
     const truncationIndex = this.toolIntegrity.findTruncationPointWithIntegrity(
       allMessages,
-      targetTokensForRecent
+      targetTokensForRecent,
+      { mode: options?.integrityMode }
     )
 
     // Get recent messages and truncated (early) messages
@@ -195,7 +198,10 @@ export class ConversationTruncatorService {
       const fitted = this.trimOldestMessagesToFit(
         finalMessages,
         effectiveMaxTokens,
-        { pendingToolUseIds: options?.pendingToolUseIds }
+        {
+          pendingToolUseIds: options?.pendingToolUseIds,
+          integrityMode: options?.integrityMode,
+        }
       )
       finalMessages = fitted.messages
       truncatedTokenCount = fitted.tokenCount
@@ -232,6 +238,7 @@ export class ConversationTruncatorService {
       systemPromptTokens?: number
       maxTokens?: number
       pendingToolUseIds?: Iterable<string>
+      integrityMode?: EnforceToolProtocolOptions["mode"]
     }
   ): TruncationResult {
     const systemPromptTokens = options?.systemPromptTokens || 0
@@ -259,7 +266,8 @@ export class ConversationTruncatorService {
     // Find truncation point with tool integrity
     const truncationIndex = this.toolIntegrity.findTruncationPointWithIntegrity(
       messages,
-      effectiveMaxTokens
+      effectiveMaxTokens,
+      { mode: options?.integrityMode }
     )
 
     let recentMessages = messages.slice(truncationIndex)
@@ -289,7 +297,10 @@ export class ConversationTruncatorService {
       const fitted = this.trimOldestMessagesToFit(
         recentMessages,
         effectiveMaxTokens,
-        { pendingToolUseIds: options?.pendingToolUseIds }
+        {
+          pendingToolUseIds: options?.pendingToolUseIds,
+          integrityMode: options?.integrityMode,
+        }
       )
       recentMessages = fitted.messages
       truncatedTokenCount = fitted.tokenCount
@@ -372,7 +383,10 @@ export class ConversationTruncatorService {
   private trimOldestMessagesToFit(
     messages: UnifiedMessage[],
     maxTokens: number,
-    options?: { pendingToolUseIds?: Iterable<string> }
+    options?: {
+      pendingToolUseIds?: Iterable<string>
+      integrityMode?: EnforceToolProtocolOptions["mode"]
+    }
   ): {
     messages: UnifiedMessage[]
     tokenCount: number
@@ -397,7 +411,7 @@ export class ConversationTruncatorService {
       // After trimming, use unified sanitize to clean up all orphaned
       // tool_use/tool_result blocks in both directions.
       const sanitized = this.toolIntegrity.sanitizeMessages(fitted, {
-        mode: "global",
+        mode: options?.integrityMode ?? "global",
         pendingToolUseIds: options?.pendingToolUseIds,
       })
       fitted = sanitized.messages
