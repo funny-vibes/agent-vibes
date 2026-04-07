@@ -239,6 +239,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read extension version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./apps/vscode-extension/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Download extension packages
         uses: actions/download-artifact@v4
         with:
@@ -247,7 +253,7 @@ jobs:
 
       - name: List release assets
         run: |
-          echo "── VS Code extensions ──"
+          echo "── Cursor extensions ──"
           ls -lh extensions/
 
       - name: Create GitHub Release
@@ -259,16 +265,13 @@ jobs:
           body: |
             ## Agent Vibes
 
-            ### VS Code Extension (.vsix)
+            ### Cursor Extension (.vsix)
 
-            Install directly in Cursor / VS Code:
-            ```bash
-            cursor --install-extension agent-vibes-<platform>-<version>.vsix --force
-            ```
+            Download the `.vsix` that matches your platform, then install it in Cursor.
 
-            | Platform | Extension |
-            |----------|-----------|
-            | macOS Apple Silicon | `agent-vibes-darwin-arm64-*.vsix` |
-            | macOS Intel | `agent-vibes-darwin-x64-*.vsix` |
-            | Linux x64 | `agent-vibes-linux-x64-*.vsix` |
-            | Windows x64 | `agent-vibes-win32-x64-*.vsix` |
+            | Platform | Asset | Install command |
+            |----------|-------|-----------------|
+            | macOS Apple Silicon | `agent-vibes-darwin-arm64-${{ steps.version.outputs.version }}.vsix` | `cursor --install-extension agent-vibes-darwin-arm64-${{ steps.version.outputs.version }}.vsix --force` |
+            | macOS Intel | `agent-vibes-darwin-x64-${{ steps.version.outputs.version }}.vsix` | `cursor --install-extension agent-vibes-darwin-x64-${{ steps.version.outputs.version }}.vsix --force` |
+            | Linux x64 | `agent-vibes-linux-x64-${{ steps.version.outputs.version }}.vsix` | `cursor --install-extension agent-vibes-linux-x64-${{ steps.version.outputs.version }}.vsix --force` |
+            | Windows x64 | `agent-vibes-win32-x64-${{ steps.version.outputs.version }}.vsix` | `cursor --install-extension agent-vibes-win32-x64-${{ steps.version.outputs.version }}.vsix --force` |
