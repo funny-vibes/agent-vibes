@@ -6,6 +6,7 @@ import {
 } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import { ChildProcess, spawn } from "child_process"
+import * as crypto from "crypto"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
@@ -64,11 +65,19 @@ interface WorkerModelState {
 /**
  * A managed worker process
  */
+interface WorkerConversationSession {
+  uuid: string
+  seq: number
+}
+
 interface WorkerHandle {
   process: ChildProcess
   account: NativeAccount
   stableKey: string
   configSignature: string
+  cloudCodeSessionId: string
+  conversationSessions: Map<string, WorkerConversationSession>
+  fallbackConversationSession: WorkerConversationSession
   ready: boolean
   draining: boolean
   pending: Map<string, PendingRequest>
@@ -158,6 +167,48 @@ function getNativeAccountConfigSignature(account: NativeAccount): string {
     account.cloudCodeUrlOverride?.trim() || "",
     account.isGcpTos ? "gcp-tos" : "non-gcp",
   ].join("|")
+}
+
+function generateCloudCodeSessionId(): string {
+  const buf = crypto.randomBytes(8)
+  const unsigned = buf.readBigUInt64BE()
+  const signed =
+    unsigned > BigInt("9223372036854775807")
+      ? unsigned - BigInt("18446744073709551616")
+      : unsigned
+  return signed.toString()
+}
+
+function extractConversationKeyFromRequestId(
+  payload: Record<string, unknown>
+): string {
+  const explicitKey =
+    typeof payload.__workerConversationKey === "string"
+      ? payload.__workerConversationKey.trim()
+      : ""
+  if (explicitKey) return explicitKey
+
+  const requestId =
+    typeof payload.requestId === "string" ? payload.requestId.trim() : ""
+  const match = /^agent\/\d+\/([^/]+)\/\d+$/.exec(requestId)
+  return match?.[1] || "__fallback__"
+}
+
+function resolveWorkerConversationSession(
+  handle: WorkerHandle,
+  payload: Record<string, unknown>
+): WorkerConversationSession {
+  const conversationKey = extractConversationKeyFromRequestId(payload)
+  if (conversationKey === "__fallback__") {
+    return handle.fallbackConversationSession
+  }
+
+  const existing = handle.conversationSessions.get(conversationKey)
+  if (existing) return existing
+
+  const created = { uuid: crypto.randomUUID(), seq: 0 }
+  handle.conversationSessions.set(conversationKey, created)
+  return created
 }
 
 function resolveAppBundlePaths(appPath: string): {
@@ -547,6 +598,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       account: normalizedAccount,
       stableKey: getNativeAccountStableKey(normalizedAccount),
       configSignature: getNativeAccountConfigSignature(normalizedAccount),
+      cloudCodeSessionId: generateCloudCodeSessionId(),
+      conversationSessions: new Map(),
+      fallbackConversationSession: { uuid: crypto.randomUUID(), seq: 0 },
       ready: false,
       draining: false,
       pending: new Map(),
@@ -814,6 +868,24 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     handle.bootstrapComplete = true
   }
 
+  private applyWorkerCloudCodeIdentity(
+    handle: WorkerHandle,
+    payload: Record<string, unknown>
+  ): void {
+    const request =
+      payload.request && typeof payload.request === "object"
+        ? (payload.request as Record<string, unknown>)
+        : null
+    if (!request) return
+
+    request.sessionId = handle.cloudCodeSessionId
+    const conversationSession = resolveWorkerConversationSession(
+      handle,
+      payload
+    )
+    payload.requestId = `agent/${Date.now()}/${conversationSession.uuid}/${++conversationSession.seq}`
+  }
+
   private async preparePayloadForWorker(
     handle: WorkerHandle,
     payload: Record<string, unknown>
@@ -826,6 +898,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     if (projectId) {
       payload.project = projectId
     }
+    this.applyWorkerCloudCodeIdentity(handle, payload)
+  }
+
+  private createOutboundWorkerPayload(
+    payload: Record<string, unknown>
+  ): Record<string, unknown> {
+    const outboundPayload = { ...payload }
+    delete outboundPayload.__workerConversationKey
+    return outboundPayload
   }
 
   /**
@@ -1261,11 +1342,12 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.lastUsedWorker = worker
     worker.requestCount++
     await this.preparePayloadForWorker(worker, payload)
+    const outboundPayload = this.createOutboundWorkerPayload(payload)
     // Use long timeout for non-streaming generation, especially for deep thinking models
     const result = await this.sendRequest(
       worker,
       "generate",
-      { payload },
+      { payload: outboundPayload },
       this.GENERATE_TIMEOUT_MS
     )
     this.recordGoogleUsage(worker, payload, model, result, requestStartedAt)
@@ -1286,12 +1368,13 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.lastUsedWorker = worker
     worker.requestCount++
     await this.preparePayloadForWorker(worker, payload)
+    const outboundPayload = this.createOutboundWorkerPayload(payload)
     let lastUsageMetadata: Record<string, unknown> | null = null
 
     await this.sendStreamRequest(
       worker,
       "generateStream",
-      { payload },
+      { payload: outboundPayload },
       (chunk) => {
         const usageMetadata = this.extractGoogleUsageMetadata(chunk)
         if (usageMetadata) {

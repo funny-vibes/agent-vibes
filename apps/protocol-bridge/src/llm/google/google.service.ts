@@ -38,14 +38,9 @@ export class GoogleService {
   // Official Antigravity system prompt baked into source.
   private readonly officialSystemPrompt = ANTIGRAVITY_SYSTEM_PROMPT
 
-  // Stable sessionId for Cloud Code API requests.
-  // Official Antigravity generates one per IDE session (a signed 64-bit integer).
-  // We generate one per process lifetime to match that behavior.
-  private readonly sessionId: string
-
-  // Per-conversation request ID tracking
-  // Matches Antigravity format: agent/{currentTs}/{conversationUUID}/{seq}
-  // Each conversation gets its own UUID and monotonic sequence counter
+  // Per-conversation source request ID tracking.
+  // ProcessPoolService rewrites these into per-worker lineages before send so
+  // each Google account maintains its own Cloud Code session identity.
   private readonly conversationSessions = new Map<
     string,
     { uuid: string; seq: number }
@@ -1114,19 +1109,6 @@ export class GoogleService {
     this.logger.log(
       `Loaded built-in Antigravity system prompt (${this.officialSystemPrompt.length} chars)`
     )
-
-    // Generate a stable sessionId for this process lifetime.
-    // Official Antigravity uses a signed 64-bit integer (e.g. -3750763034362895579).
-    // We generate one from 8 random bytes interpreted as a signed BigInt.
-    const buf = crypto.randomBytes(8)
-    const unsigned = buf.readBigUInt64BE()
-    // Convert to signed 64-bit range
-    const signed =
-      unsigned > BigInt("9223372036854775807")
-        ? unsigned - BigInt("18446744073709551616")
-        : unsigned
-    this.sessionId = signed.toString()
-    this.logger.log(`Session ID for Cloud Code requests: ${this.sessionId}`)
   }
 
   /**
@@ -2420,11 +2402,6 @@ export class GoogleService {
       }
     }
 
-    // Add sessionId: matches official Antigravity behavior.
-    // A single stable signed 64-bit integer shared across all requests
-    // within the same IDE/process session, used for server-side caching.
-    request.sessionId = this.sessionId
-
     return request
   }
 
@@ -3267,6 +3244,7 @@ export class GoogleService {
       userAgent: "antigravity",
       requestType: "agent",
       requestId: `agent/${Date.now()}/${session.uuid}/${++session.seq}`,
+      __workerConversationKey: session.uuid,
     }
   }
 
