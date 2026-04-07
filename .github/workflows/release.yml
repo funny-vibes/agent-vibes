@@ -184,7 +184,7 @@ jobs:
       - name: Build extension code
         run: |
           npm --workspace apps/chatgpt-register run build
-          node apps/vscode-extension/esbuild.config.mjs --production
+          cd apps/vscode-extension && node esbuild.config.mjs --production
 
       - name: Sync assets
         working-directory: apps/vscode-extension
