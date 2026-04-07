@@ -21,10 +21,10 @@ if (!version) {
 }
 
 const installLines = {
-  darwinArm64: `curl -L -o agent-vibes-darwin-arm64-${version}.vsix ${releaseBase}/agent-vibes-darwin-arm64-${version}.vsix && cursor --install-extension agent-vibes-darwin-arm64-${version}.vsix --force`,
-  darwinX64: `curl -L -o agent-vibes-darwin-x64-${version}.vsix ${releaseBase}/agent-vibes-darwin-x64-${version}.vsix && cursor --install-extension agent-vibes-darwin-x64-${version}.vsix --force`,
-  linuxX64: `curl -L -o agent-vibes-linux-x64-${version}.vsix ${releaseBase}/agent-vibes-linux-x64-${version}.vsix && cursor --install-extension agent-vibes-linux-x64-${version}.vsix --force`,
-  win32X64: `powershell -Command "Invoke-WebRequest -Uri '${releaseBase}/agent-vibes-win32-x64-${version}.vsix' -OutFile 'agent-vibes-win32-x64-${version}.vsix'; cursor --install-extension agent-vibes-win32-x64-${version}.vsix --force"`,
+  darwinArm64: `curl -L -o agent-vibes-darwin-arm64-${version}.vsix ${releaseBase}/agent-vibes-darwin-arm64-${version}.vsix\ncursor --install-extension agent-vibes-darwin-arm64-${version}.vsix --force`,
+  darwinX64: `curl -L -o agent-vibes-darwin-x64-${version}.vsix ${releaseBase}/agent-vibes-darwin-x64-${version}.vsix\ncursor --install-extension agent-vibes-darwin-x64-${version}.vsix --force`,
+  linuxX64: `curl -L -o agent-vibes-linux-x64-${version}.vsix ${releaseBase}/agent-vibes-linux-x64-${version}.vsix\ncursor --install-extension agent-vibes-linux-x64-${version}.vsix --force`,
+  win32X64: `Invoke-WebRequest -Uri "${releaseBase}/agent-vibes-win32-x64-${version}.vsix" -OutFile "agent-vibes-win32-x64-${version}.vsix"\ncursor --install-extension agent-vibes-win32-x64-${version}.vsix --force`,
 }
 
 function updateReadme(filePath) {

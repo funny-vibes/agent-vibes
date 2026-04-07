@@ -156,25 +156,29 @@ One-click download + install from [GitHub Releases](https://github.com/funny-vib
 #### macOS Apple Silicon
 
 ```bash
-curl -L -o agent-vibes-darwin-arm64-0.1.0.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-darwin-arm64-0.1.0.vsix && cursor --install-extension agent-vibes-darwin-arm64-0.1.0.vsix --force
+curl -L -o agent-vibes-darwin-arm64-0.1.0.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-darwin-arm64-0.1.0.vsix
+cursor --install-extension agent-vibes-darwin-arm64-0.1.0.vsix --force
 ```
 
-####### macOS Intel
+#### macOS Intel
 
 ```bash
-curl -L -o agent-vibes-darwin-x64-0.1.0.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-darwin-x64-0.1.0.vsix && cursor --install-extension agent-vibes-darwin-x64-0.1.0.vsix --force
+curl -L -o agent-vibes-darwin-x64-0.1.0.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-darwin-x64-0.1.0.vsix
+cursor --install-extension agent-vibes-darwin-x64-0.1.0.vsix --force
 ```
 
-####### Linux x64
+#### Linux x64
 
 ```bash
-curl -L -o agent-vibes-linux-x64-0.1.0.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-linux-x64-0.1.0.vsix && cursor --install-extension agent-vibes-linux-x64-0.1.0.vsix --force
+curl -L -o agent-vibes-linux-x64-0.1.0.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-linux-x64-0.1.0.vsix
+cursor --install-extension agent-vibes-linux-x64-0.1.0.vsix --force
 ```
 
-####### Windows x64
+#### Windows x64
 
 ```powershell
-powershell -Command "Invoke-WebRequest -Uri 'https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-win32-x64-0.1.0.vsix' -OutFile 'agent-vibes-win32-x64-0.1.0.vsix'; cursor --install-extension agent-vibes-win32-x64-0.1.0.vsix --force"
+Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.0/agent-vibes-win32-x64-0.1.0.vsix" -OutFile "agent-vibes-win32-x64-0.1.0.vsix"
+cursor --install-extension agent-vibes-win32-x64-0.1.0.vsix --force
 ```
 
 Restart Cursor after installation.
