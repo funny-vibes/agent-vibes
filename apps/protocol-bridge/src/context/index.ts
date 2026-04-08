@@ -1,18 +1,26 @@
 /**
  * Context Module Exports
  *
- * Provides conversation history management, tokenization, and context truncation.
+ * Provides conversation history management, projection, compaction, and tokenization.
  */
 
 // Types
 export * from "./types"
 
 // History services
-export { ConversationTruncatorService } from "./conversation-truncator.service"
-export { SummaryCacheService } from "./summary-cache.service"
-export { SummaryGeneratorService } from "./summary-generator.service"
 export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
+export { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
+export type {
+  ContextAttachmentSnapshot,
+  SessionTodoAttachmentLike,
+} from "./context-attachment-builder.service"
+export { ContextCompactionService } from "./context-compaction.service"
+export type { ContextCompactionResult } from "./context-compaction.service"
+export { ContextManagerService } from "./context-manager.service"
+export { ContextProjectionService } from "./context-projection.service"
+export { ContextSummaryService } from "./context-summary.service"
+export { ContextUsageLedgerService } from "./context-usage-ledger.service"
 export { normalizeToolProtocolMessages } from "./tool-protocol-normalizer"
 export type { ToolProtocolNormalizationResult } from "./tool-protocol-normalizer"
 export { enforceToolProtocol, assertIntegrity } from "./message-integrity-guard"

@@ -30,6 +30,7 @@ import {
   type CooldownableAccount,
   clearAccountDisablement,
   disableAccount,
+  isAccountAvailableForModel,
   isAccountDisabled,
   getEarliestRecovery,
   markAccountCooldown,
@@ -388,11 +389,25 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   baseUrl: string
   proxyUrl?: string
   preferResponsesApi?: boolean
+  maxContextTokens?: number
   source: "env" | "file"
   stateKey: string
 }
 
 type PersistedOpenaiCompatAccountState = PersistedBackendAccountState
+
+interface OpenaiCompatAccountFileEntry {
+  label?: string
+  apiKey?: string
+  baseUrl?: string
+  proxyUrl?: string
+  preferResponsesApi?: boolean
+  maxContextTokens?: number
+}
+
+interface OpenaiCompatConfigFile {
+  accounts?: OpenaiCompatAccountFileEntry[]
+}
 
 @Injectable()
 export class OpenaiCompatService implements OnModuleInit {
@@ -451,12 +466,23 @@ export class OpenaiCompatService implements OnModuleInit {
     // No-op: PersistenceService handles the unified DB path.
   }
 
+  private normalizeMaxContextTokens(value: unknown): number | undefined {
+    const parsed =
+      typeof value === "string" ? Number.parseInt(value.trim(), 10) : value
+    if (typeof parsed !== "number" || !Number.isFinite(parsed) || parsed <= 0) {
+      return undefined
+    }
+
+    return Math.floor(parsed)
+  }
+
   private buildAccountRecord(params: {
     label?: string
     apiKey: string
     baseUrl: string
     proxyUrl?: string
     preferResponsesApi?: boolean
+    maxContextTokens?: number
     source: "env" | "file"
   }): OpenaiCompatAccount {
     return {
@@ -465,6 +491,7 @@ export class OpenaiCompatService implements OnModuleInit {
       baseUrl: params.baseUrl,
       proxyUrl: params.proxyUrl,
       preferResponsesApi: params.preferResponsesApi,
+      maxContextTokens: this.normalizeMaxContextTokens(params.maxContextTokens),
       source: params.source,
       stateKey: this.buildAccountStateKey(params.apiKey, params.baseUrl),
       cooldownUntil: 0,
@@ -810,6 +837,9 @@ export class OpenaiCompatService implements OnModuleInit {
     const envProxyUrl = this.configService
       .get<string>("OPENAI_COMPAT_PROXY_URL", "")
       .trim()
+    const envMaxContextTokens = this.normalizeMaxContextTokens(
+      this.configService.get<number>("OPENAI_COMPAT_MAX_CONTEXT_TOKENS")
+    )
 
     if (envApiKey && envBaseUrl) {
       // Only add env account if it's not already in the list
@@ -823,6 +853,7 @@ export class OpenaiCompatService implements OnModuleInit {
             apiKey: envApiKey,
             baseUrl: envBaseUrl,
             proxyUrl: envProxyUrl || undefined,
+            maxContextTokens: envMaxContextTokens,
             source: "env",
           })
         )
@@ -894,9 +925,9 @@ export class OpenaiCompatService implements OnModuleInit {
       if (!fs.existsSync(configPath)) continue
 
       try {
-        const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
-          accounts?: Array<Record<string, string>>
-        }
+        const data = JSON.parse(
+          fs.readFileSync(configPath, "utf-8")
+        ) as OpenaiCompatConfigFile
         if (Array.isArray(data.accounts) && data.accounts.length > 0) {
           this.accountsConfigPath = configPath
           this.configureAccountStateStore(configPath)
@@ -907,7 +938,7 @@ export class OpenaiCompatService implements OnModuleInit {
             .filter(
               (
                 a
-              ): a is Record<string, string> & {
+              ): a is OpenaiCompatAccountFileEntry & {
                 apiKey: string
                 baseUrl: string
               } =>
@@ -922,9 +953,8 @@ export class OpenaiCompatService implements OnModuleInit {
                 apiKey: a.apiKey,
                 baseUrl: a.baseUrl,
                 proxyUrl: a.proxyUrl,
-                preferResponsesApi:
-                  a.preferResponsesApi === "true" ||
-                  (a as Record<string, unknown>).preferResponsesApi === true,
+                preferResponsesApi: a.preferResponsesApi === true,
+                maxContextTokens: a.maxContextTokens,
                 source: "file",
               })
             )
@@ -996,40 +1026,88 @@ export class OpenaiCompatService implements OnModuleInit {
     return this.accounts.some((account) => !isAccountDisabled(account))
   }
 
+  getConfiguredMaxContextTokens(model?: string): number | undefined {
+    let resolved: number | undefined
+
+    for (const account of this.accounts) {
+      if (isAccountDisabled(account)) {
+        continue
+      }
+      if (model && !isAccountAvailableForModel(account, model)) {
+        continue
+      }
+
+      const limit = this.normalizeMaxContextTokens(account.maxContextTokens)
+      if (limit === undefined) {
+        continue
+      }
+      resolved = resolved === undefined ? limit : Math.min(resolved, limit)
+    }
+
+    return resolved
+  }
+
   /**
    * Hot-reload accounts from config file.
-   * Adds new accounts without disturbing existing account state (cooldown, disabled, etc.).
-   * Returns the number of newly added accounts.
+   * Adds new accounts and patches mutable config without disturbing existing
+   * account state (cooldown, disabled, etc.).
+   * Returns the number of account changes.
    */
   reloadAccounts(): number {
     const freshAccounts = this.loadAllAccountsFromFile()
-    const existingKeys = new Set(this.accounts.map((a) => a.stateKey))
+    const existingByKey = new Map(this.accounts.map((a) => [a.stateKey, a]))
     const persistedStates = this.loadPersistedAccountStates()
-    let added = 0
+    let changedCount = 0
 
     for (const account of freshAccounts) {
-      if (!existingKeys.has(account.stateKey)) {
+      const existing = existingByKey.get(account.stateKey)
+      if (!existing) {
         this.applyPersistedAccountState(
           account,
           persistedStates.get(account.stateKey)
         )
         this.accounts.push(account)
-        existingKeys.add(account.stateKey)
-        added++
+        changedCount++
         this.logger.log(
           `[Hot-reload] Added new OpenAI-compat account: ${account.label || account.baseUrl}`
+        )
+        continue
+      }
+
+      let changed = false
+      if (existing.label !== account.label) {
+        existing.label = account.label
+        changed = true
+      }
+      if (existing.proxyUrl !== account.proxyUrl) {
+        existing.proxyUrl = account.proxyUrl
+        changed = true
+      }
+      if (existing.preferResponsesApi !== account.preferResponsesApi) {
+        existing.preferResponsesApi = account.preferResponsesApi
+        changed = true
+      }
+      if (existing.maxContextTokens !== account.maxContextTokens) {
+        existing.maxContextTokens = account.maxContextTokens
+        changed = true
+      }
+
+      if (changed) {
+        changedCount++
+        this.logger.log(
+          `[Hot-reload] Updated OpenAI-compat account: ${existing.label || existing.baseUrl}`
         )
       }
     }
 
-    if (added > 0) {
+    if (changedCount > 0) {
       this.persistAccountStates()
       this.logger.log(
-        `[Hot-reload] OpenAI-compat: ${added} new account(s) added, total=${this.accounts.length}`
+        `[Hot-reload] OpenAI-compat: ${changedCount} account change(s), total=${this.accounts.length}`
       )
     }
 
-    return added
+    return changedCount
   }
 
   /**
@@ -1054,6 +1132,7 @@ export class OpenaiCompatService implements OnModuleInit {
         source: account.source,
         baseUrl: account.baseUrl,
         proxyUrl: account.proxyUrl,
+        maxContextTokens: account.maxContextTokens,
         modelCooldowns,
       }
     })

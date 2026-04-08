@@ -284,7 +284,8 @@ agent-vibes sync --codex
       "baseUrl": "https://b.example.com/v1",
       "apiKey": "sk-yyy",
       "proxyUrl": "http://127.0.0.1:7897",
-      "preferResponsesApi": true
+      "preferResponsesApi": true,
+      "maxContextTokens": 200000
     }
   ]
 }
@@ -297,6 +298,8 @@ Behavior:
 - When quota is exhausted, the system automatically switches to the next available account.
 - `proxyUrl` routes requests through the specified HTTP/SOCKS proxy for that account.
 - `preferResponsesApi=true` uses the OpenAI Responses API (`/v1/responses`) instead of Chat Completions.
+- `maxContextTokens` sets a per-account input/context cap. When multiple OpenAI-compatible accounts are eligible, the bridge clamps to the
+  smallest configured cap among the currently available accounts so rotation and failover stay within the provider window.
 
 ### 3. Claude API
 
@@ -305,7 +308,8 @@ Use for third-party Claude-compatible APIs.
 Configuration:
 
 - `agent-vibes sync --claude` reads `~/.claude/settings.json` and writes or updates a managed `claude-code-sync` entry in `~/.agent-vibes/data/claude-api-accounts.json`.
-  The managed entry mirrors the current source settings; if the source no longer declares explicit model IDs, stale managed `models` are removed so dynamic discovery can take effect.
+  The managed entry mirrors the current source settings; if the source no longer declares explicit model IDs, stale managed `models` are removed so
+  dynamic discovery can take effect.
 - Or edit `~/.agent-vibes/data/claude-api-accounts.json` manually:
 
 ```json
@@ -321,6 +325,7 @@ Configuration:
       "label": "third-party",
       "apiKey": "sk-third-yyy",
       "baseUrl": "https://claude.example.com",
+      "maxContextTokens": 200000,
       "stripThinking": true,
       "proxyUrl": "socks5://127.0.0.1:1080",
       "prefix": "team-a",
@@ -351,6 +356,8 @@ Behavior:
 - If `models` is configured, the explicit mappings take precedence and automatic discovery is skipped for that account.
 - `stripThinking=true` removes Anthropic thinking fields before forwarding for providers that only support the base Claude model name.
 - `excludedModels` supports case-insensitive wildcard patterns such as `claude-3-*`, `*-thinking`, or `*haiku*`.
+- `maxContextTokens` sets a per-account input/context cap. When multiple Claude API accounts can serve the same model, the bridge clamps to the smallest
+  configured cap among the currently available candidates so retries do not overflow a smaller provider window.
 - Official `api.anthropic.com` accounts use `x-api-key`; third-party endpoints use `Authorization: Bearer ...`.
 
 ## Project Structure
@@ -470,7 +477,8 @@ agent-vibes/
 
 ## Community
 
-Join the discussion and share your thoughts about Agent Vibes on [LINUX DO](https://linux.do/t/topic/1814066), or feel free to report bugs and feedback on [GitHub Issues](https://github.com/funny-vibes/agent-vibes/issues).
+Join the discussion and share your thoughts about Agent Vibes on [LINUX DO](https://linux.do/t/topic/1814066), or feel free to report bugs and feedback on
+[GitHub Issues](https://github.com/funny-vibes/agent-vibes/issues).
 
 ## Contributing
 

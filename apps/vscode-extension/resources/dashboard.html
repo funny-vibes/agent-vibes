@@ -199,8 +199,31 @@
     .btn-secondary { background: var(--input-bg); color: var(--fg); border-color: var(--border); }
     .btn-ghost { background: transparent; color: var(--fg-2); border-color: transparent; }
     .btn-ghost:hover:not(:disabled) { background: var(--input-bg); color: var(--fg); }
-    .btn-danger { background: transparent; color: var(--bad); border-color: transparent; font-size: var(--text-xs); }
-    .btn-danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent); }
+    .btn-danger {
+      background: color-mix(in srgb, var(--bad) 10%, transparent);
+      color: var(--bad);
+      border-color: color-mix(in srgb, var(--bad) 30%, transparent);
+      font-size: var(--text-xs);
+    }
+    .btn-danger:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--bad) 18%, transparent);
+      border-color: color-mix(in srgb, var(--bad) 45%, transparent);
+      color: #fff;
+    }
+    .account-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--sp-2);
+      flex-shrink: 0;
+    }
+    .account-action-btn {
+      height: 24px;
+      min-width: 64px;
+      justify-content: center;
+      padding: 0 10px;
+      font-size: var(--text-xs);
+    }
 
     /* ── Logs path row ── */
     .log-path-bar {
@@ -673,6 +696,9 @@
   <script>
     const vscode = acquireVsCodeApi();
     let curCh = null;
+    let dlgMode = 'add';
+    let dlgEditIndex = -1;
+    let dlgInitialData = null;
     let allData = {};
     let usageSummaryData = null;
     let currentLogFilePath = '';
@@ -709,6 +735,7 @@
           { key: 'label', label: 'Label', type: 'text', ph: 'e.g. claude-proxy' },
           { key: 'baseUrl', label: 'Base URL', type: 'text', ph: 'https://api.example.com' },
           { key: 'apiKey', label: 'API Key', type: 'text' },
+          { key: 'maxContextTokens', label: 'Max Context Tokens', type: 'number', ph: '200000', defaultValue: '200000' },
           { key: 'proxyUrl', label: 'Proxy URL (optional)', type: 'text', ph: 'http://127.0.0.1:7897' },
         ],
         name: a => a.label || a.baseUrl || 'Unknown',
@@ -719,8 +746,10 @@
         mode: 'form',
         fields: [
           { key: 'label', label: 'Label', type: 'text' },
+          { key: 'baseUrl', label: 'Base URL', type: 'text', ph: 'https://api.anthropic.com' },
           { key: 'apiKey', label: 'API Key', type: 'text', ph: 'sk-ant-...' },
-          { key: 'proxyUrl', label: 'Proxy URL (optional)', type: 'text' },
+          { key: 'maxContextTokens', label: 'Max Context Tokens', type: 'number', ph: '200000', defaultValue: '200000' },
+          { key: 'proxyUrl', label: 'Proxy URL (optional)', type: 'text', ph: 'http://127.0.0.1:7897' },
         ],
         name: a => a.label || 'Unnamed',
         info: a => a.apiKey ? a.apiKey.slice(0, 16) + '...' : '',
@@ -777,7 +806,6 @@
       if (m.type === 'testResult') handleTestResult(m.data);
       if (m.type === 'oauthStatus') handleOAuthStatus(m.data);
       if (m.type === 'codexOAuthStatus') handleCodexOAuthStatus(m.data);
-      if (m.type === 'chatgptRegisterStatus') handleChatgptRegisterStatus(m.data);
     });
 
     // Fetch initial pool status once on load
@@ -1116,8 +1144,7 @@
     // ── Accounts tab ──
     var selectedChannel = 'antigravity';
     var emailPrivacy = false;
-    var codexSubView = 'accounts'; // 'accounts' | 'register'
-    var registerDraft = null; // live form values preserved across re-renders
+    var codexSubView = 'accounts';
     var antigravityDraft = { proxyUrl: '' };
 
     function maskEmail(email) {
@@ -1413,34 +1440,6 @@
       h += '</div>';
       h += '</div>';
 
-      // ── Inline Register panel (replaces account list when active) ──
-      if (selectedChannel === 'codex' && codexSubView === 'register') {
-        // Snapshot live form values before re-render (survives auto-refresh)
-        snapshotRegisterDraft();
-        var defs = registerDraft || (allData && allData.chatgptRegisterDefaults) || {};
-        h += '<div style="border-top:1px solid var(--line);padding-top:var(--sp-4);margin-top:var(--sp-2)">';
-        h += '<div style="display:flex;align-items:center;gap:var(--sp-2);margin-bottom:var(--sp-3)">';
-        h += '<button class="btn btn-ghost" onclick="switchCodexSubView(\'accounts\')" style="padding:0 var(--sp-2)">← Back</button>';
-        h += '<span style="font-size:var(--text-lg);font-weight:700">GPT Register</span>';
-        h += '</div>';
-        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6;margin-bottom:var(--sp-3)">';
-        h += 'Connect to your self-hosted email provisioning service (CF Worker / custom API) to automatically register a ChatGPT account, complete the OAuth flow, and save the resulting Codex credentials.';
-        h += '</div>';
-        h += '<div class="field"><label>API URL</label>';
-        h += '<input type="text" id="f-reg-apiUrl" placeholder="https://your-worker.your-domain.workers.dev" value="' + esc(defs.apiUrl || '') + '" /></div>';
-        h += '<div class="field"><label>Admin Token</label>';
-        h += '<input type="text" id="f-reg-adminToken" placeholder="Worker admin token" value="' + esc(defs.adminToken || '') + '" /></div>';
-        h += '<div class="field"><label>Domains (one per line, prefix * to enable for random selection)</label>';
-        h += '<textarea id="f-reg-domains" style="min-height:60px" placeholder="*enabled-domain.com\nother-domain.com">' + esc(mergeDomainsForDisplay(defs)) + '</textarea></div>';
-        h += '<div style="margin-top:var(--sp-3)">';
-        h += '<button class="btn btn-primary" id="inline-reg-btn" onclick="startChatgptRegisterInline()">Start Registration</button>';
-        h += '</div>';
-        h += '<div id="chatgpt-register-status" style="margin-top:var(--sp-3)"></div>';
-        h += '</div>';
-
-        panel.innerHTML = h;
-        return;
-      }
 
       // Account list (paginated)
       if (list.length === 0) {
@@ -1477,7 +1476,12 @@
             h += '<span style="font-size:var(--text-xs);color:var(--fg-2)">' + esc(stateLabel(poolEntry.state)) + '</span>';
           }
           h += '</div>';
-          h += '<button class="btn btn-danger" style="font-size:var(--text-xs);padding:2px 8px" onclick="rmAcct(\'' + selectedChannel + '\',' + i + ')">Remove</button>';
+          h += '<div class="account-actions">';
+          if (selectedChannel === 'openai-compat' || selectedChannel === 'claude-api') {
+            h += '<button class="btn btn-secondary account-action-btn" onclick="editAcct(\'' + selectedChannel + '\',' + i + ')">Edit</button>';
+          }
+          h += '<button class="btn btn-danger account-action-btn" onclick="rmAcct(\'' + selectedChannel + '\',' + i + ')">Remove</button>';
+          h += '</div>';
           h += '</div>';
 
           // Quota bars for Antigravity — always render key models, even at 0%
@@ -1647,12 +1651,18 @@
     // ── Dialog ──
     var dlgOAuthTab = 'oauth'; // 'oauth' or 'token'
 
-    function openDlg(ch) {
+    function openDlg(ch, mode, index) {
       curCh = ch;
+      dlgMode = mode || 'add';
+      dlgEditIndex = typeof index === 'number' ? index : -1;
       const d = CH[ch];
       const title = document.getElementById('dlg-title');
       const fields = document.getElementById('dlg-fields');
       const okBtn = document.getElementById('dlg-ok');
+      const channelState = getChannelState(allData || {}, ch);
+      dlgInitialData = dlgMode === 'edit' && dlgEditIndex >= 0
+        ? (channelState.accounts[dlgEditIndex] || null)
+        : null;
 
       // Reset action bar visibility + default label
       document.querySelector('#dlg .dialog-actions').style.display = '';
@@ -1660,30 +1670,38 @@
       okBtn.disabled = false;
 
       if (ch === 'antigravity') {
-        title.textContent = 'Add ' + d.label + ' Account';
+        title.textContent = (dlgMode === 'edit' ? 'Edit ' : 'Add ') + d.label + ' Account';
         antigravityDraft = { proxyUrl: '' };
         dlgOAuthTab = 'oauth';
         renderAntigravityDlg();
       } else if (ch === 'codex') {
-        title.textContent = 'Add ' + d.label + ' Account';
+        title.textContent = (dlgMode === 'edit' ? 'Edit ' : 'Add ') + d.label + ' Account';
         codexOAuthTab = 'oauth';
         renderCodexDlg();
       } else if (d.mode === 'sync') {
-        title.textContent = 'Add ' + d.label + ' Token';
-        okBtn.textContent = 'Add';
+        title.textContent = (dlgMode === 'edit' ? 'Edit ' : 'Add ') + d.label + ' Token';
+        okBtn.textContent = dlgMode === 'edit' ? 'Save' : 'Add';
         okBtn.onclick = submitDlg;
         fields.innerHTML =
           '<div class="field"><label>Refresh Token</label>' +
           '<textarea id="f-token" placeholder="Paste token(s)...\nSupports: single, JSON array, or multi-line"></textarea>' +
           '<div class="field-hint">Format: 1//xxx (Google) or rt_xxx (OpenAI). Batch supported.</div></div>';
       } else {
-        title.textContent = 'Add ' + d.label + ' Account';
-        okBtn.textContent = 'Add';
+        title.textContent = (dlgMode === 'edit' ? 'Edit ' : 'Add ') + d.label + ' Account';
+        okBtn.textContent = dlgMode === 'edit' ? 'Save' : 'Add';
         okBtn.onclick = submitDlg;
         let fh = '';
         for (const f of d.fields) {
+          var currentValue = '';
+          if (dlgInitialData && dlgInitialData[f.key] !== undefined && dlgInitialData[f.key] !== null) {
+            currentValue = String(dlgInitialData[f.key]);
+          } else if (f.key === 'proxyUrl' && lastStatusData && lastStatusData.defaultProxyUrl) {
+            currentValue = String(lastStatusData.defaultProxyUrl);
+          } else if (f.defaultValue !== undefined && f.defaultValue !== null) {
+            currentValue = String(f.defaultValue);
+          }
           fh += '<div class="field"><label>' + esc(f.label) + '</label>' +
-            '<input type="' + f.type + '" id="f-' + f.key + '" placeholder="' + esc(f.ph || '') + '" /></div>';
+            '<input type="' + f.type + '" id="f-' + f.key + '" placeholder="' + esc(f.ph || '') + '" value="' + esc(currentValue) + '" /></div>';
         }
         fields.innerHTML = fh;
       }
@@ -1785,17 +1803,13 @@
       var fields = document.getElementById('dlg-fields');
       var okBtn = document.getElementById('dlg-ok');
       var isOAuth = codexOAuthTab === 'oauth';
-      var isRegister = codexOAuthTab === 'register';
       var isToken = codexOAuthTab === 'token';
       var h = '';
 
-      // Tab bar — only show when NOT in standalone register mode
-      if (!isRegister) {
-        h += '<div class="oauth-tabs">';
-        h += '<button class="oauth-tab' + (isOAuth ? ' active' : '') + '" onclick="switchCodexOAuthTab(\'oauth\')">OpenAI OAuth</button>';
-        h += '<button class="oauth-tab' + (isToken ? ' active' : '') + '" onclick="switchCodexOAuthTab(\'token\')">Manual Sync</button>';
-        h += '</div>';
-      }
+      h += '<div class="oauth-tabs">';
+      h += '<button class="oauth-tab' + (isOAuth ? ' active' : '') + '" onclick="switchCodexOAuthTab(\'oauth\')">OpenAI OAuth</button>';
+      h += '<button class="oauth-tab' + (isToken ? ' active' : '') + '" onclick="switchCodexOAuthTab(\'token\')">Manual Sync</button>';
+      h += '</div>';
 
       h += '<div class="dlg-body">';
 
@@ -1810,22 +1824,6 @@
         okBtn.textContent = 'Start Authorization';
         okBtn.disabled = false;
         okBtn.onclick = startCodexOAuth;
-      } else if (isRegister) {
-        var defs = (allData && allData.chatgptRegisterDefaults) || {};
-        h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6;padding:var(--sp-2) 0 var(--sp-3)">';
-        h += 'Connect to your self-hosted email provisioning service (CF Worker / custom API) to automatically register a ChatGPT account, complete the OAuth flow, and save the resulting Codex credentials.';
-        h += '</div>';
-        h += '<div class="field"><label>API URL</label>';
-        h += '<input type="text" id="f-reg-apiUrl" placeholder="https://your-worker.your-domain.workers.dev" value="' + esc(defs.apiUrl || '') + '" /></div>';
-        h += '<div class="field"><label>Admin Token</label>';
-        h += '<input type="text" id="f-reg-adminToken" placeholder="Worker admin token" value="' + esc(defs.adminToken || '') + '" /></div>';
-        h += '<div class="field"><label>Domains (one per line, prefix * to enable for random selection)</label>';
-        h += '<textarea id="f-reg-domains" style="min-height:60px" placeholder="*enabled-domain.com\nother-domain.com">' + esc(mergeDomainsForDisplay(defs)) + '</textarea></div>';
-        h += '<div id="chatgpt-register-status" style="margin-top:var(--sp-3)"></div>';
-
-        okBtn.textContent = 'Start Registration';
-        okBtn.disabled = false;
-        okBtn.onclick = startChatgptRegister;
       } else {
         h += '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6;padding:var(--sp-2) 0 var(--sp-3)">';
         h += 'Sync from your local Codex CLI configuration at <code>~/.codex/auth.json</code>.';
@@ -1848,110 +1846,9 @@
       renderCodexDlg();
     }
 
-    // ── Domain merge/parse helpers ──
-    // Merge domain + domains + enabledDomains into a single textarea value.
-    // Enabled domains get a * prefix; plain domains have no prefix.
-    // The single `domain` field is included as the first entry if not already in the list.
-    // When defs is a draft (string in .domains), pass it through as-is.
-    function mergeDomainsForDisplay(defs) {
-      // Draft mode: domains is already a merged string
-      if (typeof defs.domains === 'string') return defs.domains;
-      var allDomains = Array.isArray(defs.domains) ? defs.domains.slice() : [];
-      var enabled = Array.isArray(defs.enabledDomains) ? defs.enabledDomains : [];
-      // Include single domain if not already in list
-      var singleDomain = (defs.domain || '').trim();
-      if (singleDomain) {
-        var alreadyIn = false;
-        for (var x = 0; x < allDomains.length; x++) {
-          if (allDomains[x].toLowerCase() === singleDomain.toLowerCase()) { alreadyIn = true; break; }
-        }
-        if (!alreadyIn) allDomains.unshift(singleDomain);
-      }
-      var enabledSet = {};
-      for (var i = 0; i < enabled.length; i++) enabledSet[enabled[i].toLowerCase()] = true;
-      var lines = [];
-      for (var j = 0; j < allDomains.length; j++) {
-        var d = allDomains[j];
-        lines.push(enabledSet[d.toLowerCase()] ? '*' + d : d);
-      }
-      // Add enabled domains not in allDomains
-      for (var k = 0; k < enabled.length; k++) {
-        var found = false;
-        for (var m = 0; m < allDomains.length; m++) {
-          if (allDomains[m].toLowerCase() === enabled[k].toLowerCase()) { found = true; break; }
-        }
-        if (!found) lines.push('*' + enabled[k]);
-      }
-      return lines.join('\n');
-    }
-
-    // Parse merged textarea back into { domain, domains, enabledDomains } for postMessage.
-    // First non-starred entry becomes `domain`; all entries go into `domains`.
-    function parseMergedDomains(raw) {
-      var lines = (raw || '').split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
-      var domains = [];
-      var enabled = [];
-      var domain = '';
-      for (var i = 0; i < lines.length; i++) {
-        if (lines[i].charAt(0) === '*') {
-          var d = lines[i].slice(1).trim();
-          if (d) { domains.push(d); enabled.push(d); }
-        } else {
-          domains.push(lines[i]);
-          if (!domain) domain = lines[i];
-        }
-      }
-      return { domain: domain, domains: domains.join('\n'), enabledDomains: enabled.join('\n') };
-    }
-
-    function openRegisterDlg() {
-      switchCodexSubView('register');
-    }
-
-    function snapshotRegisterDraft() {
-      // Capture current form values from DOM before re-render
-      var el = document.getElementById('f-reg-apiUrl');
-      if (!el) return; // form not in DOM yet
-      registerDraft = {
-        apiUrl: (document.getElementById('f-reg-apiUrl') || {}).value || '',
-        adminToken: (document.getElementById('f-reg-adminToken') || {}).value || '',
-        domains: (document.getElementById('f-reg-domains') || {}).value || '',
-      };
-      // Persist to backend so values survive panel close/reopen
-      var merged = parseMergedDomains(registerDraft.domains);
-      vscode.postMessage({ type: 'persistRegisterDefaults', data: {
-        apiUrl: registerDraft.apiUrl,
-        adminToken: registerDraft.adminToken,
-        domain: merged.domain,
-        domains: merged.domains,
-        enabledDomains: merged.enabledDomains,
-      }});
-    }
-
     function switchCodexSubView(view) {
-      if (view === 'accounts') {
-        registerDraft = null; // clear draft when leaving register view
-      }
       codexSubView = view;
       renderChannelDetail();
-    }
-
-    function startChatgptRegisterInline() {
-      var btn = document.getElementById('inline-reg-btn');
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Registering...';
-      }
-      var merged = parseMergedDomains((document.getElementById('f-reg-domains') || {}).value || '');
-      var data = {
-        apiUrl: (document.getElementById('f-reg-apiUrl') || {}).value || '',
-        adminToken: (document.getElementById('f-reg-adminToken') || {}).value || '',
-        domain: merged.domain,
-        domains: merged.domains,
-        enabledDomains: merged.enabledDomains,
-        randomSubdomain: false,
-      };
-      vscode.postMessage({ type: 'startChatgptRegister', data: data });
     }
 
     function startCodexOAuth() {
@@ -1981,58 +1878,13 @@
       }
     }
 
-    // ── ChatGPT Register ──
-    function startChatgptRegister() {
-      var btn = document.getElementById('dlg-ok');
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Registering...';
-      }
-      var merged = parseMergedDomains((document.getElementById('f-reg-domains') || {}).value || '');
-      var data = {
-        apiUrl: (document.getElementById('f-reg-apiUrl') || {}).value || '',
-        adminToken: (document.getElementById('f-reg-adminToken') || {}).value || '',
-        domain: merged.domain,
-        domains: merged.domains,
-        enabledDomains: merged.enabledDomains,
-        randomSubdomain: false,
-      };
-      vscode.postMessage({ type: 'startChatgptRegister', data: data });
+    function closeDlg() {
+      document.getElementById('dlg').classList.remove('open');
+      curCh = null;
+      dlgMode = 'add';
+      dlgEditIndex = -1;
+      dlgInitialData = null;
     }
-
-    function handleChatgptRegisterStatus(data) {
-      var el = document.getElementById('chatgpt-register-status');
-      if (!el) return;
-      var btn = document.getElementById('inline-reg-btn') || document.getElementById('dlg-ok');
-
-      if (data.status === 'loading') {
-        var logHtml = '';
-        if (data.logs && data.logs.length > 0) {
-          var last = data.logs.slice(-5);
-          logHtml = '<div style="margin-top:var(--sp-2);font-family:var(--vscode-editor-font-family,monospace);font-size:var(--text-xs);color:var(--fg-3);max-height:120px;overflow-y:auto">';
-          for (var i = 0; i < last.length; i++) { logHtml += '<div>' + esc(last[i]) + '</div>'; }
-          logHtml += '</div>';
-        }
-        el.innerHTML = '<div style="display:flex;align-items:center;gap:8px;padding:var(--sp-2) 0;color:var(--focus);font-size:var(--text-sm)"><span class="btn-spinner"></span>' + esc(data.message) + '</div>' + logHtml;
-        if (btn) { btn.disabled = true; btn.textContent = 'Registering...'; }
-      } else if (data.status === 'success') {
-        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--good);font-size:var(--text-sm);font-weight:600">' + esc(data.message) + '</div>';
-        if (btn) { btn.disabled = false; btn.textContent = 'Start Registration'; }
-        // Auto-switch back to accounts view after success
-        setTimeout(function() { switchCodexSubView('accounts'); }, 2500);
-      } else if (data.status === 'error') {
-        var errLogHtml = '';
-        if (data.logs && data.logs.length > 0) {
-          errLogHtml = '<div style="margin-top:var(--sp-2);font-family:var(--vscode-editor-font-family,monospace);font-size:var(--text-xs);color:var(--fg-2);max-height:200px;overflow-y:auto;background:var(--input-bg);padding:var(--sp-2);border-radius:var(--radius)">';
-          for (var j = 0; j < data.logs.length; j++) { errLogHtml += '<div>' + esc(data.logs[j]) + '</div>'; }
-          errLogHtml += '</div>';
-        }
-        el.innerHTML = '<div style="padding:var(--sp-2) 0;color:var(--bad);font-size:var(--text-sm);font-weight:600">' + esc(data.message) + '</div>' + errLogHtml;
-        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
-      }
-    }
-
-    function closeDlg() { document.getElementById('dlg').classList.remove('open'); curCh = null; }
 
     function openAccountFile(channel) {
       var state = getChannelState(allData, channel);
@@ -2059,11 +1911,16 @@
           const el = document.getElementById('f-' + f.key);
           if (el && el.value.trim()) acct[f.key] = el.value.trim();
         }
-        vscode.postMessage({ type: 'addAccount', channel: curCh, data: acct });
+        if (dlgMode === 'edit' && dlgEditIndex >= 0) {
+          vscode.postMessage({ type: 'updateAccount', channel: curCh, index: dlgEditIndex, data: acct });
+        } else {
+          vscode.postMessage({ type: 'addAccount', channel: curCh, data: acct });
+        }
       }
       closeDlg();
     }
 
+    function editAcct(ch, i) { openDlg(ch, 'edit', i); }
     function rmAcct(ch, i) { vscode.postMessage({ type: 'removeAccount', channel: ch, index: i }); }
     function runCmd(cmd) { vscode.postMessage({ type: 'runCommand', command: cmd }); }
     function runCmdWithLoading(btn, cmd) {

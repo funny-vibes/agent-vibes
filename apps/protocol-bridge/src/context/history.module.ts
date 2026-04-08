@@ -1,9 +1,12 @@
 import { Module } from "@nestjs/common"
 import { TokenCounterService } from "./token-counter.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
-import { ConversationTruncatorService } from "./conversation-truncator.service"
-import { SummaryCacheService } from "./summary-cache.service"
-import { SummaryGeneratorService } from "./summary-generator.service"
+import { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
+import { ContextCompactionService } from "./context-compaction.service"
+import { ContextManagerService } from "./context-manager.service"
+import { ContextProjectionService } from "./context-projection.service"
+import { ContextSummaryService } from "./context-summary.service"
+import { ContextUsageLedgerService } from "./context-usage-ledger.service"
 
 /**
  * History Module
@@ -13,29 +16,36 @@ import { SummaryGeneratorService } from "./summary-generator.service"
  * Components:
  * - TokenCounterService: Accurate token counting (tiktoken)
  * - ToolIntegrityService: Tool use/result pair integrity
- * - ConversationTruncatorService: Token-based truncation with summary
- * - SummaryCacheService: Cache for generated summaries
- * - SummaryGeneratorService: Generate summaries for truncated messages
+ * - ContextProjectionService: Read-time API view over transcript + compaction boundary
+ * - ContextSummaryService: Structured compaction summary generation
+ * - ContextCompactionService: Boundary-based compaction + final hard fit
+ * - ContextManagerService: Single orchestration entry point for session and stateless requests
  *
  * Design:
- * - Cursor client manages its own history
- * - We only truncate when exceeding backend token limits
- * - Summaries are generated for truncated messages and cached
+ * - Maintain a canonical transcript or ephemeral transcript state
+ * - Project backend-facing messages at send time
+ * - Record compaction as first-class state instead of ad hoc truncation
  */
 @Module({
   providers: [
     TokenCounterService,
     ToolIntegrityService,
-    SummaryCacheService,
-    SummaryGeneratorService,
-    ConversationTruncatorService,
+    ContextAttachmentBuilderService,
+    ContextProjectionService,
+    ContextSummaryService,
+    ContextUsageLedgerService,
+    ContextCompactionService,
+    ContextManagerService,
   ],
   exports: [
     TokenCounterService,
     ToolIntegrityService,
-    ConversationTruncatorService,
-    SummaryCacheService,
-    SummaryGeneratorService,
+    ContextAttachmentBuilderService,
+    ContextProjectionService,
+    ContextSummaryService,
+    ContextUsageLedgerService,
+    ContextCompactionService,
+    ContextManagerService,
   ],
 })
 export class HistoryModule {}

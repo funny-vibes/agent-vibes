@@ -272,7 +272,8 @@ agent-vibes sync --codex
       "baseUrl": "https://b.example.com/v1",
       "apiKey": "sk-yyy",
       "proxyUrl": "http://127.0.0.1:7897",
-      "preferResponsesApi": true
+      "preferResponsesApi": true,
+      "maxContextTokens": 200000
     }
   ]
 }
@@ -285,6 +286,7 @@ agent-vibes sync --codex
 - 额度耗尽时自动切换到下一个可用账号。
 - `proxyUrl` 可为该账号指定 HTTP/SOCKS 代理地址。
 - `preferResponsesApi=true` 时使用 OpenAI Responses API（`/v1/responses`）代替 Chat Completions。
+- `maxContextTokens` 可为账号设置输入/上下文上限。若当前有多个可用的 OpenAI 兼容账号可参与轮转，bridge 会取其中已配置上限的最小值进行 clamp，避免切换或回退到较小窗口的提供方时溢出。
 
 ### 3. Claude API
 
@@ -309,6 +311,7 @@ agent-vibes sync --codex
       "label": "third-party",
       "apiKey": "sk-third-yyy",
       "baseUrl": "https://claude.example.com",
+      "maxContextTokens": 200000,
       "stripThinking": true,
       "proxyUrl": "socks5://127.0.0.1:1080",
       "prefix": "team-a",
@@ -338,6 +341,8 @@ agent-vibes sync --codex
 - 如果配置了 `models`，则以手动映射为准，不再自动发现该账号的模型列表。
 - `stripThinking=true` 时，会在转发前移除 Anthropic thinking 相关字段，适合只支持基础 Claude 模型名的第三方端点。
 - `excludedModels` 支持大小写不敏感的通配符写法，例如 `claude-3-*`、`*-thinking`、`*haiku*`。
+- `maxContextTokens` 可为账号设置输入/上下文上限。若多个 Claude API 账号都能服务同一个模型，bridge 会取当前可用候选中已配置上限的最小值做 clamp，
+  确保失败回退时也不会撞上较小提供方的窗口。
 - 官方 `api.anthropic.com` 使用 `x-api-key`；第三方兼容端点使用 `Authorization: Bearer ...`。
 
 ## 项目结构

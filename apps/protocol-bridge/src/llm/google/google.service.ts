@@ -11,6 +11,7 @@ import {
   resolveCloudCodeModel,
 } from "../model-registry"
 import { ProcessPoolService } from "../native/process-pool.service"
+import { BackendApiError } from "../shared/backend-errors"
 import { findPendingToolUseIdsInMessages } from "../tool-continuation-policy"
 import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
@@ -20,6 +21,17 @@ class FatalCloudCodeRequestError extends Error {
     super(message)
     this.name = "FatalCloudCodeRequestError"
   }
+}
+
+interface ConversationRecoveryState {
+  retryAt: number
+  updatedAt: number
+  reason: string
+}
+
+interface RecoveryBackoffState {
+  attemptCount: number
+  totalWaitMs: number
 }
 
 /**
@@ -58,6 +70,8 @@ export class GoogleService {
   private readonly MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS = 60 * 1000
   private readonly TRANSIENT_WORKER_FAILURE_COOLDOWN_MS = 5 * 60 * 1000
   private readonly TRANSIENT_TRANSPORT_FAILURE_COOLDOWN_MS = 60 * 1000
+  private readonly MAX_PROGRESSIVE_RECOVERY_DELAY_MS = 5 * 60 * 1000
+  private readonly MAX_PROGRESSIVE_RECOVERY_TOTAL_WAIT_MS = 20 * 60 * 1000
   private readonly MAX_PROMPT_SHRINK_RETRIES: number = 3
   private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 65536
   private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 65536
@@ -69,10 +83,6 @@ export class GoogleService {
   private readonly CONVERSATION_SESSION_TTL_MS: number
   private readonly CONVERSATION_SESSION_MAX_SIZE: number
 
-  // CHECKPOINT counter for Antigravity-style context truncation.
-  // Incremented each time enforceTokenBudget or tryShrinkPayload injects a CHECKPOINT summary.
-  private checkpointCounter = 0
-
   private readonly toolNameById = new Map<
     string,
     { name: string; updatedAt: number }
@@ -81,12 +91,21 @@ export class GoogleService {
     string,
     { projectId?: string; traceId?: string; updatedAt: number }
   >()
+  private readonly conversationRecoveryById = new Map<
+    string,
+    ConversationRecoveryState
+  >()
   private lastToolNameCacheCleanupAt = 0
   private lastConversationMetricContextCleanupAt = 0
+  private lastConversationRecoveryCleanupAt = 0
   private readonly TOOL_NAME_CACHE_TTL_MS = 24 * 60 * 60 * 1000
   private readonly TOOL_NAME_CACHE_MAX_SIZE = 4096
   private readonly CONVERSATION_METRIC_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000
   private readonly CONVERSATION_METRIC_CONTEXT_MAX_SIZE = 4096
+  private readonly CONVERSATION_RECOVERY_TTL_MS = 24 * 60 * 60 * 1000
+  private readonly CONVERSATION_RECOVERY_MAX_SIZE = 4096
+  private readonly MAX_AUTOMATIC_CONVERSATION_RECOVERY_WAIT_MS =
+    this.MAX_PROGRESSIVE_RECOVERY_TOTAL_WAIT_MS
 
   /**
    * Parse duration string like "1.203608125s" or "1h16m0.667923083s" to milliseconds
@@ -270,6 +289,13 @@ export class GoogleService {
     ].join("\n")
   }
 
+  private buildCloudCodeTemporaryUnavailableMessage(
+    model: string,
+    waitMs: number
+  ): string {
+    return `All Cloud Code workers are temporarily unavailable for ${model}. Retry after ${Math.ceil(waitMs / 1000)}s.`
+  }
+
   private getTelemetryPlatform(): string {
     const platformMap: Record<string, string> = {
       darwin: "DARWIN",
@@ -376,6 +402,137 @@ export class GoogleService {
         this.conversationMetricContextById.delete(conversationId)
       }
     }
+  }
+
+  private getConversationRecoveryKey(
+    conversationId: string | null | undefined,
+    model: string
+  ): string | null {
+    const normalizedConversationId =
+      typeof conversationId === "string" ? conversationId.trim() : ""
+    const normalizedModel = typeof model === "string" ? model.trim() : ""
+    if (!normalizedConversationId || !normalizedModel) return null
+    return `${normalizedConversationId}::${normalizedModel}`
+  }
+
+  private cleanupConversationRecovery(force: boolean = false): void {
+    const now = Date.now()
+    if (
+      !force &&
+      now - this.lastConversationRecoveryCleanupAt < 5 * 60 * 1000 &&
+      this.conversationRecoveryById.size < this.CONVERSATION_RECOVERY_MAX_SIZE
+    ) {
+      return
+    }
+
+    this.lastConversationRecoveryCleanupAt = now
+    for (const [key, entry] of this.conversationRecoveryById) {
+      if (
+        !entry.reason ||
+        entry.retryAt <= now ||
+        now - entry.updatedAt > this.CONVERSATION_RECOVERY_TTL_MS
+      ) {
+        this.conversationRecoveryById.delete(key)
+      }
+    }
+
+    if (
+      this.conversationRecoveryById.size <= this.CONVERSATION_RECOVERY_MAX_SIZE
+    ) {
+      return
+    }
+
+    const entries = Array.from(this.conversationRecoveryById.entries()).sort(
+      (left, right) => left[1].updatedAt - right[1].updatedAt
+    )
+    const overflow =
+      this.conversationRecoveryById.size - this.CONVERSATION_RECOVERY_MAX_SIZE
+    for (let index = 0; index < overflow; index++) {
+      const key = entries[index]?.[0]
+      if (key) {
+        this.conversationRecoveryById.delete(key)
+      }
+    }
+  }
+
+  private getConversationRecoveryState(
+    dto: CreateMessageDto,
+    model: string
+  ): ConversationRecoveryState | null {
+    this.cleanupConversationRecovery()
+    const key = this.getConversationRecoveryKey(dto._conversationId, model)
+    if (!key) return null
+    const state = this.conversationRecoveryById.get(key) || null
+    if (!state) return null
+    if (state.retryAt <= Date.now()) {
+      this.conversationRecoveryById.delete(key)
+      return null
+    }
+    return state
+  }
+
+  private scheduleConversationRecovery(
+    dto: CreateMessageDto,
+    model: string,
+    waitMs: number,
+    reason: string
+  ): void {
+    if (!Number.isFinite(waitMs) || waitMs <= 0) return
+    const key = this.getConversationRecoveryKey(dto._conversationId, model)
+    if (!key) return
+
+    this.cleanupConversationRecovery()
+    const now = Date.now()
+    const requestedRetryAt = now + Math.max(0, Math.round(waitMs))
+    const existing = this.conversationRecoveryById.get(key)
+    const retryAt = existing
+      ? Math.max(existing.retryAt, requestedRetryAt)
+      : requestedRetryAt
+
+    this.conversationRecoveryById.set(key, {
+      retryAt,
+      updatedAt: now,
+      reason,
+    })
+  }
+
+  private clearConversationRecovery(
+    dto: CreateMessageDto,
+    model: string
+  ): void {
+    const key = this.getConversationRecoveryKey(dto._conversationId, model)
+    if (!key) return
+    this.conversationRecoveryById.delete(key)
+  }
+
+  private async waitForActiveConversationRecovery(
+    dto: CreateMessageDto,
+    model: string,
+    contextLabel: string
+  ): Promise<void> {
+    const state = this.getConversationRecoveryState(dto, model)
+    if (!state) return
+
+    const remainingMs = Math.max(0, state.retryAt - Date.now())
+    if (remainingMs <= 0) {
+      this.clearConversationRecovery(dto, model)
+      return
+    }
+
+    if (remainingMs > this.MAX_AUTOMATIC_CONVERSATION_RECOVERY_WAIT_MS) {
+      this.logger.warn(
+        `${contextLabel}: recovery gate active for ${model}, remaining ${remainingMs}ms exceeds auto-wait cap`
+      )
+      throw new HttpException(
+        `Conversation recovery is still active for ${model}. Retry after ${Math.ceil(remainingMs / 1000)}s.`,
+        HttpStatus.TOO_MANY_REQUESTS
+      )
+    }
+
+    this.logger.warn(
+      `${contextLabel}: waiting ${remainingMs}ms before retrying ${model} in the same conversation (${state.reason})`
+    )
+    await this.sleep(remainingMs)
   }
 
   private rememberConversationMetricContext(
@@ -577,6 +734,51 @@ export class GoogleService {
     return Math.min(backoff, this.MAX_RETRY_DELAY)
   }
 
+  private getProgressiveRecoveryWaitMs(
+    baseWaitMs: number,
+    recoveryAttempt: number
+  ): number {
+    const normalizedBase = Math.max(baseWaitMs, this.BASE_RETRY_DELAY)
+    const multiplier = Math.pow(2, Math.min(recoveryAttempt, 4))
+    return Math.min(
+      normalizedBase * multiplier,
+      this.MAX_PROGRESSIVE_RECOVERY_DELAY_MS
+    )
+  }
+
+  private async waitForProgressiveRecovery(
+    dto: CreateMessageDto,
+    model: string,
+    reason: string,
+    baseWaitMs: number,
+    state: RecoveryBackoffState,
+    contextLabel: string
+  ): Promise<{ waited: boolean; waitMs: number }> {
+    const waitMs = this.getProgressiveRecoveryWaitMs(
+      baseWaitMs,
+      state.attemptCount
+    )
+
+    this.scheduleConversationRecovery(dto, model, waitMs, reason)
+
+    const nextTotalWaitMs = state.totalWaitMs + waitMs
+    if (nextTotalWaitMs > this.MAX_PROGRESSIVE_RECOVERY_TOTAL_WAIT_MS) {
+      this.logger.error(
+        `${contextLabel}: recovery budget exhausted for ${model} after ${Math.ceil(state.totalWaitMs / 1000)}s; latest suggested wait ${waitMs}ms (${reason})`
+      )
+      return { waited: false, waitMs }
+    }
+
+    state.attemptCount += 1
+    state.totalWaitMs = nextTotalWaitMs
+
+    this.logger.warn(
+      `${contextLabel}: waiting ${waitMs}ms before retrying ${model} (${reason}, recovery attempt ${state.attemptCount}, total waited ${Math.ceil(state.totalWaitMs / 1000)}s)`
+    )
+    await this.sleep(waitMs)
+    return { waited: true, waitMs }
+  }
+
   /**
    * Detect quota-exhausted 429 (deterministic, hours/days reset) vs transient rate limit.
    * Quota-exhausted errors should use the full reset duration as cooldown, uncapped.
@@ -745,7 +947,8 @@ export class GoogleService {
   private tryShrinkPayloadContentsForPromptLimit(
     payload: Record<string, unknown>,
     promptLimit: { actual: number; max: number },
-    shrinkAttempt: number
+    shrinkAttempt: number,
+    protectedPrefixCount: number = 0
   ): {
     dropped: number
     remaining: number
@@ -760,6 +963,23 @@ export class GoogleService {
     const originalContents = contentsValue as Array<Record<string, unknown>>
     if (originalContents.length <= 1) return null
 
+    // Extend the protected prefix to also cover compaction boundary/summary
+    // messages that sit immediately after the Google context prefix.
+    // These messages contain the compressed context from earlier conversation
+    // turns and must survive the shrink pass to avoid losing archived context.
+    const effectiveProtectedCount =
+      protectedPrefixCount +
+      this.countCompactionPrefixMessages(originalContents, protectedPrefixCount)
+
+    const protectedPrefix = originalContents.slice(0, effectiveProtectedCount)
+    const shrinkableContents = originalContents.slice(effectiveProtectedCount)
+    if (
+      shrinkableContents.length === 0 ||
+      (protectedPrefix.length === 0 && shrinkableContents.length <= 1)
+    ) {
+      return null
+    }
+
     // Reserve extra headroom because backend-side tokenization/wrapping is stricter.
     const safetyHeadroom = 8192 + shrinkAttempt * 2048
     const targetTokens = Math.max(1, promptLimit.max - safetyHeadroom)
@@ -771,11 +991,15 @@ export class GoogleService {
       )
     )
 
-    let dropCount = Math.ceil(originalContents.length * requiredRatio)
-    dropCount = Math.max(1, Math.min(dropCount, originalContents.length - 1))
+    let dropCount = Math.ceil(shrinkableContents.length * requiredRatio)
+    const maxDroppable =
+      protectedPrefix.length > 0
+        ? shrinkableContents.length
+        : shrinkableContents.length - 1
+    if (maxDroppable <= 0) return null
+    dropCount = Math.max(1, Math.min(dropCount, maxDroppable))
 
-    const droppedContents = originalContents.slice(0, dropCount)
-    const trimmed = originalContents.slice(dropCount)
+    const trimmed = [...protectedPrefix, ...shrinkableContents.slice(dropCount)]
     if (trimmed.length <= 0) return null
 
     const normalized = this.stripPromptShrinkMetadata(
@@ -783,15 +1007,69 @@ export class GoogleService {
     )
     if (normalized.contents.length <= 0) return null
 
-    // CHECKPOINT: inject structured summary instead of silently dropping
-    const checkpointMessage = this.buildCheckpointMessage(droppedContents)
-    requestObj.contents = [checkpointMessage, ...normalized.contents]
+    requestObj.contents = normalized.contents
 
     return {
-      dropped: originalContents.length - normalized.contents.length,
+      dropped: Math.max(
+        0,
+        originalContents.length - normalized.contents.length
+      ),
       remaining: (requestObj.contents as unknown[]).length,
       removedFunctionResponses: normalized.removedFunctionResponses,
     }
+  }
+
+  /**
+   * Count the number of compaction boundary/summary messages that
+   * immediately follow the protected prefix in the contents array.
+   *
+   * These messages are generated by ContextProjectionService.project()
+   * and contain `[Context boundary ...]` / `[Context summary ...]`
+   * markers. They must be preserved during prompt shrink to avoid
+   * losing archived conversation context.
+   */
+  private countCompactionPrefixMessages(
+    contents: Array<Record<string, unknown>>,
+    startIndex: number
+  ): number {
+    let count = 0
+    for (let i = startIndex; i < contents.length; i++) {
+      const entry = contents[i]
+      if (entry && this.isCompactionPrefixMessage(entry)) {
+        count++
+      } else {
+        break
+      }
+    }
+    return count
+  }
+
+  /**
+   * Check whether a Google-format content entry is a compaction
+   * boundary or summary message produced by the projection service.
+   */
+  private isCompactionPrefixMessage(content: Record<string, unknown>): boolean {
+    const parts = content.parts
+    if (!Array.isArray(parts) || parts.length === 0) return false
+
+    const firstPart = parts[0] as Record<string, unknown> | undefined
+    if (!firstPart) return false
+
+    const text = firstPart.text
+    if (typeof text !== "string") return false
+
+    return (
+      text.startsWith("[Context boundary ") ||
+      text.startsWith("[Context summary ")
+    )
+  }
+
+  private normalizeProtectedContextPrefixCount(value: unknown): number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return 0
+    }
+
+    return Math.max(0, Math.floor(value))
   }
 
   private sanitizeClaudeContentsForSend(
@@ -1179,252 +1457,76 @@ export class GoogleService {
    */
   private enforceTokenBudget(
     payload: Record<string, unknown>,
-    hardLimit: number = this.CLOUD_CODE_HARD_TOKEN_LIMIT
-  ): { enforced: boolean; originalTokens: number; finalTokens: number } {
-    const estimatedTokens = this.tokenCounter.countGooglePayloadTokens(
+    hardLimit: number = this.CLOUD_CODE_HARD_TOKEN_LIMIT,
+    protectedPrefixCount: number = 0
+  ): {
+    enforced: boolean
+    originalTokens: number
+    finalTokens: number
+    withinLimit: boolean
+  } {
+    const originalTokens = this.tokenCounter.countGooglePayloadTokens(
       payload as Parameters<TokenCounterService["countGooglePayloadTokens"]>[0]
     )
+    let finalTokens = originalTokens
+    const normalizedProtectedPrefixCount =
+      this.normalizeProtectedContextPrefixCount(protectedPrefixCount)
 
-    if (estimatedTokens <= hardLimit) {
-      return {
-        enforced: false,
-        originalTokens: estimatedTokens,
-        finalTokens: estimatedTokens,
-      }
-    }
-
-    this.logger.warn(
-      `[enforceTokenBudget] Payload exceeds hard limit: ${estimatedTokens} > ${hardLimit}, generating CHECKPOINT`
-    )
-
-    const request = payload.request as Record<string, unknown> | undefined
-    if (!request) {
-      this.logger.error(
-        "[enforceTokenBudget] No request in payload, cannot trim"
-      )
-      return {
-        enforced: false,
-        originalTokens: estimatedTokens,
-        finalTokens: estimatedTokens,
-      }
-    }
-
-    const contents = request.contents as
-      | Array<Record<string, unknown>>
-      | undefined
-    if (!Array.isArray(contents) || contents.length <= 1) {
-      this.logger.warn(
-        "[enforceTokenBudget] Contents too short to trim, sending as-is"
-      )
-      return {
-        enforced: false,
-        originalTokens: estimatedTokens,
-        finalTokens: estimatedTokens,
-      }
-    }
-
-    // Iteratively drop oldest entries and inject CHECKPOINT summary
-    // (matching Antigravity IDE's CHECKPOINT mechanism)
-    const maxIterations = 10
-    let currentContents = contents
-    let currentTokens = estimatedTokens
-    let allDroppedContents: Array<Record<string, unknown>> = []
-
-    for (let i = 0; i < maxIterations && currentTokens > hardLimit; i++) {
-      if (currentContents.length <= 1) break
-
-      // Calculate how many to drop based on overshoot ratio
-      const overRatio = (currentTokens - hardLimit) / currentTokens
-      const dropCount = Math.max(
-        1,
-        Math.ceil(currentContents.length * Math.min(overRatio * 1.2, 0.5))
-      )
-      const safeDrop = Math.min(dropCount, currentContents.length - 1)
-
-      // Collect dropped messages for CHECKPOINT summary
-      const dropped = currentContents.slice(0, safeDrop)
-      allDroppedContents = [...allDroppedContents, ...dropped]
-      currentContents = currentContents.slice(safeDrop)
-
-      // Normalize: ensure first message is from user role
-      const normalized = this.stripPromptShrinkMetadata(
-        this.normalizeContentsForPromptShrink(currentContents)
-      )
-      currentContents = normalized.contents
-      if (currentContents.length <= 0) {
-        this.logger.error(
-          "[enforceTokenBudget] Normalization left empty contents"
+    if (finalTokens > hardLimit) {
+      for (
+        let shrinkAttempt = 0;
+        shrinkAttempt < this.MAX_PROMPT_SHRINK_RETRIES &&
+        finalTokens > hardLimit;
+        shrinkAttempt++
+      ) {
+        const shrinkResult = this.tryShrinkPayloadContentsForPromptLimit(
+          payload,
+          { actual: finalTokens, max: hardLimit },
+          shrinkAttempt,
+          normalizedProtectedPrefixCount
         )
-        break
+        if (!shrinkResult) {
+          break
+        }
+
+        finalTokens = this.tokenCounter.countGooglePayloadTokens(
+          payload as Parameters<
+            TokenCounterService["countGooglePayloadTokens"]
+          >[0]
+        )
       }
-
-      // Inject CHECKPOINT summary as first message
-      const checkpointMessage = this.buildCheckpointMessage(allDroppedContents)
-      currentContents = [checkpointMessage, ...currentContents]
-
-      request.contents = currentContents
-      currentTokens = this.tokenCounter.countGooglePayloadTokens(
-        payload as Parameters<
-          TokenCounterService["countGooglePayloadTokens"]
-        >[0]
-      )
-
-      this.logger.log(
-        `[enforceTokenBudget] CHECKPOINT ${this.checkpointCounter}: dropped ${safeDrop} entries, ` +
-          `${currentContents.length} remaining, ${currentTokens} tokens`
-      )
     }
 
     return {
-      enforced: true,
-      originalTokens: estimatedTokens,
-      finalTokens: currentTokens,
+      enforced: originalTokens > hardLimit,
+      originalTokens,
+      finalTokens,
+      withinLimit: finalTokens <= hardLimit,
     }
   }
 
-  /**
-   * Build a CHECKPOINT message from dropped contents.
-   * Matches Antigravity IDE's {{ CHECKPOINT N }} format:
-   * - Extracts user objectives from first user message
-   * - Extracts code interactions (functionCall/functionResponse) with file paths
-   * - Generates a conversation summary from text content
-   */
-  private buildCheckpointMessage(
-    droppedContents: Array<Record<string, unknown>>
-  ): Record<string, unknown> {
-    this.checkpointCounter++
-    const checkpointNumber = this.checkpointCounter
+  private assertTokenBudgetWithinLimit(
+    operation: "sendClaudeMessage" | "sendClaudeMessageStream",
+    budgetResult: {
+      enforced: boolean
+      originalTokens: number
+      finalTokens: number
+      withinLimit: boolean
+    },
+    hardLimit: number
+  ): void {
+    if (budgetResult.withinLimit) {
+      return
+    }
 
-    // Extract user objective from first user message
-    let userObjective = ""
-    for (const msg of droppedContents) {
-      if (msg.role !== "user") continue
-      const parts = msg.parts as Array<Record<string, unknown>> | undefined
-      if (!parts) continue
-      for (const part of parts) {
-        if (typeof part.text === "string" && part.text.length > 0) {
-          // Take first meaningful user text as objective (limit to 500 chars)
-          userObjective = part.text.slice(0, 500)
-          break
-        }
+    throw new BackendApiError(
+      `Cloud Code ${operation} payload exceeds prompt limit after payload compaction (${budgetResult.finalTokens} > ${hardLimit})`,
+      {
+        backend: "google",
+        statusCode: 400,
+        permanent: false,
       }
-      if (userObjective) break
-    }
-
-    // Extract code interactions (file paths from functionCall/functionResponse)
-    const editedFiles = new Set<string>()
-    const viewedFiles = new Set<string>()
-    const toolsUsed = new Set<string>()
-
-    for (const msg of droppedContents) {
-      const parts = msg.parts as Array<Record<string, unknown>> | undefined
-      if (!parts) continue
-      for (const part of parts) {
-        // functionCall
-        const fc = part.functionCall as Record<string, unknown> | undefined
-        if (fc && typeof fc.name === "string") {
-          toolsUsed.add(fc.name)
-          const args = fc.args as Record<string, unknown> | undefined
-          if (args) {
-            // Extract file paths from common tool argument patterns
-            const filePath =
-              (typeof args.TargetFile === "string" && args.TargetFile) ||
-              (typeof args.AbsolutePath === "string" && args.AbsolutePath) ||
-              (typeof args.File === "string" && args.File) ||
-              (typeof args.path === "string" && args.path) ||
-              (typeof args.SearchPath === "string" && args.SearchPath)
-            if (filePath) {
-              const editTools = new Set([
-                "replace_file_content",
-                "multi_replace_file_content",
-                "write_to_file",
-              ])
-              if (editTools.has(fc.name)) {
-                editedFiles.add(filePath)
-              } else {
-                viewedFiles.add(filePath)
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Build conversation summary from text content
-    const summaryParts: string[] = []
-    let charBudget = 2000
-    for (const msg of droppedContents) {
-      if (charBudget <= 0) break
-      const role = msg.role === "model" ? "Assistant" : "User"
-      const parts = msg.parts as Array<Record<string, unknown>> | undefined
-      if (!parts) continue
-      for (const part of parts) {
-        if (charBudget <= 0) break
-        if (typeof part.text === "string" && part.text.length > 0) {
-          const snippet = part.text.slice(0, Math.min(200, charBudget))
-          summaryParts.push(
-            `${role}: ${snippet}${part.text.length > 200 ? "..." : ""}`
-          )
-          charBudget -= snippet.length
-        }
-      }
-    }
-
-    // Assemble CHECKPOINT text (matching official Antigravity format)
-    const lines: string[] = [
-      `{{ CHECKPOINT ${checkpointNumber} }}`,
-      ` **The earlier parts of this conversation have been truncated due to its long length. The following content summarizes the truncated context so that you may continue your work. **`,
-      "",
-    ]
-
-    if (userObjective) {
-      lines.push("# USER Objective:")
-      lines.push(userObjective)
-      lines.push("")
-    }
-
-    if (summaryParts.length > 0) {
-      lines.push("# Previous Session Summary:")
-      lines.push(summaryParts.join("\n"))
-      lines.push("")
-    }
-
-    if (editedFiles.size > 0 || viewedFiles.size > 0) {
-      lines.push("# Code Interaction Summary:")
-      for (const f of editedFiles) {
-        lines.push(`<edited_file>`)
-        lines.push(`\t<target_file>${f}</target_file>`)
-        lines.push(`</edited_file>`)
-      }
-      for (const f of viewedFiles) {
-        lines.push(`<viewed_file>`)
-        lines.push(`\t<absolute_path>${f}</absolute_path>`)
-        lines.push(`</viewed_file>`)
-      }
-      lines.push("")
-    }
-
-    if (toolsUsed.size > 0) {
-      lines.push(
-        `Tools used in truncated context: ${Array.from(toolsUsed).join(", ")}`
-      )
-      lines.push("")
-    }
-
-    lines.push(
-      "**IMPORTANT: this summary is just for your reference. You may respond to my previous and future messages, but DO NOT ACKNOWLEDGE THIS CHECKPOINT MESSAGE. JUST READ IT BUT DO NOT MENTION IT, RESPOND TO IT, OR TAKE ACTION BECAUSE OF IT.**"
     )
-
-    this.logger.log(
-      `[CHECKPOINT ${checkpointNumber}] Generated summary: ` +
-        `${editedFiles.size} edited, ${viewedFiles.size} viewed, ` +
-        `${toolsUsed.size} tools, ${summaryParts.length} conversation snippets`
-    )
-
-    return {
-      role: "user",
-      parts: [{ text: lines.join("\n") }],
-    }
   }
 
   /**
@@ -3267,27 +3369,53 @@ export class GoogleService {
       )
     }
 
-    let resolvedModel = this.resolveClaudeModel(dto.model)
+    const resolvedModel = this.resolveClaudeModel(dto.model)
     this.logger.log(
       `Sending Claude request via Cloud Code API: ${resolvedModel}`
     )
 
     const payload = this.buildClaudePayload(dto)
+    await this.waitForActiveConversationRecovery(
+      dto,
+      resolvedModel,
+      "sendClaudeMessage"
+    )
     const requestStartedAt = process.hrtime.bigint()
+    const protectedContextMessageCount =
+      this.normalizeProtectedContextPrefixCount(
+        dto._protectedContextMessageCount
+      )
 
     // Enforce token budget before sending
     // Use protocol-layer budget if available, otherwise fall back to hard limit
     const budgetLimit =
       dto._contextTokenBudget || this.CLOUD_CODE_HARD_TOKEN_LIMIT
-    const budgetResult = this.enforceTokenBudget(payload, budgetLimit)
+    const budgetResult = this.enforceTokenBudget(
+      payload,
+      budgetLimit,
+      protectedContextMessageCount
+    )
     if (budgetResult.enforced) {
       this.logger.warn(
         `[sendClaudeMessage] Token budget enforced: ${budgetResult.originalTokens} -> ${budgetResult.finalTokens}`
       )
     }
+    this.assertTokenBudgetWithinLimit(
+      "sendClaudeMessage",
+      budgetResult,
+      budgetLimit
+    )
 
     let lastError: Error | null = null
     let promptShrinkRetries = 0
+    const rateLimitRecoveryState: RecoveryBackoffState = {
+      attemptCount: 0,
+      totalWaitMs: 0,
+    }
+    const workerRecoveryState: RecoveryBackoffState = {
+      attemptCount: 0,
+      totalWaitMs: 0,
+    }
 
     let consecutiveAuthErrors = 0
     const maxAuthRetries = Math.max(this.processPool.workerCount, 2)
@@ -3314,6 +3442,7 @@ export class GoogleService {
         this.logger.log(`Claude response received from Cloud Code API`)
         // Mark this worker as preferred for future requests with this model
         this.processPool.markSuccessForModel(resolvedModel)
+        this.clearConversationRecovery(dto, resolvedModel)
         return this.convertToAnthropicFormat(data, dto.model)
       } catch (error) {
         const errMsg = (error as Error).message || ""
@@ -3372,31 +3501,12 @@ export class GoogleService {
           const waitMs =
             this.processPool.getMinCooldownMsForModel(resolvedModel)
           if (waitMs > this.MAX_429_WAIT_MS) {
-            // Check if quota fallback model is configured
-            const fallbackModel = this.processPool.quotaFallbackModel
-            if (fallbackModel && resolvedModel !== fallbackModel) {
-              this.logger.warn(
-                `All workers quota exhausted for ${resolvedModel}, falling back to ${fallbackModel}`
-              )
-              // Replace model in payload and strip thinking config
-              payload.model = fallbackModel
-              resolvedModel = fallbackModel
-              const request = payload.request as
-                | Record<string, unknown>
-                | undefined
-              if (request?.generationConfig) {
-                const genConfig = request.generationConfig as Record<
-                  string,
-                  unknown
-                >
-                delete genConfig.thinkingConfig
-              }
-              // Reset retry state — give fallback model fresh attempts
-              lastError = null
-              attempt = -1 // will be incremented to 0
-              continue
-            }
-            // No fallback configured — return 429 with Retry-After
+            this.scheduleConversationRecovery(
+              dto,
+              resolvedModel,
+              waitMs,
+              exhausted ? "quota exhausted" : "rate limited"
+            )
             this.logger.error(
               `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
             )
@@ -3406,11 +3516,26 @@ export class GoogleService {
             )
           }
 
-          this.logger.warn(
-            `All workers rate-limited for ${resolvedModel}, waiting ${waitMs}ms before retry`
+          const recovery = await this.waitForProgressiveRecovery(
+            dto,
+            resolvedModel,
+            exhausted ? "quota exhausted" : "rate limited",
+            waitMs,
+            rateLimitRecoveryState,
+            "All workers rate-limited"
           )
-          await this.sleep(waitMs)
+          if (!recovery.waited) {
+            throw new HttpException(
+              await this.buildCloudCodeRateLimitMessage(
+                resolvedModel,
+                recovery.waitMs
+              ),
+              HttpStatus.TOO_MANY_REQUESTS
+            )
+          }
+
           lastError = error as Error
+          attempt--
           continue
         }
 
@@ -3425,7 +3550,8 @@ export class GoogleService {
             const shrinkResult = this.tryShrinkPayloadContentsForPromptLimit(
               payload,
               promptTooLong,
-              promptShrinkRetries
+              promptShrinkRetries,
+              protectedContextMessageCount
             )
             if (shrinkResult) {
               promptShrinkRetries++
@@ -3484,12 +3610,32 @@ export class GoogleService {
           const waitMs =
             this.processPool.getMinCooldownMsForModel(resolvedModel)
           if (waitMs > 0 && waitMs <= this.MAX_RETRY_DELAY) {
-            this.logger.warn(
-              `All workers temporarily unavailable for ${resolvedModel}, waiting ${waitMs}ms before retry`
+            const recovery = await this.waitForProgressiveRecovery(
+              dto,
+              resolvedModel,
+              isModelCapacityExhausted
+                ? "model capacity exhausted"
+                : "temporarily unavailable",
+              waitMs,
+              workerRecoveryState,
+              "All workers temporarily unavailable"
             )
-            await this.sleep(waitMs)
-            lastError = error as Error
-            continue
+            if (recovery.waited) {
+              lastError = error as Error
+              attempt--
+              continue
+            }
+
+            this.logger.error(
+              `All workers still temporarily unavailable for ${resolvedModel} after ${Math.ceil(workerRecoveryState.totalWaitMs / 1000)}s of recovery waits, giving up`
+            )
+            throw new HttpException(
+              this.buildCloudCodeTemporaryUnavailableMessage(
+                resolvedModel,
+                recovery.waitMs
+              ),
+              HttpStatus.SERVICE_UNAVAILABLE
+            )
           }
         }
 
@@ -3523,7 +3669,7 @@ export class GoogleService {
 
     // Quota management handled by native process pool
 
-    let resolvedModel = this.resolveClaudeModel(dto.model)
+    const resolvedModel = this.resolveClaudeModel(dto.model)
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this
     this.logger.log(
@@ -3531,18 +3677,36 @@ export class GoogleService {
     )
 
     const payload = this.buildClaudePayload(dto)
+    await this.waitForActiveConversationRecovery(
+      dto,
+      resolvedModel,
+      "sendClaudeMessageStream"
+    )
     const requestStartedAt = process.hrtime.bigint()
+    const protectedContextMessageCount =
+      this.normalizeProtectedContextPrefixCount(
+        dto._protectedContextMessageCount
+      )
 
     // Enforce token budget before sending
     // Use protocol-layer budget if available, otherwise fall back to hard limit
     const budgetLimit =
       dto._contextTokenBudget || this.CLOUD_CODE_HARD_TOKEN_LIMIT
-    const budgetResult = this.enforceTokenBudget(payload, budgetLimit)
+    const budgetResult = this.enforceTokenBudget(
+      payload,
+      budgetLimit,
+      protectedContextMessageCount
+    )
     if (budgetResult.enforced) {
       this.logger.warn(
         `[sendClaudeMessageStream] Token budget enforced: ${budgetResult.originalTokens} -> ${budgetResult.finalTokens}`
       )
     }
+    this.assertTokenBudgetWithinLimit(
+      "sendClaudeMessageStream",
+      budgetResult,
+      budgetLimit
+    )
 
     const messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
 
@@ -3681,11 +3845,14 @@ export class GoogleService {
     let promptShrinkRetries = 0
 
     const attemptStream = async (): Promise<void> => {
-      // Recovery orchestration: allow ONE cooldown wait when all workers are
-      // exhausted but the shortest cooldown is within MAX_429_WAIT_MS.
-      // After recovery, the loop continues with a fresh attempt (workerAttempt
-      // is not consumed) so the recovered worker gets a fair chance.
-      let hasWaitedForRecovery = false
+      const rateLimitRecoveryState: RecoveryBackoffState = {
+        attemptCount: 0,
+        totalWaitMs: 0,
+      }
+      const workerRecoveryState: RecoveryBackoffState = {
+        attemptCount: 0,
+        totalWaitMs: 0,
+      }
 
       for (
         let workerAttempt = 0;
@@ -3700,6 +3867,7 @@ export class GoogleService {
           )
           // Mark this worker as preferred for future requests with this model
           self.processPool.markSuccessForModel(resolvedModel)
+          self.clearConversationRecovery(dto, resolvedModel)
           return // success
         } catch (err) {
           const errMsg = (err as Error).message || ""
@@ -3736,33 +3904,13 @@ export class GoogleService {
             // All workers exhausted for this model — check if we can wait for recovery
             const waitMs =
               self.processPool.getMinCooldownMsForModel(resolvedModel)
-
             if (waitMs > self.MAX_429_WAIT_MS) {
-              // Check if quota fallback model is configured
-              const fallbackModel = self.processPool.quotaFallbackModel
-              if (fallbackModel && resolvedModel !== fallbackModel) {
-                self.logger.warn(
-                  `All workers quota exhausted for ${resolvedModel}, falling back to ${fallbackModel} (streaming)`
-                )
-                // Replace model in payload and strip thinking config
-                payload.model = fallbackModel
-                const request = payload.request as
-                  | Record<string, unknown>
-                  | undefined
-                if (request?.generationConfig) {
-                  const genConfig = request.generationConfig as Record<
-                    string,
-                    unknown
-                  >
-                  delete genConfig.thinkingConfig
-                }
-                // Reset state for fresh attempt with fallback model
-                resolvedModel = fallbackModel
-                hasWaitedForRecovery = false
-                workerAttempt = -1 // will be incremented to 0
-                continue
-              }
-              // No fallback configured — return 429 with context
+              self.scheduleConversationRecovery(
+                dto,
+                resolvedModel,
+                waitMs,
+                exhausted ? "quota exhausted" : "rate limited"
+              )
               self.logger.error(
                 `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait ${self.MAX_429_WAIT_MS}ms)`
               )
@@ -3775,23 +3923,27 @@ export class GoogleService {
               )
             }
 
-            // Cooldown within threshold — wait for the first worker to recover
-            if (!hasWaitedForRecovery) {
-              hasWaitedForRecovery = true
-              self.logger.warn(
-                `All workers exhausted for ${resolvedModel}, waiting ${Math.ceil(waitMs / 1000)}s for recovery (1 recovery wait allowed)`
-              )
-              await self.sleep(waitMs)
+            const recovery = await self.waitForProgressiveRecovery(
+              dto,
+              resolvedModel,
+              exhausted ? "quota exhausted" : "rate limited",
+              waitMs,
+              rateLimitRecoveryState,
+              "All workers exhausted"
+            )
+            if (recovery.waited) {
               workerAttempt-- // don't consume an attempt — give recovered worker a fair chance
               continue
             }
 
-            // Already waited once — give up to avoid infinite loop
             self.logger.error(
-              `All workers still exhausted for ${resolvedModel} after recovery wait, giving up`
+              `All workers still exhausted for ${resolvedModel} after ${Math.ceil(rateLimitRecoveryState.totalWaitMs / 1000)}s of recovery waits, giving up`
             )
             throw new HttpException(
-              await this.buildCloudCodeRateLimitMessage(resolvedModel, waitMs),
+              await this.buildCloudCodeRateLimitMessage(
+                resolvedModel,
+                recovery.waitMs
+              ),
               HttpStatus.TOO_MANY_REQUESTS
             )
           }
@@ -3807,7 +3959,8 @@ export class GoogleService {
               const shrinkResult = self.tryShrinkPayloadContentsForPromptLimit(
                 payload,
                 promptTooLong,
-                promptShrinkRetries
+                promptShrinkRetries,
+                protectedContextMessageCount
               )
               if (shrinkResult) {
                 promptShrinkRetries++
@@ -3873,12 +4026,31 @@ export class GoogleService {
             const waitMs =
               self.processPool.getMinCooldownMsForModel(resolvedModel)
             if (waitMs > 0 && waitMs <= self.MAX_RETRY_DELAY) {
-              self.logger.warn(
-                `All workers temporarily unavailable for ${resolvedModel}, waiting ${waitMs}ms before retry`
+              const recovery = await self.waitForProgressiveRecovery(
+                dto,
+                resolvedModel,
+                isModelCapacityExhausted
+                  ? "model capacity exhausted"
+                  : "temporarily unavailable",
+                waitMs,
+                workerRecoveryState,
+                "All workers temporarily unavailable"
               )
-              await self.sleep(waitMs)
-              workerAttempt-- // give the recovered worker a fair chance
-              continue
+              if (recovery.waited) {
+                workerAttempt-- // give the recovered worker a fair chance
+                continue
+              }
+
+              self.logger.error(
+                `All workers still temporarily unavailable for ${resolvedModel} after ${Math.ceil(workerRecoveryState.totalWaitMs / 1000)}s of recovery waits, giving up`
+              )
+              throw new HttpException(
+                self.buildCloudCodeTemporaryUnavailableMessage(
+                  resolvedModel,
+                  recovery.waitMs
+                ),
+                HttpStatus.SERVICE_UNAVAILABLE
+              )
             }
           }
 

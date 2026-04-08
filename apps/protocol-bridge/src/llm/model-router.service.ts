@@ -412,7 +412,7 @@ export class ModelRouterService {
       }
 
       if (status === 400) {
-        return /model|provider|upstream|quota|rate limit|unavailable|unsupported|overloaded|temporar/.test(
+        return /model|provider|upstream|quota|rate limit|unavailable|unsupported|overloaded|temporar|prompt too long|prompt limit|context(?: is)? too large|token limit|too many tokens|exceeds?.*limit/.test(
           message
         )
       }

@@ -236,4 +236,12 @@ export class CreateMessageDto {
   @IsArray()
   @IsString({ each: true })
   _pendingToolUseIds?: string[]
+
+  /**
+   * Internal count of leading context messages that must survive any
+   * backend-side payload shrink pass.
+   */
+  @IsOptional()
+  @IsNumber()
+  _protectedContextMessageCount?: number
 }

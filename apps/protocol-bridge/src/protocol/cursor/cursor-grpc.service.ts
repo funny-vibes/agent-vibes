@@ -80,7 +80,6 @@ import {
   ExecuteHookArgsSchema,
   FetchArgsSchema,
   FetchErrorSchema,
-  type FetchResult,
   FetchResultSchema,
   FetchSuccessSchema,
   FetchToolCallSchema,
@@ -3740,9 +3739,9 @@ export class CursorGrpcService {
       }
       case "exa_fetch":
         return {
-          case: "fetchToolCall" as const,
-          value: create(FetchToolCallSchema, {
-            args: create(FetchArgsSchema, {
+          case: "webFetchToolCall" as const,
+          value: create(WebFetchToolCallSchema, {
+            args: create(WebFetchArgsSchema, {
               url: safeString(
                 args.url || (Array.isArray(args.ids) ? args.ids[0] : "")
               ),
@@ -5289,12 +5288,16 @@ export class CursorGrpcService {
 
     if (family === "exa_fetch") {
       const contents = this.normalizeExaFetchContents(args, result)
-      let exaFetchResultOneOf: FetchResult["result"]
+      const url = safeString(
+        args.url || (Array.isArray(args.ids) ? args.ids[0] : "")
+      )
+      let exaFetchResultOneOf: WebFetchResult["result"]
       if (status === "success") {
         exaFetchResultOneOf = {
           case: "success" as const,
-          value: create(FetchSuccessSchema, {
-            content:
+          value: create(WebFetchSuccessSchema, {
+            url,
+            markdown:
               typeof contents === "string"
                 ? contents
                 : typeof contents === "object" && contents !== null
@@ -5304,30 +5307,29 @@ export class CursorGrpcService {
         }
       } else if (status === "rejected") {
         exaFetchResultOneOf = {
-          case: "error" as const,
-          value: create(FetchErrorSchema, {
-            error: statusMessage || "exa_fetch rejected",
+          case: "rejected" as const,
+          value: create(WebFetchRejectedSchema, {
+            reason: statusMessage || "exa_fetch rejected",
           }),
         }
       } else {
         exaFetchResultOneOf = {
           case: "error" as const,
-          value: create(FetchErrorSchema, {
+          value: create(WebFetchErrorSchema, {
+            url,
             error: statusMessage || "exa_fetch failed",
           }),
         }
       }
 
       return {
-        case: "fetchToolCall" as const,
-        value: create(FetchToolCallSchema, {
-          args: create(FetchArgsSchema, {
-            url: safeString(
-              args.url || (Array.isArray(args.ids) ? args.ids[0] : "")
-            ),
+        case: "webFetchToolCall" as const,
+        value: create(WebFetchToolCallSchema, {
+          args: create(WebFetchArgsSchema, {
+            url,
             toolCallId: callId,
           }),
-          result: create(FetchResultSchema, {
+          result: create(WebFetchResultSchema, {
             result: exaFetchResultOneOf,
           }),
         }),

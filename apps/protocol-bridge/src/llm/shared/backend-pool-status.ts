@@ -44,6 +44,7 @@ export interface BackendPoolEntryStatus {
   ready?: boolean
   requestCount?: number
   pid?: number
+  maxContextTokens?: number
   modelCooldowns: BackendPoolModelCooldownStatus[]
   rateLimits?: CodexRateLimitSnapshot
 }

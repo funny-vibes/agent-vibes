@@ -8,11 +8,23 @@ import * as path from "path"
 import { PersistenceService } from "../../persistence"
 import { ParsedCursorRequest } from "./cursor-request-parser"
 import { enforceToolProtocol } from "../../context/message-integrity-guard"
+import type {
+  ContextConversationState,
+  ContextTranscriptRecord,
+  ContextUsageLedgerState,
+  ContextUsageSnapshot,
+  LooseMessageContent,
+} from "../../context/types"
 
 /**
  * Content block types for messages
  */
-type MessageContent = string | Array<{ type: string; [key: string]: unknown }>
+export type MessageContent = LooseMessageContent
+
+export interface SessionMessage {
+  role: "user" | "assistant"
+  content: MessageContent
+}
 
 function buildUserMessageContent(
   text: string,
@@ -78,7 +90,9 @@ export interface SessionRestartRecovery {
  */
 export interface ChatSession {
   conversationId: string
-  messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+  messages: SessionMessage[]
+  messageRecords: ContextTranscriptRecord[]
+  contextState: ContextConversationState
   model: string
   thinkingLevel: number
   isAgentic: boolean
@@ -140,13 +154,20 @@ export interface ChatSession {
 
   // Recovery notice for unrecoverable in-flight state after proxy restart
   restartRecovery?: SessionRestartRecovery
+
+  // Exact prompt projection metadata for the in-flight request.
+  pendingRequestContextLedger?: {
+    promptTokenCount: number
+    recordedCompactionId?: string
+    attachmentFingerprint?: string
+  }
 }
 
 export interface PendingToolCall {
   toolCallId: string
   toolName: string
   toolInput: Record<string, unknown>
-  toolFamilyHint?: "mcp" | "edit"
+  toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
   sentAt: Date
@@ -283,7 +304,7 @@ interface PersistedPendingToolCall {
   toolCallId: string
   toolName: string
   toolInput: Record<string, unknown>
-  toolFamilyHint?: "mcp" | "edit"
+  toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
   sentAt: number
@@ -338,9 +359,11 @@ interface PersistedSessionRestartRecovery {
 }
 
 interface PersistedChatSessionV1 {
-  version: 1
+  version: 1 | 2
   conversationId: string
-  messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+  messages: SessionMessage[]
+  messageRecords?: ContextTranscriptRecord[]
+  contextState?: ContextConversationState
   model: string
   thinkingLevel: number
   isAgentic: boolean
@@ -536,7 +559,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       const session = this.deserializeSession(persisted)
       this.sessions.set(conversationId, session)
       this.logger.log(
-        `>>> Restored persisted session: ${conversationId} (messages: ${session.messages.length}, turns: ${session.turns.length})`
+        `>>> Restored persisted session: ${conversationId} ` +
+          `(messages=${session.messages.length}, records=${session.messageRecords.length}, turns=${session.turns.length}, pending=${session.pendingToolCalls.size})`
       )
       this.schedulePersist(conversationId)
       return session
@@ -794,9 +818,11 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 1,
+      version: 2,
       conversationId: session.conversationId,
       messages: session.messages,
+      messageRecords: session.messageRecords,
+      contextState: session.contextState,
       model: session.model,
       thinkingLevel: session.thinkingLevel,
       isAgentic: session.isAgentic,
@@ -989,16 +1015,195 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private createTranscriptRecord(
+    message: SessionMessage,
+    createdAt: number = Date.now()
+  ): ContextTranscriptRecord {
+    return {
+      id: crypto.randomUUID(),
+      role: message.role,
+      content: message.content,
+      createdAt,
+    }
+  }
+
+  private createContextState(
+    records: ContextTranscriptRecord[]
+  ): ContextConversationState {
+    return {
+      records: [...records],
+      compactionHistory: [],
+      activeCompactionId: undefined,
+      usageLedger: {},
+    }
+  }
+
+  private syncMessagesFromRecords(
+    records: ContextTranscriptRecord[]
+  ): SessionMessage[] {
+    return records.map((record) => ({
+      role: record.role,
+      content: record.content,
+    }))
+  }
+
+  private messageContentEqual(
+    left: MessageContent,
+    right: MessageContent
+  ): boolean {
+    if (left === right) return true
+    if (typeof left !== typeof right) return false
+    try {
+      return JSON.stringify(left) === JSON.stringify(right)
+    } catch {
+      return false
+    }
+  }
+
+  private messagesEqual(left: SessionMessage, right: SessionMessage): boolean {
+    return (
+      left.role === right.role &&
+      this.messageContentEqual(left.content, right.content)
+    )
+  }
+
+  private hasStableRecordPrefix(
+    previousRecords: ContextTranscriptRecord[],
+    nextRecords: ContextTranscriptRecord[],
+    throughRecordId: string
+  ): boolean {
+    const previousIndex = previousRecords.findIndex(
+      (record) => record.id === throughRecordId
+    )
+    const nextIndex = nextRecords.findIndex(
+      (record) => record.id === throughRecordId
+    )
+    if (previousIndex < 0 || nextIndex < 0 || previousIndex !== nextIndex) {
+      return false
+    }
+
+    for (let index = 0; index <= previousIndex; index++) {
+      if (previousRecords[index]?.id !== nextRecords[index]?.id) {
+        return false
+      }
+    }
+
+    return true
+  }
+
+  private reconcileMessageRecords(
+    existing: ContextTranscriptRecord[],
+    nextMessages: SessionMessage[]
+  ): ContextTranscriptRecord[] {
+    let prefix = 0
+    while (
+      prefix < existing.length &&
+      prefix < nextMessages.length &&
+      this.messagesEqual(existing[prefix]!, nextMessages[prefix]!)
+    ) {
+      prefix++
+    }
+
+    let existingSuffix = existing.length - 1
+    let nextSuffix = nextMessages.length - 1
+    while (
+      existingSuffix >= prefix &&
+      nextSuffix >= prefix &&
+      this.messagesEqual(existing[existingSuffix]!, nextMessages[nextSuffix]!)
+    ) {
+      existingSuffix--
+      nextSuffix--
+    }
+
+    const reconciled: ContextTranscriptRecord[] = []
+    reconciled.push(...existing.slice(0, prefix))
+    for (let i = prefix; i <= nextSuffix; i++) {
+      reconciled.push(this.createTranscriptRecord(nextMessages[i]!))
+    }
+    if (existingSuffix + 1 < existing.length) {
+      reconciled.push(...existing.slice(existingSuffix + 1))
+    }
+    return reconciled
+  }
+
+  private isContextStateCompatible(
+    state: ContextConversationState,
+    records: ContextTranscriptRecord[],
+    previousRecords: ContextTranscriptRecord[] = state.records
+  ): boolean {
+    if (!state.activeCompactionId) return true
+    const active = state.compactionHistory.find(
+      (commit) => commit.id === state.activeCompactionId
+    )
+    if (!active) return false
+
+    return this.hasStableRecordPrefix(
+      previousRecords,
+      records,
+      active.archivedThroughRecordId
+    )
+  }
+
+  private shouldRetainUsageLedger(
+    state: ContextConversationState,
+    records: ContextTranscriptRecord[],
+    previousRecords: ContextTranscriptRecord[] = state.records
+  ): boolean {
+    const anchorRecordId = state.usageLedger.anchorRecordId
+    if (!anchorRecordId) return true
+
+    return this.hasStableRecordPrefix(previousRecords, records, anchorRecordId)
+  }
+
   private deserializeSession(persisted: PersistedChatSessionV1): ChatSession {
     const now = Date.now()
     const createdAt = new Date(this.toTimestamp(persisted.createdAt, now))
     const lastActivityAt = new Date(
       this.toTimestamp(persisted.lastActivityAt, createdAt.getTime())
     )
+    const baseMessages = Array.isArray(persisted.messages)
+      ? persisted.messages
+      : []
+    const messageRecords =
+      Array.isArray(persisted.messageRecords) &&
+      persisted.messageRecords.length > 0
+        ? persisted.messageRecords
+        : baseMessages.map((message, index) =>
+            this.createTranscriptRecord(
+              message,
+              createdAt.getTime() + index * 1000
+            )
+          )
+    const rawContextState =
+      persisted.contextState && typeof persisted.contextState === "object"
+        ? persisted.contextState
+        : undefined
+    const contextState =
+      rawContextState &&
+      Array.isArray(rawContextState.records) &&
+      this.isContextStateCompatible(
+        rawContextState,
+        messageRecords,
+        rawContextState.records
+      )
+        ? {
+            ...rawContextState,
+            records: messageRecords,
+            usageLedger: this.shouldRetainUsageLedger(
+              rawContextState,
+              messageRecords,
+              rawContextState.records
+            )
+              ? rawContextState.usageLedger
+              : {},
+          }
+        : this.createContextState(messageRecords)
 
     return {
       conversationId: persisted.conversationId,
-      messages: Array.isArray(persisted.messages) ? persisted.messages : [],
+      messages: this.syncMessagesFromRecords(messageRecords),
+      messageRecords,
+      contextState,
       // Note: We do NOT run enforceToolProtocol here.
       // Deserialized sessions may have legitimate interrupted tool calls that
       // should be handled by repairInterruptedToolProtocol() with proper
@@ -1071,26 +1276,34 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     conversationId: string,
     initialRequest?: ParsedCursorRequest
   ): ChatSession {
+    const initialMessages =
+      initialRequest?.conversation.map((message, index, conversation) => {
+        if (
+          index === conversation.length - 1 &&
+          message.role === "user" &&
+          initialRequest.attachedImages?.length
+        ) {
+          return {
+            role: message.role,
+            content: buildUserMessageContent(
+              message.content,
+              initialRequest.attachedImages
+            ),
+          }
+        }
+
+        return message
+      }) || []
+    const messageRecords = initialMessages.map((message, index) =>
+      this.createTranscriptRecord(message, Date.now() + index * 1000)
+    )
+    const contextState = this.createContextState(messageRecords)
+
     return {
       conversationId,
-      messages:
-        initialRequest?.conversation.map((message, index, conversation) => {
-          if (
-            index === conversation.length - 1 &&
-            message.role === "user" &&
-            initialRequest.attachedImages?.length
-          ) {
-            return {
-              role: message.role,
-              content: buildUserMessageContent(
-                message.content,
-                initialRequest.attachedImages
-              ),
-            }
-          }
-
-          return message
-        }) || [],
+      messages: initialMessages,
+      messageRecords,
+      contextState,
       model: initialRequest?.model || "claude-sonnet-4.5",
       thinkingLevel: initialRequest?.thinkingLevel || 0,
       isAgentic: initialRequest?.isAgentic || false,
@@ -1201,7 +1414,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       }
 
       this.logger.log(
-        `>>> Using existing session: ${conversationId} (blobIds: ${session.messageBlobIds.length}, turns: ${session.turns.length})`
+        `>>> Using existing session: ${conversationId} ` +
+          `(messages=${session.messages.length}, records=${session.messageRecords.length}, blobIds=${session.messageBlobIds.length}, turns=${session.turns.length}, pending=${session.pendingToolCalls.size})`
       )
     }
 
@@ -1216,24 +1430,29 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     conversationId: string,
     role: "user" | "assistant",
     content: MessageContent
-  ): void {
+  ): string | undefined {
     const session = this.getSession(conversationId)
-    if (session) {
-      session.messages.push({ role, content })
-      session.lastActivityAt = new Date()
+    if (!session) return undefined
 
-      // Note: We do NOT run enforceToolProtocol here.
-      // addMessage is an incremental operation — assistant writes tool_use first,
-      // then user writes tool_result later. The intermediate state (orphan tool_use
-      // with no tool_result yet) is a legitimate pending-tool-call window.
-      // Guard only runs on batch operations (replaceMessages) and at send time.
+    const message = { role, content } satisfies SessionMessage
+    session.messages.push(message)
+    const record = this.createTranscriptRecord(message)
+    session.messageRecords.push(record)
+    session.contextState.records = session.messageRecords
+    session.lastActivityAt = new Date()
 
-      // Estimate token usage (rough estimate: 1 token ≈ 4 characters)
-      const contentStr =
-        typeof content === "string" ? content : JSON.stringify(content)
-      session.usedTokens += Math.ceil(contentStr.length / 4)
-      this.schedulePersist(conversationId)
-    }
+    // Note: We do NOT run enforceToolProtocol here.
+    // addMessage is an incremental operation — assistant writes tool_use first,
+    // then user writes tool_result later. The intermediate state (orphan tool_use
+    // with no tool_result yet) is a legitimate pending-tool-call window.
+    // Guard only runs on batch operations (replaceMessages) and at send time.
+
+    // Estimate token usage (rough estimate: 1 token ≈ 4 characters)
+    const contentStr =
+      typeof content === "string" ? content : JSON.stringify(content)
+    session.usedTokens += Math.ceil(contentStr.length / 4)
+    this.schedulePersist(conversationId)
+    return record.id
   }
 
   /**
@@ -1481,7 +1700,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     toolCallId: string,
     toolName: string,
     toolInput: Record<string, unknown>,
-    toolFamilyHint?: "mcp",
+    toolFamilyHint?: "mcp" | "web_fetch",
     modelCallId: string = ""
   ): Promise<void> {
     const session = this.getSession(conversationId)
@@ -2091,10 +2310,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     return !!ctx && ctx.pendingToolCallIds.has(toolCallId)
   }
 
-  replaceMessages(
-    conversationId: string,
-    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
-  ): void {
+  replaceMessages(conversationId: string, messages: SessionMessage[]): void {
     const session = this.getSession(conversationId)
     if (!session) return
 
@@ -2115,10 +2331,78 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           `${guardResult.removedEmptyMessages} empty messages`
       )
     }
-    session.messages = guardResult.messages as Array<{
-      role: "user" | "assistant"
-      content: MessageContent
-    }>
+    const normalizedMessages = guardResult.messages as SessionMessage[]
+    const reconciledRecords = this.reconcileMessageRecords(
+      session.messageRecords,
+      normalizedMessages
+    )
+    const previousContextRecords = session.contextState.records
+    const previousUsageAnchor = session.contextState.usageLedger.anchorRecordId
+    session.messages = normalizedMessages
+    session.messageRecords = reconciledRecords
+    if (
+      this.isContextStateCompatible(
+        session.contextState,
+        reconciledRecords,
+        previousContextRecords
+      )
+    ) {
+      session.contextState.records = reconciledRecords
+      if (
+        !this.shouldRetainUsageLedger(
+          session.contextState,
+          reconciledRecords,
+          previousContextRecords
+        )
+      ) {
+        session.contextState.usageLedger = {}
+        this.logger.log(
+          `Invalidated context usage ledger for ${conversationId} after transcript rewrite before anchor ${previousUsageAnchor}`
+        )
+      }
+    } else {
+      session.contextState = this.createContextState(reconciledRecords)
+      this.logger.log(
+        `Reset context compaction state for ${conversationId} after transcript rewrite invalidated archived context`
+      )
+    }
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
+  }
+
+  getContextState(
+    conversationId: string
+  ): ContextConversationState | undefined {
+    return this.getSession(conversationId)?.contextState
+  }
+
+  markContextStateDirty(conversationId: string): void {
+    const session = this.getSession(conversationId)
+    if (!session) return
+    session.lastActivityAt = new Date()
+    session.contextState.records = session.messageRecords
+    this.schedulePersist(conversationId)
+  }
+
+  recordAssistantResponseUsage(
+    conversationId: string,
+    recordId: string,
+    usage: ContextUsageSnapshot,
+    usageLedgerState?: ContextUsageLedgerState
+  ): void {
+    const session = this.getSession(conversationId)
+    if (!session) return
+    session.contextState.usageLedger = usageLedgerState || {
+      anchorRecordId: recordId,
+      lastUsage: usage,
+    }
+    const inputContextTokens =
+      usage.inputTokens +
+      usage.cachedInputTokens +
+      usage.cacheCreationInputTokens
+    session.usedTokens = inputContextTokens
+    session.usedContextTokens = inputContextTokens
+    session.pendingRequestContextLedger = undefined
     session.lastActivityAt = new Date()
     this.schedulePersist(conversationId)
   }

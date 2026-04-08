@@ -8,7 +8,11 @@ export interface ToolContinuationMessage {
 export function backendRequiresCompleteToolBatchBeforeContinuation(
   backend: BackendType
 ): boolean {
-  return backend === "google" || backend === "google-claude"
+  return (
+    backend === "google" ||
+    backend === "google-claude" ||
+    backend === "claude-api"
+  )
 }
 
 export function findPendingToolUseIdsInMessages(

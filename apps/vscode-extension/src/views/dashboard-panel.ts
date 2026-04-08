@@ -7,10 +7,6 @@ import { X509Certificate } from "crypto"
 import { ConfigManager } from "../services/config-manager"
 import { BridgeManager } from "../services/bridge-manager"
 import { NetworkManager } from "../services/network-manager"
-import {
-  ChatGptRegisterInput,
-  ChatGptRegisterService,
-} from "../services/chatgpt-register-service"
 import { startOAuthFlow } from "../services/oauth-service"
 import { startCodexOAuthFlow } from "../services/codex-oauth-service"
 import { CMD, CURSOR_DOMAINS } from "../constants"
@@ -57,7 +53,6 @@ export class DashboardPanel {
   private readonly panel: vscode.WebviewPanel
   private readonly extensionUri: vscode.Uri
   private disposables: vscode.Disposable[] = []
-  private readonly chatgptRegister: ChatGptRegisterService
   private readonly handleBridgeStateChanged = () => {
     if (this.panel.visible) {
       this.sendAllData()
@@ -73,7 +68,6 @@ export class DashboardPanel {
   ) {
     this.panel = panel
     this.extensionUri = extensionUri
-    this.chatgptRegister = new ChatGptRegisterService(extensionUri.fsPath)
 
     // Set initial HTML
     this.panel.webview.html = this.getHtml()
@@ -176,6 +170,16 @@ export class DashboardPanel {
         }
         break
 
+      case "updateAccount":
+        if (msg.channel !== undefined && msg.index !== undefined && msg.data) {
+          const filePath = this.getChannelPath(msg.channel)
+          if (filePath) {
+            this.config.updateAccount(filePath, msg.index, msg.data)
+            this.sendAllData()
+          }
+        }
+        break
+
       case "addByToken":
         if (msg.channel && msg.raw) {
           this.handleAddByToken(msg.channel, msg.raw)
@@ -269,20 +273,6 @@ export class DashboardPanel {
 
       case "startCodexOAuth":
         void this.handleStartCodexOAuth()
-        break
-
-      case "startChatgptRegister":
-        if (msg.data) {
-          void this.handleStartChatgptRegister(msg.data)
-        }
-        break
-
-      case "persistRegisterDefaults":
-        if (msg.data) {
-          this.persistChatGptRegisterDefaults(
-            this.sanitizeChatGptRegisterInput(msg.data)
-          )
-        }
         break
     }
   }
@@ -702,7 +692,6 @@ export class DashboardPanel {
     }
     const accountsData = {
       ...channelAccountsData,
-      chatgptRegisterDefaults: this.getChatGptRegisterDefaults(),
     }
 
     const totalAccounts = Object.values(channelAccountsData).reduce(
@@ -716,6 +705,7 @@ export class DashboardPanel {
       forwarding: this.network.isForwardingActive(),
       hasCertificates: this.config.hasCertificates(),
       totalAccounts,
+      defaultProxyUrl: this.getDefaultProxyUrl(),
       setup: this.getOverviewPayload(channelAccountsData),
     }
 
@@ -1509,12 +1499,6 @@ export class DashboardPanel {
     }
   }
 
-  private pickOptionalString(value: unknown): string | undefined {
-    if (typeof value !== "string") return undefined
-    const trimmed = value.trim()
-    return trimmed.length > 0 ? trimmed : undefined
-  }
-
   /**
    * Codex OAuth2 PKCE flow — opens browser for OpenAI authorization.
    */
@@ -1587,74 +1571,6 @@ export class DashboardPanel {
     }
   }
 
-  private getChatGptRegisterDefaults(): Record<string, unknown> {
-    return this.config.readLocalConfig("chatgptRegister", {
-      apiUrl: "",
-      adminToken: "",
-      customAuth: "",
-      domain: "",
-      domains: [],
-      enabledDomains: [],
-      subdomain: "",
-      randomSubdomain: false,
-      fingerprint: "",
-      proxyUrl: "",
-    })
-  }
-
-  private normalizeStringArray(value: unknown): string[] {
-    if (Array.isArray(value)) {
-      return value
-        .map((item) => String(item || "").trim())
-        .filter((item) => item.length > 0)
-    }
-
-    if (typeof value === "string") {
-      return value
-        .split(/\r?\n|,/)
-        .map((item) => item.trim())
-        .filter((item) => item.length > 0)
-    }
-
-    return []
-  }
-
-  private sanitizeChatGptRegisterInput(
-    data: Record<string, unknown>
-  ): ChatGptRegisterInput {
-    const domains = this.normalizeStringArray(data.domains)
-    const enabledDomains = this.normalizeStringArray(data.enabledDomains)
-
-    return {
-      apiUrl: String(data.apiUrl || "").trim(),
-      adminToken: String(data.adminToken || "").trim(),
-      customAuth: String(data.customAuth || "").trim() || undefined,
-      domain: String(data.domain || "").trim() || undefined,
-      domains,
-      enabledDomains,
-      subdomain: String(data.subdomain || "").trim() || undefined,
-      randomSubdomain: Boolean(data.randomSubdomain),
-      fingerprint: String(data.fingerprint || "").trim() || undefined,
-      proxyUrl: String(data.proxyUrl || "").trim() || undefined,
-      password: String(data.password || "").trim() || undefined,
-    }
-  }
-
-  private persistChatGptRegisterDefaults(input: ChatGptRegisterInput): void {
-    this.config.writeLocalConfig("chatgptRegister", {
-      apiUrl: input.apiUrl,
-      adminToken: input.adminToken,
-      customAuth: input.customAuth || "",
-      domain: input.domain || "",
-      domains: input.domains || [],
-      enabledDomains: input.enabledDomains || [],
-      subdomain: input.subdomain || "",
-      randomSubdomain: Boolean(input.randomSubdomain),
-      fingerprint: input.fingerprint || "",
-      proxyUrl: input.proxyUrl || "",
-    })
-  }
-
   private upsertCodexAccount(account: Record<string, unknown>): void {
     const filePath = this.config.codexAccountsPath
     const accounts = this.config.readAccounts(filePath)
@@ -1696,50 +1612,6 @@ export class DashboardPanel {
     this.config.writeAccounts(filePath, nextAccounts)
   }
 
-  private async handleStartChatgptRegister(
-    rawData: Record<string, unknown>
-  ): Promise<void> {
-    const input = this.sanitizeChatGptRegisterInput(rawData)
-    const logs: string[] = []
-    const postStatus = (status: string, message: string) => {
-      this.panel.webview.postMessage({
-        type: "chatgptRegisterStatus",
-        data: {
-          status,
-          message,
-          logs,
-        },
-      })
-    }
-
-    this.persistChatGptRegisterDefaults(input)
-    postStatus("loading", "Starting ChatGPT registration...")
-
-    try {
-      const result = await this.chatgptRegister.register(input, (line) => {
-        logs.push(line)
-        postStatus("loading", line)
-      })
-
-      this.upsertCodexAccount(result.account)
-
-      const accountLabel =
-        String(result.account.email || "").trim() ||
-        String(result.account.accountId || "").trim() ||
-        "unknown"
-      const planType = String(result.account.planType || "").trim()
-
-      postStatus(
-        "success",
-        `Codex account added: ${accountLabel}${planType ? ` (${planType})` : ""}`
-      )
-      this.sendAllData()
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      postStatus("error", message)
-    }
-  }
-
   private getChannelData(channel: AccountChannel): DashboardAccountChannelData {
     const filePath = this.getChannelPath(channel)
     if (!filePath) {
@@ -1778,6 +1650,33 @@ export class DashboardPanel {
           ? "custom"
           : "default"
     }
+  }
+
+  private getDefaultProxyUrl(): string {
+    const httpProxy = vscode.workspace
+      .getConfiguration("http")
+      .get<string>("proxy", "")
+      .trim()
+
+    if (httpProxy) {
+      return httpProxy
+    }
+
+    const envCandidates = [
+      process.env.HTTPS_PROXY,
+      process.env.HTTP_PROXY,
+      process.env.https_proxy,
+      process.env.http_proxy,
+    ]
+
+    for (const candidate of envCandidates) {
+      const value = String(candidate || "").trim()
+      if (value) {
+        return value
+      }
+    }
+
+    return ""
   }
 
   private async openAccountFile(channel: string): Promise<void> {
