@@ -216,11 +216,86 @@ function extractQuotaResetDelayMs(errorText) {
   return null
 }
 
+function parseStructuredDurationMs(value) {
+  if (typeof value === "string") {
+    return parseDurationMs(value) ?? parseRetryAfterMs(value)
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null
+  }
+
+  const secondsRaw = value.seconds ?? value.Seconds
+  const nanosRaw = value.nanos ?? value.Nanos
+  if (secondsRaw === undefined && nanosRaw === undefined) {
+    return null
+  }
+
+  const seconds = Number.parseFloat(String(secondsRaw ?? "0"))
+  const nanos = Number.parseFloat(String(nanosRaw ?? "0"))
+  const secondsMs = Number.isFinite(seconds) ? seconds * 1000 : 0
+  const nanosMs = Number.isFinite(nanos) ? nanos / 1_000_000 : 0
+  return Math.max(0, Math.round(secondsMs + nanosMs))
+}
+
+function extractStructuredRetryDelayMsFromValue(value, depth = 0) {
+  if (depth > 8 || value == null) return null
+
+  const direct = parseStructuredDurationMs(value)
+  if (direct !== null) return direct
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = extractStructuredRetryDelayMsFromValue(item, depth + 1)
+      if (nested !== null) return nested
+    }
+    return null
+  }
+
+  if (typeof value !== "object") return null
+
+  for (const [rawKey, child] of Object.entries(value)) {
+    const normalizedKey = String(rawKey || "")
+      .trim()
+      .toLowerCase()
+      .replace(/-/g, "_")
+    const compactKey = normalizedKey.replace(/_/g, "")
+
+    if (
+      RETRY_DELAY_HINT_KEYS.has(normalizedKey) ||
+      RETRY_DELAY_HINT_KEYS.has(compactKey)
+    ) {
+      const hinted = parseStructuredDurationMs(child)
+      if (hinted !== null) return hinted
+    }
+
+    const nested = extractStructuredRetryDelayMsFromValue(child, depth + 1)
+    if (nested !== null) return nested
+  }
+
+  return null
+}
+
+function extractStructuredRetryDelayMs(errorText) {
+  const text =
+    typeof errorText === "string" ? errorText.trim() : String(errorText || "")
+  if (!text || !/^[\[{]/.test(text)) return null
+
+  try {
+    const parsed = JSON.parse(text)
+    return extractStructuredRetryDelayMsFromValue(parsed, 0)
+  } catch {
+    return null
+  }
+}
+
 function getCloudCodeRetryDelayMs(response, errorText) {
   const retryAfterMs = parseRetryAfterMs(
     readResponseHeader(response, "retry-after")
   )
   if (retryAfterMs !== null) return retryAfterMs
+  const structuredRetryDelayMs = extractStructuredRetryDelayMs(errorText)
+  if (structuredRetryDelayMs !== null) return structuredRetryDelayMs
   return extractQuotaResetDelayMs(errorText)
 }
 
@@ -228,6 +303,28 @@ function shouldGraceRetryQuotaExhausted(response, errorText) {
   if (!isQuotaExhausted(errorText)) return false
   const retryDelayMs = getCloudCodeRetryDelayMs(response, errorText)
   return retryDelayMs !== null && retryDelayMs <= QUOTA_RESET_GRACE_WINDOW_MS
+}
+
+function isModelCapacityExhausted(errorText) {
+  const text =
+    typeof errorText === "string" ? errorText : String(errorText || "")
+  const normalized = text.toLowerCase()
+  return (
+    normalized.includes("model_capacity_exhausted") ||
+    normalized.includes("no capacity available for model")
+  )
+}
+
+function shouldPreferPoolRotation(options) {
+  return options?.preferPoolRotation === true
+}
+
+function shouldBypassLocalRetry(response, errorText, options) {
+  if (!shouldPreferPoolRotation(options)) return false
+  if (response.status === 429 && isQuotaExhausted(errorText)) return true
+  if (response.status === 503 && isModelCapacityExhausted(errorText))
+    return true
+  return false
 }
 
 function clearLoadCodeAssistCache() {
@@ -594,6 +691,9 @@ function initializeClient(account) {
     projectId: cloudCodeProjectId,
     quotaProjectId,
   }
+  if (oauthClient && quotaProjectId) {
+    oauthClient.quotaProjectId = quotaProjectId
+  }
   endpoint = selectEndpoint(account)
 }
 
@@ -602,11 +702,21 @@ function initializeClient(account) {
 // ---------------------------------------------------------------------------
 const RETRY_STATUS_CODES = [503, 429]
 const MAX_RETRIES = 3
-const BASE_DELAY_MS = 2000 // 2s, 4s, 8s exponential backoff
+const BASE_DELAY_MS = 200 // 200ms, 400ms, 800ms exponential backoff
 const STREAM_FIRST_CHUNK_TIMEOUT_MS = 20000
 const STREAM_IDLE_TIMEOUT_MS = 45000
 const QUOTA_RESET_GRACE_WINDOW_MS = 1500
 const QUOTA_RESET_RETRY_DELAY_MS = 5000
+const RETRY_DELAY_HINT_KEYS = new Set([
+  "retryafter",
+  "retry_after",
+  "retrydelay",
+  "retry_delay",
+  "quotaresetdelay",
+  "quota_reset_delay",
+  "backofflimit",
+  "backoff_limit",
+])
 
 // Many quota 429s are deterministic, but official Antigravity still gives
 // "reset after 0s/1s" responses one short grace retry before surfacing them.
@@ -754,7 +864,7 @@ async function* iterateResponseStream(stream) {
  * Make authenticated request to Cloud Code API (with retry)
  * Replicates the w() method from Antigravity IDE
  */
-async function cloudCodeRequest(apiMethod, payload) {
+async function cloudCodeRequest(apiMethod, payload, options = {}) {
   let lastError = null
   let retryDelayMs = null
 
@@ -763,7 +873,7 @@ async function cloudCodeRequest(apiMethod, payload) {
       const delay = retryDelayMs ?? BASE_DELAY_MS * Math.pow(2, attempt - 1)
       retryDelayMs = null
       process.stderr.write(
-        `[retry] ${apiMethod} attempt ${attempt + 1}/${MAX_RETRIES + 1} after ${delay}ms\n`
+        `[worker-local-retry] ${apiMethod} attempt ${attempt + 1}/${MAX_RETRIES + 1} after ${delay}ms\n`
       )
       await sleep(delay)
     }
@@ -795,6 +905,10 @@ async function cloudCodeRequest(apiMethod, payload) {
     const errorText = await readResponseText(response)
     lastError = buildCloudCodeError(apiMethod, response, errorText)
 
+    if (shouldBypassLocalRetry(response, errorText, options)) {
+      throw lastError
+    }
+
     if (response.status === 429 && isQuotaExhausted(errorText)) {
       if (
         attempt < MAX_RETRIES &&
@@ -802,7 +916,7 @@ async function cloudCodeRequest(apiMethod, payload) {
       ) {
         retryDelayMs = QUOTA_RESET_RETRY_DELAY_MS
         process.stderr.write(
-          `[retry] ${apiMethod} quota reset is imminent; retrying in ${retryDelayMs}ms\n`
+          `[worker-local-retry] ${apiMethod} quota reset is imminent; retrying in ${retryDelayMs}ms\n`
         )
         continue
       }
@@ -824,7 +938,8 @@ async function cloudCodeRequest(apiMethod, payload) {
 async function* cloudCodeStreamRequest(
   apiMethod,
   payload,
-  abortSignal = undefined
+  abortSignal = undefined,
+  options = {}
 ) {
   let lastError = null
   let retryDelayMs = null
@@ -837,7 +952,7 @@ async function* cloudCodeStreamRequest(
       const delay = retryDelayMs ?? BASE_DELAY_MS * Math.pow(2, attempt - 1)
       retryDelayMs = null
       process.stderr.write(
-        `[retry] ${apiMethod} stream attempt ${attempt + 1}/${MAX_RETRIES + 1} after ${delay}ms\n`
+        `[worker-local-retry] ${apiMethod} stream attempt ${attempt + 1}/${MAX_RETRIES + 1} after ${delay}ms\n`
       )
       await sleepWithAbort(delay, abortSignal)
     }
@@ -957,6 +1072,10 @@ async function* cloudCodeStreamRequest(
       "stream failed"
     )
 
+    if (shouldBypassLocalRetry(response, errorText, options)) {
+      throw lastError
+    }
+
     if (response.status === 429 && isQuotaExhausted(errorText)) {
       if (
         attempt < MAX_RETRIES &&
@@ -964,7 +1083,7 @@ async function* cloudCodeStreamRequest(
       ) {
         retryDelayMs = QUOTA_RESET_RETRY_DELAY_MS
         process.stderr.write(
-          `[retry] ${apiMethod} stream quota reset is imminent; retrying in ${retryDelayMs}ms\n`
+          `[worker-local-retry] ${apiMethod} stream quota reset is imminent; retrying in ${retryDelayMs}ms\n`
         )
         continue
       }
@@ -1004,6 +1123,9 @@ async function handleGenerate(id, params) {
   if (!oauthClient) throw new Error("Worker not initialized")
   // Use streamGenerateContent (confirmed by traffic capture) and collect all chunks
   const payload = buildStreamPayload(params.payload)
+  const retryOptions = {
+    preferPoolRotation: params?.retryPolicy?.preferPoolRotation === true,
+  }
   process.stderr.write(
     `[DEBUG] streamGenerateContent request: project=${payload.project}, model=${payload.model}\n`
   )
@@ -1012,7 +1134,9 @@ async function handleGenerate(id, params) {
   let usageMetadata = undefined
   for await (const chunk of cloudCodeStreamRequest(
     "streamGenerateContent",
-    payload
+    payload,
+    undefined,
+    retryOptions
   )) {
     // SSE chunks have outer wrapper: { response: { candidates: [...] }, traceId, metadata }
     const inner = chunk.response || chunk
@@ -1044,6 +1168,9 @@ async function handleGenerateStream(id, params) {
   if (!oauthClient) throw new Error("Worker not initialized")
   // Use streamGenerateContent (confirmed by traffic capture) — forward SSE chunks directly
   const payload = buildStreamPayload(params.payload)
+  const retryOptions = {
+    preferPoolRotation: params?.retryPolicy?.preferPoolRotation === true,
+  }
   const requestController = new AbortController()
   activeStreamRequests.set(id, requestController)
   process.stderr.write(
@@ -1053,7 +1180,8 @@ async function handleGenerateStream(id, params) {
     for await (const chunk of cloudCodeStreamRequest(
       "streamGenerateContent",
       payload,
-      requestController.signal
+      requestController.signal,
+      retryOptions
     )) {
       // Unwrap outer response wrapper before forwarding
       const inner = chunk.response || chunk

@@ -12,6 +12,9 @@ interface GeminiModelInfo {
   modelId: string
   displayName?: string
   description?: string
+  supportsThinking?: boolean
+  thinkingBudget?: number
+  minThinkingBudget?: number
 }
 
 /**
@@ -81,6 +84,9 @@ export class GoogleModelCacheService implements OnModuleInit {
           string,
           {
             displayName?: string
+            supportsThinking?: boolean
+            thinkingBudget?: number
+            minThinkingBudget?: number
             quotaInfo?: { remainingFraction?: number; resetTime?: string }
           }
         >
@@ -95,6 +101,15 @@ export class GoogleModelCacheService implements OnModuleInit {
           this.modelCache.set(modelId, {
             modelId,
             displayName: modelData.displayName,
+            supportsThinking: modelData.supportsThinking,
+            thinkingBudget:
+              typeof modelData.thinkingBudget === "number"
+                ? modelData.thinkingBudget
+                : undefined,
+            minThinkingBudget:
+              typeof modelData.minThinkingBudget === "number"
+                ? modelData.minThinkingBudget
+                : undefined,
           })
         }
       }

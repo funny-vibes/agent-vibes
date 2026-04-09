@@ -14,32 +14,36 @@ import {
   UnifiedMessage,
 } from "../../context"
 import {
-  CursorRuleSource,
-  ExecClientMessageSchema,
-  ShellStream,
   type BackgroundShellSpawnResult,
   type CursorRule,
+  CursorRuleSource,
   type DeleteResult,
   type DiagnosticsResult,
+  ExecClientMessageSchema,
   type GrepResult,
   type LsDirectoryTreeNode,
   type LsResult,
   type ReadResult,
   type ShellResult,
+  ShellStream,
   type WriteResult,
 } from "../../gen/agent/v1_pb"
-import { CodexService } from "../../llm/codex/codex.service"
 import {
   ClaudeApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
 } from "../../llm/claude-api/claude-api.service"
-import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
+import { CodexService } from "../../llm/codex/codex.service"
 import { GoogleService } from "../../llm/google/google.service"
+import {
+  applyThinkingIntentToDto,
+  buildThinkingIntentFromCursorRequest,
+} from "../../llm/thinking-intent"
 import {
   BackendType,
   ModelRouteResult,
   ModelRouterService,
 } from "../../llm/model-router.service"
+import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
 import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/tool-continuation-policy"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
@@ -51,9 +55,12 @@ import {
   ChatSessionManager,
   InterruptedToolCallInfo,
   PendingToolCall,
+  SessionActiveToolBatch,
+  SessionCompletedToolBatchSummary,
   SessionRestartRecovery,
   SessionTodoItem,
   SessionTodoStatus,
+  SessionTopLevelAgentTurnState,
   SubAgentContext,
 } from "./chat-session.service"
 import { ClientSideToolV2ExecutorService } from "./client-side-tool-v2-executor.service"
@@ -68,6 +75,7 @@ import {
   buildToolsForApi,
   resolveCursorToolDefinitionKey,
 } from "./cursor-tool-mapper"
+import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import {
   buildMcpDispatchInput,
@@ -76,7 +84,6 @@ import {
   resolveMcpToolDefinition,
 } from "./mcp-call-contract"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
-import { KnowledgeBaseService } from "./knowledge-base.service"
 
 /**
  * SSE Event content block structure (content_block_start)
@@ -95,10 +102,11 @@ interface SseContentBlock {
  * SSE Event delta structure (content_block_delta)
  */
 interface SseDelta {
-  type: "text_delta" | "input_json_delta" | "thinking_delta"
+  type: "text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta"
   text?: string
   partial_json?: string
   thinking?: string
+  signature?: string
 }
 
 /**
@@ -159,10 +167,18 @@ interface ToolResultContentItem {
   [key: string]: unknown
 }
 
+interface ThinkingContentItem {
+  type: "thinking"
+  thinking: string
+  signature?: string
+  [key: string]: unknown
+}
+
 type MessageContentItem =
   | TextContentItem
   | ToolUseContentItem
   | ToolResultContentItem
+  | ThinkingContentItem
 
 /**
  * Message content type - compatible with chat-session.manager.ts
@@ -302,15 +318,7 @@ interface ActiveToolCall {
 
 type ToolDispatchOutcome = "waiting_for_result" | "completed_inline"
 
-interface ToolInvocationDispatchParams {
-  conversationId: string
-  session: ChatSession
-  streamId?: string
-  toolCall: ActiveToolCall
-  accumulatedText: string
-  checkpointModel: string
-  workspaceRootPath?: string
-}
+type AssistantTurnCompletionMode = "initial" | "continuation"
 
 interface HandleToolResultOptions {
   continueGeneration?: boolean
@@ -320,6 +328,10 @@ interface HandleToolResultOptions {
 interface BackendStreamOptions {
   buildDtoForRoute?: (route: ModelRouteResult) => CreateMessageDto
   abortSignal?: AbortSignal
+  initialRoute?: {
+    backend: BackendType
+    model: string
+  }
   streamAbortBinding?: {
     conversationId: string
     streamId: string
@@ -330,6 +342,45 @@ interface ExecDispatchTarget {
   toolName: string
   input: Record<string, unknown>
   toolFamilyHint?: "mcp" | "web_fetch"
+}
+
+interface PreparedToolInvocation {
+  activeToolCall: ActiveToolCall
+  canonicalToolName: string
+  input: Record<string, unknown>
+  deferredToolFamily?: DeferredToolFamily
+  execDispatchTarget?: ExecDispatchTarget
+  dispatchErrorMessage?: string
+  canDispatchExec: boolean
+  protocolToolName: string
+  protocolToolInput: Record<string, unknown>
+  protocolToolFamilyHint?: "mcp" | "web_fetch"
+}
+
+interface AssistantTurnStreamParams {
+  conversationId: string
+  session: ChatSession
+  stream: AsyncGenerator<string, void, unknown>
+  streamId?: string
+  checkpointModel: string
+  workspaceRootPath?: string
+  mode: AssistantTurnCompletionMode
+  emitInitialHeartbeat?: boolean
+  emitTokenDeltas?: boolean
+  streamAbortContext: string
+  messageStopAbortContext: string
+}
+
+interface AssistantTurnStreamOutcome {
+  kind:
+    | "completed"
+    | "waiting_for_results"
+    | "empty"
+    | "partial_without_message_stop"
+    | "aborted"
+  accumulatedText: string
+  finalUsage?: ContextUsageSnapshot
+  toolCallCount: number
 }
 
 interface CanonicalToolInvocation {
@@ -354,6 +405,12 @@ interface ExecDispatchResolution {
 interface ToolCompletedExtraData {
   beforeContent?: string
   afterContent?: string
+  editSuccess?: {
+    linesAdded?: number
+    linesRemoved?: number
+    diffString?: string
+    message?: string
+  }
   readSuccess?: {
     path?: string
     content?: string
@@ -363,9 +420,32 @@ interface ToolCompletedExtraData {
     truncated?: boolean
   }
   shellResult?: {
-    stdout: string
-    stderr: string
-    exitCode: number
+    stdout?: string
+    stderr?: string
+    exitCode?: number
+    shellId?: number
+    pid?: number
+    interleavedOutput?: string
+    msToWait?: number
+    localExecutionTimeMs?: number
+    executionTime?: number
+    aborted?: boolean
+    abortReason?: number
+    backgroundReason?: number
+    outputLocation?: {
+      filePath?: string
+      sizeBytes?: bigint | number
+      lineCount?: bigint | number
+    }
+    terminalsFolder?: string
+    timeoutBehavior?: number
+    hardTimeout?: number
+    requestedSandboxPolicy?: { type?: unknown } | null
+    isBackground?: boolean
+    description?: string
+    classifierResult?: Record<string, unknown>
+    closeStdin?: boolean
+    fileOutputThresholdBytes?: bigint | number
   }
   lsDirectoryTreeRoot?: Record<string, unknown>
   grepSuccess?: {
@@ -380,6 +460,14 @@ interface ToolCompletedExtraData {
     deletedFile?: string
     fileSize?: bigint | number
     prevContent?: string
+  }
+  taskSuccess?: {
+    conversationSteps?: Array<Record<string, unknown>>
+    agentId?: string
+    isBackground?: boolean
+    durationMs?: bigint | number
+    resultSuffix?: string
+    transcriptPath?: string
   }
   diagnosticsSuccess?: {
     path?: string
@@ -452,7 +540,9 @@ export class CursorConnectStreamService {
         (1 - this.CLOUD_CODE_SAFETY_MARGIN_RATIO)
     )
   }
-  // Cloud Code 输出 hard cap（从流量与轨迹分析验证）
+  // Official Antigravity agent payload samples use a much smaller Cloud Code
+  // output budget than the generic Anthropic path. Matching that default keeps
+  // requests closer to the native Go client and avoids overly heavy asks.
   private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS = 64_000
   private readonly DEFAULT_NON_CLOUD_OUTPUT_TOKENS = 100_000
   private readonly CLOUD_CODE_EXTRA_OVERHEAD_TOKENS = 1_536
@@ -463,6 +553,9 @@ export class CursorConnectStreamService {
   private readonly LARGE_TOOL_RESULT_HEAD_LINES = 220
   private readonly LARGE_TOOL_RESULT_TAIL_LINES = 120
   private readonly LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS = 24_000
+  private readonly TOP_LEVEL_AGENT_MAX_READONLY_TURNS = 18
+  private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
+  private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
   private readonly LEGACY_WEB_DOCUMENT_CHUNK_SIZE = 4_000
   private readonly MAX_LEGACY_WEB_DOCUMENTS_PER_CONVERSATION = 12
   private readonly EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT: ContextAttachmentSnapshot =
@@ -546,9 +639,13 @@ export class CursorConnectStreamService {
           }
         } else {
           // 超时，发送心跳并继续等待同一个 dataPromise
-          this.logger.debug(
-            "Sending keepalive heartbeat while waiting for backend"
-          )
+          const now = Date.now()
+          if (now - this.lastHeartbeatLog > this.HEARTBEAT_LOG_INTERVAL) {
+            this.logger.debug(
+              "Sending keepalive heartbeat while waiting for backend (logging once per minute)"
+            )
+            this.lastHeartbeatLog = now
+          }
           yield { type: "heartbeat" as const }
         }
       }
@@ -592,6 +689,122 @@ export class CursorConnectStreamService {
     }
   }
 
+  private isTaskLikePendingToolCall(
+    pendingToolCall: PendingToolCall | undefined
+  ): boolean {
+    if (!pendingToolCall) return false
+    const family = this.normalizeDeferredToolFamily(pendingToolCall.toolName)
+    return family === "task" || family === "await_task"
+  }
+
+  private buildRuntimeInterruptedRecovery(
+    reason: string,
+    interruptedToolCalls: InterruptedToolCallInfo[],
+    interruptedSubAgent?: SessionRestartRecovery["interruptedSubAgent"]
+  ): SessionRestartRecovery {
+    const trimmedReason = reason.trim() || "connection closed"
+    const sampleNames = interruptedToolCalls
+      .slice(0, 3)
+      .map((toolCall) => toolCall.toolName || toolCall.toolCallId)
+    let notice =
+      `The previous turn was interrupted before all tool results were received.` +
+      `\nreason: ${trimmedReason}`
+
+    if (sampleNames.length > 0) {
+      notice += `\ninterrupted tools: ${sampleNames.join(", ")}`
+      if (interruptedToolCalls.length > sampleNames.length) {
+        notice += `, +${interruptedToolCalls.length - sampleNames.length} more`
+      }
+    }
+
+    if (interruptedSubAgent) {
+      notice += `\ninterrupted sub-agent: ${interruptedSubAgent.subagentId}`
+    }
+
+    return {
+      restoredAt: new Date(),
+      notice,
+      interruptedToolCalls,
+      interruptedInteractionQueryCount: 0,
+      interruptedSubAgent,
+    }
+  }
+
+  private interruptPendingToolCallsForRecovery(
+    conversationId: string,
+    toolCallIds: string[],
+    reason: string
+  ): number {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session || toolCallIds.length === 0) return 0
+
+    const uniqueToolCallIds = Array.from(
+      new Set(
+        toolCallIds
+          .map((toolCallId) =>
+            typeof toolCallId === "string" ? toolCallId.trim() : ""
+          )
+          .filter(Boolean)
+      )
+    )
+    if (uniqueToolCallIds.length === 0) return 0
+
+    const interruptedToolCalls: InterruptedToolCallInfo[] = []
+    let interruptedSubAgent: SessionRestartRecovery["interruptedSubAgent"]
+
+    for (const toolCallId of uniqueToolCallIds) {
+      const pendingToolCall = session.pendingToolCalls.get(toolCallId)
+      if (!pendingToolCall) continue
+
+      interruptedToolCalls.push({
+        toolCallId: pendingToolCall.toolCallId,
+        toolName: pendingToolCall.toolName,
+        sentAt: pendingToolCall.sentAt,
+      })
+
+      if (session.subAgentContext?.parentToolCallId === toolCallId) {
+        interruptedSubAgent = {
+          subagentId: session.subAgentContext.subagentId,
+          parentToolCallId: session.subAgentContext.parentToolCallId,
+          turnCount: session.subAgentContext.turnCount,
+          toolCallCount: session.subAgentContext.toolCallCount,
+        }
+      }
+
+      this.sessionManager.clearPendingToolCall(
+        conversationId,
+        toolCallId,
+        `interrupted: ${reason}`
+      )
+    }
+
+    if (interruptedToolCalls.length === 0) {
+      return 0
+    }
+
+    if (interruptedSubAgent) {
+      this.sessionManager.clearSubAgentContext(conversationId)
+    }
+
+    const refreshedSession = this.sessionManager.getSession(conversationId)
+    if (refreshedSession) {
+      this.repairInterruptedToolProtocol(
+        refreshedSession,
+        this.buildRuntimeInterruptedRecovery(
+          reason,
+          interruptedToolCalls,
+          interruptedSubAgent
+        )
+      )
+    }
+
+    this.logger.warn(
+      `Interrupted ${interruptedToolCalls.length} pending tool call(s) for recovery: ` +
+        `${interruptedToolCalls.map((toolCall) => toolCall.toolName || toolCall.toolCallId).join(", ")}`
+    )
+    return interruptedToolCalls.length
+  }
+
   private async *abortPendingToolCallsOnStream(
     conversationId: string,
     session: ChatSession,
@@ -612,7 +825,21 @@ export class CursorConnectStreamService {
       )
     let abortedCount = 0
 
+    const taskLikeToolCallIds = pendingToolCallIds.filter((pendingToolCallId) =>
+      this.isTaskLikePendingToolCall(
+        session.pendingToolCalls.get(pendingToolCallId)
+      )
+    )
+    if (taskLikeToolCallIds.length > 0) {
+      abortedCount += this.interruptPendingToolCallsForRecovery(
+        conversationId,
+        taskLikeToolCallIds,
+        reason
+      )
+    }
+
     for (const pendingToolCallId of pendingToolCallIds) {
+      if (taskLikeToolCallIds.includes(pendingToolCallId)) continue
       if (!session.pendingToolCalls.has(pendingToolCallId)) continue
 
       const isPrimary =
@@ -722,6 +949,36 @@ export class CursorConnectStreamService {
     }
 
     const abortedStreamId = pendingToolCall.streamId
+    if (this.isTaskLikePendingToolCall(pendingToolCall)) {
+      this.interruptPendingToolCallsForRecovery(
+        conversationId,
+        [pendingToolCall.toolCallId],
+        safeReason
+      )
+
+      const remainingIds = this.sessionManager.getPendingToolCallIdsByStream(
+        conversationId,
+        abortedStreamId
+      )
+      if (remainingIds.length === 0) {
+        this.logger.log(
+          `Exec throw converted task interruption into recovery state for ${conversationId}`
+        )
+        return true
+      }
+
+      this.logger.warn(
+        `Exec throw for task-like tool ${pendingToolCall.toolCallId} left ${remainingIds.length} pending tool call(s) on aborted stream; draining siblings`
+      )
+      yield* this.abortPendingToolCallsOnStream(
+        conversationId,
+        session,
+        abortedStreamId,
+        safeReason
+      )
+      return true
+    }
+
     const toolResultContent = stack
       ? `Tool execution aborted by client.\nreason: ${safeReason}\nstack: ${stack.slice(0, 2000)}`
       : `Tool execution aborted by client.\nreason: ${safeReason}`
@@ -819,9 +1076,13 @@ export class CursorConnectStreamService {
     options?: BackendStreamOptions
   ): AsyncGenerator<string, void, unknown> {
     attemptedBackends.add(route.backend)
-    const routedDto = options?.buildDtoForRoute
-      ? options.buildDtoForRoute(route)
-      : { ...dto, model: route.model }
+    const canReuseInitialDto =
+      options?.initialRoute?.backend === route.backend &&
+      options?.initialRoute?.model === route.model
+    const routedDto =
+      canReuseInitialDto || !options?.buildDtoForRoute
+        ? { ...dto, model: route.model }
+        : options.buildDtoForRoute(route)
     // Buffer envelope events (message_start, ping) AND structural events
     // (content_block_start, content_block_stop) so we can discard them on
     // fallback.  Only once a content_block_delta arrives (i.e., actual
@@ -963,6 +1224,10 @@ export class CursorConnectStreamService {
     try {
       yield* this.executeBackendStreamWithFallback(dto, route, new Set(), {
         ...options,
+        initialRoute: {
+          backend: route.backend,
+          model: route.model,
+        },
         abortSignal: registration?.controller.signal ?? options?.abortSignal,
       })
     } finally {
@@ -1024,6 +1289,8 @@ export class CursorConnectStreamService {
       conversationId?: string
       session?: ChatSession
       toolDefinitions?: CreateMessageDto["tools"]
+      additionalSystemPrompt?: string
+      disableTools?: boolean
       pendingToolUseIds?: string[]
       thinkingLevel?: number
       buildMessages: (budget: {
@@ -1044,28 +1311,45 @@ export class CursorConnectStreamService {
     const systemPrompt = useGoogleContextMessages
       ? this.buildGoogleSystemPrompt(options.promptContext)
       : this.buildSystemPrompt(options.promptContext)
+    const effectiveSystemPrompt = options.additionalSystemPrompt
+      ? [systemPrompt, options.additionalSystemPrompt]
+          .filter((part) => typeof part === "string" && part.trim().length > 0)
+          .join("\n\n")
+      : systemPrompt
     const budget = this.resolveMessageBudget(route.backend, {
       session: options.session,
-      contextTokens: contextMessages.length
+      protectedContextTokens: contextMessages.length
         ? this.tokenCounter.countMessages(contextMessages as UnifiedMessage[])
         : 0,
-      systemPrompt,
-      toolDefinitions: options.toolDefinitions,
+      systemPrompt: effectiveSystemPrompt,
+      toolDefinitions: options.disableTools
+        ? undefined
+        : options.toolDefinitions,
       model: options.model,
     })
+    const historyMessages = options.buildMessages(budget)
+    const outgoingMessages = useGoogleContextMessages
+      ? this.buildGoogleOfficialMessages(contextMessages, historyMessages)
+      : ([
+          ...contextMessages,
+          ...historyMessages,
+        ] as CreateMessageDto["messages"])
+    const historyTokens = historyMessages.length
+      ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
+      : 0
+    const totalMessageTokens = outgoingMessages.length
+      ? this.tokenCounter.countMessages(outgoingMessages as UnifiedMessage[])
+      : 0
 
     const dto: CreateMessageDto = {
       model: route.model,
-      messages: [
-        ...contextMessages,
-        ...options.buildMessages(budget),
-      ] as CreateMessageDto["messages"],
-      system: systemPrompt || undefined,
+      messages: outgoingMessages,
+      system: effectiveSystemPrompt || undefined,
       max_tokens: budget.maxOutputTokens,
       stream: true,
     }
 
-    if (options.toolDefinitions) {
+    if (!options.disableTools && options.toolDefinitions) {
       dto.tools = options.toolDefinitions
     }
     if (options.conversationId) {
@@ -1077,18 +1361,23 @@ export class CursorConnectStreamService {
       dto._pendingToolUseIds = options.pendingToolUseIds
     }
 
-    if ((options.thinkingLevel || 0) > 0) {
-      const thinkingConfig = this.buildCursorThinkingConfig(
+    const requestedReasoningEffort = this.resolveRequestedReasoningEffort(
+      options.session?.requestedModelParameters
+    )
+
+    if ((options.thinkingLevel || 0) > 0 || requestedReasoningEffort) {
+      const thinkingIntent = this.buildCursorThinkingIntent(
         options.thinkingLevel || 0,
-        route.model
+        route.model,
+        requestedReasoningEffort
       )
-      if (thinkingConfig) {
-        dto.thinking = thinkingConfig.thinking
-        if (thinkingConfig.output_config) {
-          dto.output_config = thinkingConfig.output_config
-        }
-      }
+      applyThinkingIntentToDto(dto, thinkingIntent)
     }
+
+    this.logger.debug(
+      `Prompt assembly for ${route.backend}: protectedContextMessages=${contextMessages.length}, ` +
+        `historyMessages=${historyMessages.length}, historyTokens=${historyTokens}, totalMessageTokens=${totalMessageTokens}`
+    )
 
     return dto
   }
@@ -1174,7 +1463,7 @@ export class CursorConnectStreamService {
     options?: {
       parsed?: ParsedCursorRequest
       session?: ChatSession
-      contextTokens?: number
+      protectedContextTokens?: number
       systemPrompt?: string
       toolDefinitions?: unknown
       model?: string
@@ -1208,7 +1497,7 @@ export class CursorConnectStreamService {
       }
     }
 
-    const contextTokens = options?.contextTokens || 0
+    const protectedContextTokens = options?.protectedContextTokens || 0
     const protocolSystemPromptTokens = options?.systemPrompt
       ? this.tokenCounter.countMessages([
           {
@@ -1230,7 +1519,7 @@ export class CursorConnectStreamService {
         : this.GENERIC_EXTRA_OVERHEAD_TOKENS
 
     const systemPromptTokens =
-      contextTokens +
+      protectedContextTokens +
       protocolSystemPromptTokens +
       toolDefinitionTokens +
       backendSystemPromptTokens +
@@ -1244,7 +1533,7 @@ export class CursorConnectStreamService {
 
     this.logger.debug(
       `Token budget resolved: backend=${backend}, maxTokens=${maxTokens}, ` +
-        `systemPromptTokens=${systemPromptTokens} (context=${contextTokens}, protocolSystem=${protocolSystemPromptTokens}, tools=${toolDefinitionTokens}, backendSystem=${backendSystemPromptTokens}), ` +
+        `systemPromptTokens=${systemPromptTokens} (protectedContext=${protectedContextTokens}, protocolSystem=${protocolSystemPromptTokens}, tools=${toolDefinitionTokens}, backendSystem=${backendSystemPromptTokens}), ` +
         `maxOutput=${maxOutputTokens}`
     )
 
@@ -1521,12 +1810,20 @@ export class CursorConnectStreamService {
   }
 
   private shouldDeferToolBatchContinuation(
+    conversationId: string,
     backend: BackendType,
     pendingToolUseIds: string[]
   ): boolean {
+    if (!backendRequiresCompleteToolBatchBeforeContinuation(backend)) {
+      return false
+    }
+
     return (
-      pendingToolUseIds.length > 0 &&
-      backendRequiresCompleteToolBatchBeforeContinuation(backend)
+      pendingToolUseIds.length > 0 ||
+      this.sessionManager.hasUnsettledAssistantToolBatchForBackend(
+        conversationId,
+        backend
+      )
     )
   }
 
@@ -2021,6 +2318,58 @@ export class CursorConnectStreamService {
     }>
   }
 
+  private queuePendingContextSummaryUiUpdate(
+    session: ChatSession,
+    conversationId: string
+  ): void {
+    const activeCompactionId = session.contextState.activeCompactionId
+    if (!activeCompactionId) {
+      return
+    }
+    if (session.lastEmittedContextSummaryCompactionId === activeCompactionId) {
+      return
+    }
+    if (
+      session.pendingContextSummaryUiUpdate?.compactionId === activeCompactionId
+    ) {
+      return
+    }
+
+    const activeCommit = session.contextState.compactionHistory.find(
+      (commit) => commit.id === activeCompactionId
+    )
+    if (!activeCommit || !activeCommit.summary.trim()) {
+      return
+    }
+
+    session.pendingContextSummaryUiUpdate = {
+      compactionId: activeCommit.id,
+      summary: activeCommit.summary,
+    }
+    this.sessionManager.markSessionDirty(conversationId)
+  }
+
+  private *emitPendingContextSummaryUiUpdate(
+    conversationId: string
+  ): Generator<Buffer> {
+    const session = this.sessionManager.getSession(conversationId)
+    const pending = session?.pendingContextSummaryUiUpdate
+    if (!session || !pending) {
+      return
+    }
+
+    yield this.grpcService.createSummaryStartedResponse()
+    yield this.grpcService.createSummaryResponse(pending.summary)
+    yield this.grpcService.createSummaryCompletedResponse()
+
+    session.lastEmittedContextSummaryCompactionId = pending.compactionId
+    session.pendingContextSummaryUiUpdate = undefined
+    this.sessionManager.markSessionDirty(conversationId)
+    this.logger.log(
+      `Emitted context compaction summary UI update for ${conversationId}: ${pending.compactionId}`
+    )
+  }
+
   private truncateMessagesForBackend(
     session: ChatSession,
     backend: BackendType,
@@ -2048,8 +2397,16 @@ export class CursorConnectStreamService {
     )
     if (primary.wasCompacted) {
       this.sessionManager.markContextStateDirty(session.conversationId)
+      this.queuePendingContextSummaryUiUpdate(session, session.conversationId)
       this.logger.log(
         `Applied context compaction (${contextLabel}): estimated ${primary.estimatedTokens} tokens after projection`
+      )
+    }
+    if (primary.toolResultCompaction?.changed) {
+      this.logger.log(
+        `Applied ${primary.toolResultCompaction.trigger} tool-result compaction (${contextLabel}): ` +
+          `${primary.toolResultCompaction.clearedToolResults} results across ` +
+          `${primary.toolResultCompaction.compactedRounds} API rounds`
       )
     }
 
@@ -2623,6 +2980,374 @@ ${raw}
     )
   }
 
+  private *finalizeInitialAssistantTurn(
+    session: ChatSession,
+    conversationId: string,
+    text: string,
+    usage?: ContextUsageSnapshot
+  ): Generator<Buffer> {
+    this.logger.log("Agent mode: sending turn_ended signal")
+
+    let assistantRecordId: string | undefined
+    if (text) {
+      assistantRecordId = this.sessionManager.addMessage(
+        session.conversationId,
+        "assistant",
+        text
+      )
+      this.logger.log(`Added text message to history (${text.length} chars)`)
+    }
+    if (assistantRecordId && usage) {
+      this.commitAssistantUsageLedger(session, assistantRecordId, usage, text)
+    }
+
+    const completedSession = this.recordCompletedTurnIfNeeded(
+      session,
+      !!assistantRecordId,
+      `message_stop: ${conversationId}`
+    )
+
+    const checkpoint = this.grpcService.createConversationCheckpointResponse(
+      completedSession.conversationId,
+      completedSession.model,
+      {
+        messageBlobIds: completedSession.messageBlobIds,
+        usedTokens: completedSession.usedTokens || 0,
+        maxTokens: this.resolveCheckpointMaxTokens(completedSession),
+        workspaceUri: completedSession.projectContext?.rootPath
+          ? `file://${completedSession.projectContext.rootPath}`
+          : undefined,
+        readPaths: Array.from(completedSession.readPaths),
+        fileStates: Object.fromEntries(completedSession.fileStates),
+        turns: completedSession.turns,
+        todos: completedSession.todos,
+      }
+    )
+    yield checkpoint
+    this.logger.log("Sent conversationCheckpointUpdate")
+
+    yield this.grpcService.createServerHeartbeatResponse()
+    yield this.grpcService.createAgentTurnEndedResponse()
+    this.logger.log("Turn ended, returning to handleBidiStream to close stream")
+  }
+
+  private async *processAssistantTurnStream(
+    params: AssistantTurnStreamParams
+  ): AsyncGenerator<Buffer, AssistantTurnStreamOutcome> {
+    const {
+      conversationId,
+      session,
+      stream,
+      streamId,
+      checkpointModel,
+      workspaceRootPath,
+      mode,
+      emitInitialHeartbeat = false,
+      emitTokenDeltas = true,
+      streamAbortContext,
+      messageStopAbortContext,
+    } = params
+
+    const modelCallBaseId = crypto.randomUUID()
+    let toolCallIndex = 0
+    let accumulatedText = ""
+    let finalUsage: ContextUsageSnapshot | undefined
+    let currentToolCall: ActiveToolCall | null = null
+    const assistantBlocks: MessageContentItem[] = []
+    const preparedTools: PreparedToolInvocation[] = []
+    let editStreamState: {
+      markerFound: boolean
+      contentStartIdx: number
+      lastSentRawLen: number
+    } | null = null
+    let isInThinkingBlock = false
+    let thinkingStartTime = 0
+    let currentThinkingBlock: ThinkingContentItem | null = null
+
+    if (emitInitialHeartbeat) {
+      yield this.grpcService.createHeartbeatResponse()
+    }
+
+    for await (const item of this.streamWithHeartbeat(stream)) {
+      if (
+        this.shouldAbortSupersededStream(
+          conversationId,
+          streamId,
+          streamAbortContext
+        )
+      ) {
+        return {
+          kind: "aborted",
+          accumulatedText,
+          finalUsage,
+          toolCallCount: preparedTools.length,
+        }
+      }
+
+      if (item.type === "heartbeat") {
+        yield this.grpcService.createHeartbeatResponse()
+        continue
+      }
+
+      const event = this.parseSseEvent(item.value)
+      if (!event) continue
+
+      if (event.type === "content_block_start") {
+        const contentBlock = event.data.content_block
+        if (
+          contentBlock?.type === "tool_use" &&
+          contentBlock.id &&
+          contentBlock.name
+        ) {
+          const modelCallId = this.generateModelCallId(
+            modelCallBaseId,
+            toolCallIndex++
+          )
+          currentToolCall = {
+            id: contentBlock.id,
+            name: contentBlock.name,
+            inputJson: "",
+            modelCallId,
+          }
+          if (this.isEditToolInvocation(currentToolCall.name)) {
+            editStreamState = {
+              markerFound: false,
+              contentStartIdx: 0,
+              lastSentRawLen: 0,
+            }
+          } else {
+            editStreamState = null
+          }
+          this.logger.debug(
+            `Tool call started: ${currentToolCall.name} (${currentToolCall.id}) modelCallId: ${modelCallId}`
+          )
+        } else if (contentBlock?.type === "thinking") {
+          isInThinkingBlock = true
+          thinkingStartTime = Date.now()
+          currentThinkingBlock = this.startAssistantThinkingBlock(
+            assistantBlocks,
+            contentBlock.signature
+          )
+          this.logger.debug("Thinking block started")
+        }
+        continue
+      }
+
+      if (event.type === "content_block_delta") {
+        const delta = event.data.delta
+        if (delta?.type === "text_delta" && delta.text) {
+          yield this.grpcService.createAgentTextResponse(delta.text)
+          accumulatedText += delta.text
+          this.appendAssistantTextBlock(assistantBlocks, delta.text)
+
+          if (emitTokenDeltas) {
+            const { estimateTokenCount } = await import("./agent-helpers")
+            const outputTokens = estimateTokenCount(delta.text)
+            if (outputTokens > 0) {
+              yield this.grpcService.createTokenDeltaResponse(0, outputTokens)
+            }
+          }
+        } else if (delta?.type === "input_json_delta" && currentToolCall) {
+          currentToolCall.inputJson += delta.partial_json || ""
+
+          if (editStreamState) {
+            const json = currentToolCall.inputJson
+            if (!editStreamState.markerFound) {
+              for (const key of [
+                '"new_text":"',
+                '"new_text": "',
+                '"file_text":"',
+                '"file_text": "',
+              ]) {
+                const idx = json.indexOf(key)
+                if (idx >= 0) {
+                  editStreamState.markerFound = true
+                  editStreamState.contentStartIdx = idx + key.length
+                  this.logger.debug(
+                    `Edit stream: found content marker at idx=${editStreamState.contentStartIdx}`
+                  )
+                  break
+                }
+              }
+            }
+            if (editStreamState.markerFound) {
+              const rawContent = json.substring(editStreamState.contentStartIdx)
+              let safeEnd = rawContent.length
+              if (rawContent.endsWith("\\")) safeEnd--
+              if (safeEnd > editStreamState.lastSentRawLen) {
+                const newRaw = rawContent.substring(
+                  editStreamState.lastSentRawLen,
+                  safeEnd
+                )
+                editStreamState.lastSentRawLen = safeEnd
+                const unescaped = newRaw
+                  .replace(/\\n/g, "\n")
+                  .replace(/\\t/g, "\t")
+                  .replace(/\\r/g, "\r")
+                  .replace(/\\\\/g, "\\")
+                  .replace(/\\"/g, '"')
+                if (unescaped) {
+                  const toolCallDelta =
+                    this.grpcService.createToolCallDeltaResponse(
+                      currentToolCall.id,
+                      currentToolCall.name,
+                      "stream_content",
+                      unescaped,
+                      currentToolCall.modelCallId
+                    )
+                  if (toolCallDelta.length > 0) {
+                    yield toolCallDelta
+                  }
+                }
+              }
+            }
+          }
+        } else if (delta?.type === "thinking_delta") {
+          this.appendAssistantThinkingDelta(
+            currentThinkingBlock,
+            delta.thinking || ""
+          )
+          if (typeof delta.thinking === "string" && delta.thinking.length > 0) {
+            yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
+          }
+        } else if (delta?.type === "signature_delta") {
+          this.setAssistantThinkingSignature(
+            currentThinkingBlock,
+            delta.signature
+          )
+        }
+        continue
+      }
+
+      if (event.type === "message_delta") {
+        finalUsage = this.extractUsageSnapshot(event) || finalUsage
+        continue
+      }
+
+      if (event.type === "content_block_stop") {
+        if (isInThinkingBlock) {
+          const thinkingDurationMs = Date.now() - thinkingStartTime
+          yield this.grpcService.createThinkingCompletedResponse(
+            thinkingDurationMs
+          )
+          isInThinkingBlock = false
+          currentThinkingBlock = null
+        }
+
+        if (currentToolCall) {
+          const preparedTool = this.buildPreparedToolInvocation(
+            session,
+            currentToolCall
+          )
+          this.appendPreparedToolUseBlock(assistantBlocks, preparedTool)
+          preparedTools.push(preparedTool)
+          this.logger.log(
+            `Tool call completed: ${preparedTool.protocolToolName}, queued for batched dispatch`
+          )
+          currentToolCall = null
+          editStreamState = null
+        }
+        continue
+      }
+
+      if (event.type === "message_stop") {
+        if (
+          this.shouldAbortSupersededStream(
+            conversationId,
+            streamId,
+            messageStopAbortContext
+          )
+        ) {
+          return {
+            kind: "aborted",
+            accumulatedText,
+            finalUsage,
+            toolCallCount: preparedTools.length,
+          }
+        }
+
+        if (preparedTools.length > 0) {
+          const dispatchOutcome = yield* this.dispatchPreparedToolBatch(
+            conversationId,
+            session,
+            streamId,
+            checkpointModel,
+            workspaceRootPath,
+            assistantBlocks,
+            preparedTools
+          )
+          return {
+            kind:
+              dispatchOutcome === "waiting_for_result"
+                ? "waiting_for_results"
+                : "completed",
+            accumulatedText,
+            finalUsage,
+            toolCallCount: preparedTools.length,
+          }
+        }
+
+        if (mode === "initial") {
+          yield* this.finalizeInitialAssistantTurn(
+            session,
+            conversationId,
+            accumulatedText,
+            finalUsage
+          )
+        } else {
+          this.logger.log(
+            "Agent mode: no more tool calls, sending turn_ended signal"
+          )
+          yield* this.finalizeAssistantContinuationTurn(
+            session,
+            conversationId,
+            accumulatedText || undefined,
+            finalUsage
+          )
+          this.logger.log("Sent conversationCheckpointUpdate (continuation)")
+        }
+
+        return {
+          kind: "completed",
+          accumulatedText,
+          finalUsage,
+          toolCallCount: 0,
+        }
+      }
+    }
+
+    if (preparedTools.length > 0) {
+      this.logger.warn(
+        `Assistant stream exited without message_stop after ${preparedTools.length} tool call(s); dispatching batched tools defensively`
+      )
+      const dispatchOutcome = yield* this.dispatchPreparedToolBatch(
+        conversationId,
+        session,
+        streamId,
+        checkpointModel,
+        workspaceRootPath,
+        assistantBlocks,
+        preparedTools
+      )
+      return {
+        kind:
+          dispatchOutcome === "waiting_for_result"
+            ? "waiting_for_results"
+            : "completed",
+        accumulatedText,
+        finalUsage,
+        toolCallCount: preparedTools.length,
+      }
+    }
+
+    return {
+      kind: accumulatedText ? "partial_without_message_stop" : "empty",
+      accumulatedText,
+      finalUsage,
+      toolCallCount: 0,
+    }
+  }
+
   private *finalizeAssistantContinuationTurn(
     session: ChatSession,
     conversationId: string,
@@ -2940,6 +3665,18 @@ ${raw}
     content: string,
     toolResultState?: { status: ToolResultStatus; message?: string }
   ): string {
+    if (
+      this.isMutatingFileTool(toolName) &&
+      this.pickFirstString(toolInput, ["path", "file_path", "filePath"])
+    ) {
+      return this.formatMutatingFileToolResultForHistory(
+        toolName,
+        toolInput,
+        content,
+        toolResultState
+      )
+    }
+
     const family = this.normalizeDeferredToolFamily(toolName)
 
     if (family === "web_search") {
@@ -3033,6 +3770,171 @@ ${raw}
     }
 
     return content
+  }
+
+  private formatMutatingFileToolResultForHistory(
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    content: string,
+    toolResultState?: { status: ToolResultStatus; message?: string }
+  ): string {
+    const path =
+      this.pickFirstString(toolInput, ["path", "file_path", "filePath"]) || ""
+    const normalizedToolName = (toolName || "file_tool").trim() || "file_tool"
+    const warningMarker = "\n\n[edit_apply_warning] "
+    const warningIdx = content.indexOf(warningMarker)
+    const payload =
+      warningIdx >= 0 ? content.slice(0, warningIdx).trimEnd() : content
+    const warning =
+      warningIdx >= 0
+        ? content.slice(warningIdx + warningMarker.length).trim()
+        : ""
+
+    if (toolResultState?.status === "rejected") {
+      return `[${normalizedToolName} rejected] ${toolResultState.message || "request rejected"}${path ? ` (path: ${path})` : ""}`
+    }
+    if (toolResultState && toolResultState.status !== "success") {
+      return `[${normalizedToolName} error] ${toolResultState.message || "request failed"}${path ? ` (path: ${path})` : ""}`
+    }
+
+    const lines = [`[${normalizedToolName} success]`]
+    if (path) lines.push(`path: ${path}`)
+    lines.push(
+      `result: full file snapshot omitted from model history to avoid context explosion`
+    )
+    if (payload) lines.push(`omitted_payload_size: ${payload.length} chars`)
+    if (warning) lines.push(`warning: ${warning}`)
+    lines.push(
+      `follow_up: use read_file with focused line ranges or grep_search if more context is needed`
+    )
+    return lines.join("\n")
+  }
+
+  private toDiffLines(content: string): string[] {
+    if (!content) return []
+    const lines = content.split(/\r?\n/)
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop()
+    }
+    return lines
+  }
+
+  private countEditLineDelta(
+    beforeContent: string,
+    afterContent: string
+  ): { linesAdded: number; linesRemoved: number } {
+    const beforeLines = this.toDiffLines(beforeContent)
+    const afterLines = this.toDiffLines(afterContent)
+
+    let prefix = 0
+    while (
+      prefix < beforeLines.length &&
+      prefix < afterLines.length &&
+      beforeLines[prefix] === afterLines[prefix]
+    ) {
+      prefix++
+    }
+
+    let beforeEnd = beforeLines.length - 1
+    let afterEnd = afterLines.length - 1
+    while (
+      beforeEnd >= prefix &&
+      afterEnd >= prefix &&
+      beforeLines[beforeEnd] === afterLines[afterEnd]
+    ) {
+      beforeEnd--
+      afterEnd--
+    }
+
+    const beforeRemaining = beforeLines.slice(prefix, beforeEnd + 1)
+    const afterRemaining = afterLines.slice(prefix, afterEnd + 1)
+
+    if (beforeRemaining.length === 0 || afterRemaining.length === 0) {
+      return {
+        linesAdded: afterRemaining.length,
+        linesRemoved: beforeRemaining.length,
+      }
+    }
+
+    const maxCells = 1_000_000
+    if (beforeRemaining.length * afterRemaining.length > maxCells) {
+      return {
+        linesAdded: afterRemaining.length,
+        linesRemoved: beforeRemaining.length,
+      }
+    }
+
+    let previous: number[] = new Array<number>(afterRemaining.length + 1).fill(
+      0
+    )
+    for (const beforeLine of beforeRemaining) {
+      const current: number[] = new Array<number>(
+        afterRemaining.length + 1
+      ).fill(0)
+      for (let index = 1; index <= afterRemaining.length; index++) {
+        current[index] =
+          beforeLine === afterRemaining[index - 1]
+            ? (previous[index - 1] ?? 0) + 1
+            : Math.max(previous[index] ?? 0, current[index - 1] ?? 0)
+      }
+      previous = current
+    }
+
+    const lcsLength: number = previous[afterRemaining.length] ?? 0
+    return {
+      linesAdded: afterRemaining.length - lcsLength,
+      linesRemoved: beforeRemaining.length - lcsLength,
+    }
+  }
+
+  private createEditUnifiedDiff(
+    displayPath: string,
+    beforeContent: string,
+    afterContent: string
+  ): string | undefined {
+    if (beforeContent === afterContent) return undefined
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { createTwoFilesPatch } = require("diff") as typeof import("diff")
+      const patch = createTwoFilesPatch(
+        `a/${displayPath}`,
+        `b/${displayPath}`,
+        beforeContent,
+        afterContent,
+        undefined,
+        undefined,
+        { context: 3 }
+      )
+      return patch.trim() || undefined
+    } catch (err) {
+      this.logger.warn(
+        `Failed to create edit unified diff for ${displayPath}: ${(err as Error).message}`
+      )
+      return undefined
+    }
+  }
+
+  private buildEditSuccessExtraData(
+    displayPath: string,
+    beforeContent: string,
+    afterContent: string
+  ): ToolCompletedExtraData["editSuccess"] {
+    const { linesAdded, linesRemoved } = this.countEditLineDelta(
+      beforeContent,
+      afterContent
+    )
+    const diffString = this.createEditUnifiedDiff(
+      displayPath,
+      beforeContent,
+      afterContent
+    )
+
+    return {
+      linesAdded,
+      linesRemoved,
+      diffString,
+    }
   }
 
   private countSubstringOccurrences(haystack: string, needle: string): number {
@@ -3247,10 +4149,128 @@ ${raw}
     return true
   }
 
+  private canonicalizeOfficialAntigravityToolInvocation(
+    toolName: string,
+    input: Record<string, unknown>
+  ): CanonicalToolInvocation | null {
+    const normalized = toolName
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+
+    switch (normalized) {
+      case "view_file":
+        return {
+          toolName: "read_file",
+          input: {
+            path: input.path || input.file_path || input.filePath,
+            start_line: input.start_line || input.startLine,
+            end_line: input.end_line || input.endLine,
+          },
+        }
+      case "list_dir":
+        return {
+          toolName: "list_directory",
+          input: {
+            path: input.path || input.dir || input.directory,
+            recursive: input.recursive,
+          },
+        }
+      case "run_command":
+        return {
+          toolName: "run_terminal_command",
+          input: {
+            command: input.command || input.cmd,
+            cwd: input.cwd || input.working_directory || input.workingDirectory,
+          },
+        }
+      case "send_command_input":
+        return {
+          toolName: "write_shell_stdin",
+          input: {
+            shellId:
+              input.shellId ||
+              input.shell_id ||
+              input.command_id ||
+              input.commandId,
+            data: input.data || input.input || input.text,
+          },
+        }
+      case "replace_file_content":
+      case "multi_replace_file_content":
+        return {
+          toolName: "edit_file_v2",
+          input: {
+            path: input.path || input.file_path || input.filePath,
+            search:
+              input.search || input.old_text || input.oldText || input.target,
+            replace:
+              input.replace ||
+              input.new_text ||
+              input.newText ||
+              input.replacement,
+          },
+        }
+      case "write_to_file":
+        return {
+          toolName: "edit_file_v2",
+          input: {
+            path: input.path || input.file_path || input.filePath,
+            search: input.search || "",
+            replace:
+              input.content || input.file_text || input.fileText || input.text,
+          },
+        }
+      case "search_web":
+        return {
+          toolName: "web_search",
+          input: {
+            query: input.query || input.search_query || input.searchQuery,
+            domain: input.domain,
+          },
+        }
+      case "read_url_content":
+        return {
+          toolName: "web_fetch",
+          input: { url: input.url || input.Url || input.URL },
+        }
+      case "command_status":
+        return {
+          toolName: "run_terminal_command",
+          input: {
+            command: input.command || "echo 'command_status unsupported'",
+            cwd: input.cwd,
+          },
+        }
+      case "browser_subagent":
+        return {
+          toolName: "task",
+          input: {
+            description:
+              input.Task ||
+              input.task ||
+              input.description ||
+              input.TaskSummary,
+            prompt: input.Task || input.task || input.description,
+            subagent_type: "browser",
+          },
+        }
+      default:
+        return null
+    }
+  }
+
   private canonicalizeToolInvocation(
     toolName: string,
     input: Record<string, unknown>
   ): CanonicalToolInvocation {
+    const antigravityInvocation =
+      this.canonicalizeOfficialAntigravityToolInvocation(toolName, input)
+    if (antigravityInvocation) {
+      return antigravityInvocation
+    }
+
     const family = this.normalizeDeferredToolFamily(toolName)
     if (family === "fetch" && this.shouldCanonicalizeFetchAsWebFetch(input)) {
       return {
@@ -3330,10 +4350,13 @@ ${raw}
           return "todo_write"
         case "CLIENT_SIDE_TOOL_V2_TASK":
         case "CLIENT_SIDE_TOOL_V2_TASK_V2":
-        case "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP":
-        case "CLIENT_SIDE_TOOL_V2_AWAIT_TASK":
-        case "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT":
           return "task"
+        case "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP":
+          return "background_composer_followup"
+        case "CLIENT_SIDE_TOOL_V2_AWAIT_TASK":
+          return "await_task"
+        case "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT":
+          return "update_project"
         case "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF":
         case "CLIENT_SIDE_TOOL_V2_REAPPLY":
           return "apply_agent_diff"
@@ -3457,7 +4480,6 @@ ${raw}
       snake.includes("task_v2") ||
       snake.includes("task_tool_call") ||
       compact === "task" ||
-      compact.includes("subagent") ||
       compact.includes("tasktoolcall")
     ) {
       return "task"
@@ -5636,7 +6658,14 @@ ${raw}
       conversationId,
       subAgentCtx.parentToolCallId,
       finalText || "[sub-agent completed with no output]",
-      { status: "success" }
+      { status: "success" },
+      {
+        taskSuccess: {
+          agentId: subAgentCtx.subagentId,
+          isBackground: false,
+          durationMs,
+        },
+      }
     )
 
     this.sessionManager.clearSubAgentContext(conversationId)
@@ -6907,10 +7936,33 @@ ${raw}
       return
     }
 
-    this.logger.error(
-      `Protocol error, failing ${pendingIds.length} pending tool call(s): ${reason}`
+    const taskLikePendingIds = pendingIds.filter((pendingId) =>
+      this.isTaskLikePendingToolCall(session.pendingToolCalls.get(pendingId))
     )
-    for (const pendingId of pendingIds) {
+    if (taskLikePendingIds.length > 0) {
+      const interruptedCount = this.interruptPendingToolCallsForRecovery(
+        conversationId,
+        taskLikePendingIds,
+        reason
+      )
+      if (interruptedCount > 0) {
+        this.logger.warn(
+          `Protocol error converted ${interruptedCount} task-like pending tool call(s) into interrupted recovery state`
+        )
+      }
+    }
+
+    const remainingPendingIds = pendingIds.filter(
+      (pendingId) => !taskLikePendingIds.includes(pendingId)
+    )
+    if (remainingPendingIds.length === 0) {
+      return
+    }
+
+    this.logger.error(
+      `Protocol error, failing ${remainingPendingIds.length} pending tool call(s): ${reason}`
+    )
+    for (const pendingId of remainingPendingIds) {
       if (!session.pendingToolCalls.has(pendingId)) continue
       yield* this.emitInlineToolResult(
         conversationId,
@@ -7577,56 +8629,537 @@ ${raw}
     }
   }
 
-  private shouldEmitToolCallStarted(
-    _deferredToolFamily: DeferredToolFamily | undefined,
-    _canDispatchExec: boolean
+  private shouldSuppressTodoLifecycleStarted(
+    toolName: string,
+    deferredToolFamily?: DeferredToolFamily
   ): boolean {
-    // Always emit started updates so Cursor can create the tool bubble before
-    // completion updates arrive (deferred tools included).
-    return true
+    if (
+      deferredToolFamily === "todo_read" ||
+      deferredToolFamily === "todo_write"
+    ) {
+      return true
+    }
+
+    const normalizedToolName = toolName.trim().toLowerCase()
+    return (
+      normalizedToolName === "read_todos" ||
+      normalizedToolName === "update_todos" ||
+      normalizedToolName === "todo_read" ||
+      normalizedToolName === "todo_write"
+    )
   }
 
-  private appendAssistantToolUseMessage(
-    conversationId: string,
-    toolCallId: string,
+  private shouldEmitToolCallStarted(
     toolName: string,
-    input: Record<string, unknown>,
-    accumulatedText: string
+    deferredToolFamily: DeferredToolFamily | undefined,
+    _canDispatchExec: boolean
+  ): boolean {
+    // Cursor currently renders todo lifecycle started/completed updates as two
+    // separate generic [Tool: readTodosToolCall] / [Tool: updateTodosToolCall]
+    // bubbles instead of reconciling them. Emit completion-only for todos.
+    return !this.shouldSuppressTodoLifecycleStarted(
+      toolName,
+      deferredToolFamily
+    )
+  }
+
+  private appendAssistantTextBlock(
+    blocks: MessageContentItem[],
+    text: string
   ): void {
-    const messageContent: MessageContentItem[] = []
-    if (accumulatedText) {
-      messageContent.push({
-        type: "text",
-        text: accumulatedText,
-      })
+    if (!text) return
+
+    const lastBlock = blocks[blocks.length - 1]
+    if (lastBlock?.type === "text") {
+      lastBlock.text += text
+      return
     }
-    messageContent.push({
-      type: "tool_use",
-      id: toolCallId,
-      name: toolName,
-      input: input,
+
+    blocks.push({
+      type: "text",
+      text,
     })
-    this.sessionManager.addMessage(conversationId, "assistant", messageContent)
+  }
+
+  private startAssistantThinkingBlock(
+    blocks: MessageContentItem[],
+    signature?: string
+  ): ThinkingContentItem {
+    const block: ThinkingContentItem = {
+      type: "thinking",
+      thinking: "",
+    }
+    if (signature) {
+      block.signature = signature
+    }
+    blocks.push(block)
+    return block
+  }
+
+  private appendAssistantThinkingDelta(
+    block: ThinkingContentItem | null,
+    thinking: string
+  ): void {
+    if (!block || !thinking) {
+      return
+    }
+    block.thinking += thinking
+  }
+
+  private setAssistantThinkingSignature(
+    block: ThinkingContentItem | null,
+    signature?: string
+  ): void {
+    if (!block || !signature) {
+      return
+    }
+    block.signature = signature
+  }
+
+  private buildPreparedToolInvocation(
+    session: ChatSession,
+    toolCall: ActiveToolCall
+  ): PreparedToolInvocation {
+    const rawInput = this.parseToolInputJson(toolCall.inputJson)
+    const canonicalInvocation = this.canonicalizeToolInvocation(
+      toolCall.name,
+      rawInput
+    )
+    const canonicalToolName = canonicalInvocation.toolName
+    const input = canonicalInvocation.input
+    const deferredToolFamily =
+      this.normalizeDeferredToolFamily(canonicalToolName)
+    const execDispatchResolution = this.resolveExecDispatchTarget(
+      session,
+      canonicalToolName,
+      input
+    )
+    const execDispatchTarget = execDispatchResolution.target
+
+    return {
+      activeToolCall: toolCall,
+      canonicalToolName,
+      input,
+      deferredToolFamily,
+      execDispatchTarget: execDispatchTarget || undefined,
+      dispatchErrorMessage: execDispatchResolution.errorMessage,
+      canDispatchExec: Boolean(execDispatchTarget),
+      protocolToolName: execDispatchTarget?.toolName || canonicalToolName,
+      protocolToolInput: execDispatchTarget?.input || input,
+      protocolToolFamilyHint: execDispatchTarget?.toolFamilyHint,
+    }
+  }
+
+  private appendPreparedToolUseBlock(
+    blocks: MessageContentItem[],
+    preparedTool: PreparedToolInvocation
+  ): void {
+    blocks.push({
+      type: "tool_use",
+      id: preparedTool.activeToolCall.id,
+      name: preparedTool.protocolToolName,
+      input: preparedTool.protocolToolInput,
+    })
+  }
+
+  private persistAssistantToolBatchMessage(
+    conversationId: string,
+    blocks: MessageContentItem[]
+  ): void {
+    if (blocks.length === 0) return
+
+    const content: MessageContent =
+      blocks.length === 1 && blocks[0]?.type === "text"
+        ? blocks[0].text
+        : blocks.map((block) => ({ ...block }))
+
+    this.sessionManager.addMessage(conversationId, "assistant", content)
+  }
+
+  private getTopLevelAgentTurnState(
+    session: ChatSession,
+    conversationId: string
+  ): SessionTopLevelAgentTurnState {
+    if (!session.topLevelAgentTurnState) {
+      session.topLevelAgentTurnState = {
+        llmTurnCount: 1,
+        readOnlyBatchCount: 0,
+        hasMutatingToolCall: false,
+        forcedSynthesisAttempted: false,
+        completedBatchSummaries: [],
+      }
+      this.sessionManager.markSessionDirty(conversationId)
+    }
+    return session.topLevelAgentTurnState
+  }
+
+  private resetTopLevelAgentTurnState(
+    session: ChatSession,
+    conversationId: string
+  ): void {
+    session.topLevelAgentTurnState = {
+      llmTurnCount: 1,
+      readOnlyBatchCount: 0,
+      hasMutatingToolCall: false,
+      forcedSynthesisAttempted: false,
+      completedBatchSummaries: [],
+    }
+    this.sessionManager.markSessionDirty(conversationId)
+  }
+
+  private notePreparedToolBatch(
+    conversationId: string,
+    session: ChatSession,
+    assistantBlocks: MessageContentItem[],
+    preparedTools: PreparedToolInvocation[]
+  ): void {
+    if (preparedTools.length === 0) return
+
+    const state = this.getTopLevelAgentTurnState(session, conversationId)
+    const assistantText = assistantBlocks
+      .filter(
+        (block): block is Extract<MessageContentItem, { type: "text" }> =>
+          block.type === "text"
+      )
+      .map((block) => block.text)
+      .join("")
+      .trim()
+
+    const tools = preparedTools.map((tool) => ({
+      toolCallId: tool.activeToolCall.id,
+      toolName: tool.protocolToolName,
+      input: tool.protocolToolInput,
+    }))
+    const readOnly = tools.every((tool) =>
+      this.isReadOnlyInvestigativeTool(tool.toolName, tool.input)
+    )
+
+    if (!readOnly) {
+      state.hasMutatingToolCall = true
+    }
+
+    state.activeToolBatch = {
+      batchId: crypto.randomUUID(),
+      toolCallIds: tools.map((tool) => tool.toolCallId),
+      assistantText,
+      readOnly,
+      startedAt: Date.now(),
+      tools,
+    }
+    this.sessionManager.markSessionDirty(conversationId)
+  }
+
+  private recordCompletedToolResultInTopLevelState(
+    conversationId: string,
+    session: ChatSession,
+    toolCallId: string,
+    toolResultContent: string
+  ): SessionCompletedToolBatchSummary | undefined {
+    const state = this.getTopLevelAgentTurnState(session, conversationId)
+    const activeBatch = state.activeToolBatch
+    if (!activeBatch) {
+      return undefined
+    }
+
+    const trackedTool = activeBatch.tools.find(
+      (tool) => tool.toolCallId === toolCallId
+    )
+    if (!trackedTool) {
+      return undefined
+    }
+
+    trackedTool.resultSummary =
+      this.buildToolResultSummaryPreview(toolResultContent)
+
+    const completed = activeBatch.tools.every(
+      (tool) => typeof tool.resultSummary === "string"
+    )
+    if (!completed) {
+      this.sessionManager.markSessionDirty(conversationId)
+      return undefined
+    }
+
+    const summary = this.buildCompletedToolBatchSummary(activeBatch)
+    state.completedBatchSummaries.push(summary)
+    if (
+      state.completedBatchSummaries.length >
+      this.TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT
+    ) {
+      state.completedBatchSummaries = state.completedBatchSummaries.slice(
+        -this.TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT
+      )
+    }
+    if (activeBatch.readOnly) {
+      state.readOnlyBatchCount += 1
+    } else {
+      state.readOnlyBatchCount = 0
+    }
+    state.activeToolBatch = undefined
+    this.sessionManager.markSessionDirty(conversationId)
+    return summary
+  }
+
+  private buildCompletedToolBatchSummary(
+    batch: SessionActiveToolBatch
+  ): SessionCompletedToolBatchSummary {
+    const label = this.buildToolBatchLabel(batch)
+    const detailLines = batch.tools
+      .slice(0, this.TOOL_BATCH_SUMMARY_DETAILS_LIMIT)
+      .map((tool) => {
+        const inputSummary = this.summarizeToolInputForMemory(
+          tool.toolName,
+          tool.input
+        )
+        const resultSummary = tool.resultSummary || "completed"
+        return `- ${tool.toolName}: ${inputSummary}; result=${resultSummary}`
+      })
+    const details = [
+      batch.assistantText
+        ? `Intent: ${this.truncateForToolSummary(batch.assistantText, 180)}`
+        : "",
+      ...detailLines,
+      batch.tools.length > this.TOOL_BATCH_SUMMARY_DETAILS_LIMIT
+        ? `- ...and ${batch.tools.length - this.TOOL_BATCH_SUMMARY_DETAILS_LIMIT} more tool result(s)`
+        : "",
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n")
+
+    return {
+      batchId: batch.batchId,
+      label,
+      details,
+      toolCallIds: [...batch.toolCallIds],
+      toolCount: batch.tools.length,
+      readOnly: batch.readOnly,
+      createdAt: Date.now(),
+    }
+  }
+
+  private buildToolBatchLabel(batch: SessionActiveToolBatch): string {
+    const counts = new Map<string, number>()
+    for (const tool of batch.tools) {
+      counts.set(tool.toolName, (counts.get(tool.toolName) || 0) + 1)
+    }
+
+    const dominantTool = Array.from(counts.entries()).sort(
+      (a, b) => b[1] - a[1]
+    )[0]?.[0]
+    const firstTool = batch.tools[0]
+
+    if (dominantTool === "read_file" || dominantTool === "read_file_v2") {
+      const paths = batch.tools
+        .map((tool) => this.pickToolPath(tool.input))
+        .filter((value): value is string => !!value)
+      if (paths.length > 0) {
+        return `Read ${paths.slice(0, 2).join(", ")}${paths.length > 2 ? "..." : ""}`
+      }
+    }
+
+    if (dominantTool === "grep_search") {
+      const query = this.pickToolQuery(firstTool?.input)
+      if (query) {
+        return `Searched for ${this.truncateForToolSummary(query, 36)}`
+      }
+    }
+
+    if (dominantTool === "run_terminal_command") {
+      const command = this.pickShellCommand(firstTool?.input)
+      if (command) {
+        return `Ran ${this.truncateForToolSummary(command, 36)}`
+      }
+    }
+
+    if (dominantTool === "read_lints") {
+      return "Read lint diagnostics"
+    }
+
+    return `Completed ${batch.tools.length} investigative tool call${batch.tools.length === 1 ? "" : "s"}`
+  }
+
+  private buildToolResultSummaryPreview(content: string): string {
+    const compact = content.replace(/\s+/g, " ").trim()
+    return this.truncateForToolSummary(compact, 160)
+  }
+
+  private summarizeToolInputForMemory(
+    toolName: string,
+    input: Record<string, unknown>
+  ): string {
+    const pathValue = this.pickToolPath(input)
+    if (pathValue) {
+      return `path=${pathValue}`
+    }
+
+    if (toolName === "grep_search") {
+      const query = this.pickToolQuery(input)
+      if (query) {
+        return `query=${this.truncateForToolSummary(query, 60)}`
+      }
+    }
+
+    if (toolName === "run_terminal_command") {
+      const command = this.pickShellCommand(input)
+      if (command) {
+        return `command=${this.truncateForToolSummary(command, 60)}`
+      }
+    }
+
+    const serialized = JSON.stringify(input)
+    return serialized
+      ? this.truncateForToolSummary(serialized, 80)
+      : "input=unknown"
+  }
+
+  private pickToolPath(
+    input: Record<string, unknown> | undefined
+  ): string | null {
+    if (!input) return null
+    const candidate = input.path
+    return typeof candidate === "string" && candidate.trim().length > 0
+      ? candidate.trim()
+      : null
+  }
+
+  private pickToolQuery(
+    input: Record<string, unknown> | undefined
+  ): string | null {
+    if (!input) return null
+    const candidates = [input.query, input.pattern, input.searchTerm]
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim().length > 0) {
+        return candidate.trim()
+      }
+    }
+    return null
+  }
+
+  private pickShellCommand(
+    input: Record<string, unknown> | undefined
+  ): string | null {
+    if (!input) return null
+    const candidates = [input.command, input.cmd]
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim().length > 0) {
+        return candidate.trim()
+      }
+    }
+    return null
+  }
+
+  private truncateForToolSummary(value: string, maxChars: number): string {
+    const normalized = value.trim()
+    if (normalized.length <= maxChars) {
+      return normalized
+    }
+    return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`
+  }
+
+  private isReadOnlyInvestigativeTool(
+    toolName: string,
+    input: Record<string, unknown>
+  ): boolean {
+    switch (toolName) {
+      case "read_file":
+      case "read_file_v2":
+      case "grep_search":
+      case "file_search":
+      case "list_directory":
+      case "read_lints":
+      case "fetch_rules":
+      case "update_todos":
+      case "glob_search":
+      case "web_search":
+      case "web_fetch":
+        return true
+      case "run_terminal_command":
+      case "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2":
+      case "run_terminal_command_v2":
+      case "shell":
+      case "run_command":
+        return this.isReadOnlyShellCommand(this.pickShellCommand(input))
+      default:
+        return false
+    }
+  }
+
+  private isReadOnlyShellCommand(command: string | null): boolean {
+    if (!command) return false
+    const normalized = command.trim().toLowerCase()
+    if (
+      /(^|[;&|])\s*(rm|mv|cp|touch|mkdir|rmdir|git\s+(add|commit|checkout|switch|reset|restore|apply)|npm\s+(install|publish)|pnpm\s+(add|install)|yarn\s+(add|install)|bun\s+add)\b/.test(
+        normalized
+      )
+    ) {
+      return false
+    }
+
+    return /^(git\s+(diff|show|status|log|grep|ls-files)\b|rg\b|grep\b|sed\b|cat\b|head\b|tail\b|ls\b|find\b|fd\b|wc\b|nl\b|awk\b|cut\b|sort\b|uniq\b|jq\b|tree\b|stat\b|pwd\b|printf\b|echo\b|eslint\b|tsc\b|go\s+test\b|pytest\b|npm\s+(test|run\s+(test|lint|typecheck|types|check))\b|pnpm\s+(test|lint|typecheck|check)\b|yarn\s+(test|lint|typecheck)\b|bun\s+(test|run\s+(lint|typecheck))\b)/.test(
+      normalized
+    )
+  }
+
+  private buildTopLevelSummaryMemoryPrompt(
+    session: ChatSession
+  ): string | undefined {
+    const state = session.topLevelAgentTurnState
+    if (!state || state.completedBatchSummaries.length === 0) {
+      return undefined
+    }
+
+    const recentSummaries = state.completedBatchSummaries
+      .slice(-this.TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT)
+      .map(
+        (summary, index) => `${index + 1}. ${summary.label}\n${summary.details}`
+      )
+      .join("\n\n")
+
+    return [
+      "Recent tool-batch progress:",
+      recentSummaries,
+      "Prefer synthesizing from this collected evidence instead of repeating equivalent investigative tool calls.",
+    ].join("\n")
+  }
+
+  private shouldAdviseTopLevelReadOnlySynthesis(session: ChatSession): boolean {
+    const state = session.topLevelAgentTurnState
+    if (!state) return false
+    if (state.hasMutatingToolCall) return false
+    return state.readOnlyBatchCount >= this.TOP_LEVEL_AGENT_MAX_READONLY_TURNS
+  }
+
+  private buildReadOnlySynthesisAdvisoryPrompt(session: ChatSession): string {
+    const state = session.topLevelAgentTurnState
+    const recentProgress = this.buildTopLevelSummaryMemoryPrompt(session)
+    const readOnlyTurns = state?.readOnlyBatchCount || 0
+    return [
+      `The current top-level agent turn has already completed ${readOnlyTurns} read-only investigative tool batches.`,
+      "Prefer synthesizing from the evidence already gathered instead of repeating equivalent investigative tool calls.",
+      "Only call another tool if it is materially necessary to reduce uncertainty or validate a concrete remaining hypothesis.",
+      "Do not end the task early if meaningful work is still required; continue until you can complete the request or clearly explain the blocker.",
+      recentProgress || "",
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n\n")
   }
 
   private createPendingToolCheckpointResponse(
     conversationId: string,
     session: ChatSession,
     checkpointModel: string,
-    workspaceRootPath: string | undefined,
-    toolCallId: string,
-    toolName: string,
-    input: Record<string, unknown>
+    workspaceRootPath: string | undefined
   ): Buffer {
+    const pendingToolCalls = Array.from(session.pendingToolCalls.values()).map(
+      (toolCall) => ({
+        id: toolCall.toolCallId,
+        name: toolCall.toolName,
+        input: toolCall.toolInput,
+      })
+    )
+
     const checkpointData = {
       messageBlobIds: session.messageBlobIds,
-      pendingToolCalls: [
-        {
-          id: toolCallId,
-          name: toolName,
-          input,
-        },
-      ],
+      pendingToolCalls,
       usedTokens: session.usedTokens,
       maxTokens: this.resolveCheckpointMaxTokens(session),
       workspaceUri: workspaceRootPath
@@ -7643,6 +9176,69 @@ ${raw}
       checkpointModel,
       checkpointData
     )
+  }
+
+  private async *registerPreparedToolInvocation(
+    conversationId: string,
+    session: ChatSession,
+    streamId: string | undefined,
+    preparedTool: PreparedToolInvocation
+  ): AsyncGenerator<Buffer> {
+    const { activeToolCall } = preparedTool
+
+    if (
+      this.shouldAbortSupersededStream(
+        conversationId,
+        streamId,
+        `tool register ${activeToolCall.id}`
+      )
+    ) {
+      return
+    }
+
+    if (preparedTool.deferredToolFamily === "glob_search") {
+      this.primeGlobDeferredInputForProtocol(
+        conversationId,
+        preparedTool.protocolToolInput
+      )
+    }
+    if (preparedTool.deferredToolFamily === "todo_write") {
+      this.primeTodoWriteDeferredInputForProtocol(
+        preparedTool.protocolToolInput
+      )
+    }
+
+    await this.sessionManager.addPendingToolCall(
+      conversationId,
+      activeToolCall.id,
+      preparedTool.protocolToolName,
+      preparedTool.protocolToolInput,
+      preparedTool.protocolToolFamilyHint,
+      activeToolCall.modelCallId
+    )
+
+    const stepId = this.sessionManager.incrementStepId(conversationId)
+    yield this.grpcService.createStepStartedResponse(stepId)
+
+    if (
+      this.shouldEmitToolCallStarted(
+        preparedTool.protocolToolName,
+        preparedTool.deferredToolFamily,
+        preparedTool.canDispatchExec
+      )
+    ) {
+      yield this.grpcService.createToolCallStartedResponse(
+        activeToolCall.id,
+        preparedTool.protocolToolName,
+        preparedTool.protocolToolInput,
+        preparedTool.protocolToolFamilyHint,
+        activeToolCall.modelCallId
+      )
+      this.sessionManager.markPendingToolCallStarted(
+        conversationId,
+        activeToolCall.id
+      )
+    }
   }
 
   private *dispatchExecMessagesForTool(
@@ -7684,136 +9280,64 @@ ${raw}
     yield toolCallBuffer
   }
 
-  private async *registerAndDispatchToolInvocation(
-    params: ToolInvocationDispatchParams
+  private async *executePreparedToolInvocation(
+    conversationId: string,
+    session: ChatSession,
+    streamId: string | undefined,
+    preparedTool: PreparedToolInvocation
   ): AsyncGenerator<Buffer, ToolDispatchOutcome> {
-    const {
-      conversationId,
-      session,
-      streamId,
-      toolCall,
-      accumulatedText,
-      checkpointModel,
-      workspaceRootPath,
-    } = params
+    const { activeToolCall } = preparedTool
 
     if (
       this.shouldAbortSupersededStream(
         conversationId,
         streamId,
-        `tool dispatch ${toolCall.id}`
+        `tool dispatch ${activeToolCall.id}`
       )
     ) {
       return "completed_inline"
     }
 
-    const rawInput = this.parseToolInputJson(toolCall.inputJson)
-    const canonicalInvocation = this.canonicalizeToolInvocation(
-      toolCall.name,
-      rawInput
-    )
-    const canonicalToolName = canonicalInvocation.toolName
-    const input = canonicalInvocation.input
-
-    const deferredToolFamily =
-      this.normalizeDeferredToolFamily(canonicalToolName)
-    if (deferredToolFamily === "glob_search") {
-      this.primeGlobDeferredInputForProtocol(conversationId, input)
-    }
-    if (deferredToolFamily === "todo_write") {
-      this.primeTodoWriteDeferredInputForProtocol(input)
-    }
-    const execDispatchResolution = this.resolveExecDispatchTarget(
-      session,
-      canonicalToolName,
-      input
-    )
-    const execDispatchTarget = execDispatchResolution.target
-    const dispatchErrorMessage = execDispatchResolution.errorMessage
-    const canDispatchExec = Boolean(execDispatchTarget)
-    const protocolToolName = execDispatchTarget?.toolName || canonicalToolName
-    const protocolToolInput = execDispatchTarget?.input || input
-    const protocolToolFamilyHint = execDispatchTarget?.toolFamilyHint
-
-    await this.sessionManager.addPendingToolCall(
-      conversationId,
-      toolCall.id,
-      protocolToolName,
-      protocolToolInput,
-      protocolToolFamilyHint,
-      toolCall.modelCallId
-    )
-
-    const stepId = this.sessionManager.incrementStepId(conversationId)
-    yield this.grpcService.createStepStartedResponse(stepId)
-
-    if (this.shouldEmitToolCallStarted(deferredToolFamily, canDispatchExec)) {
-      const toolStarted = this.grpcService.createToolCallStartedResponse(
-        toolCall.id,
-        protocolToolName,
-        protocolToolInput,
-        protocolToolFamilyHint,
-        toolCall.modelCallId
-      )
-      yield toolStarted
-      this.sessionManager.markPendingToolCallStarted(
-        conversationId,
-        toolCall.id
-      )
-    }
-
-    if (!deferredToolFamily && canDispatchExec && execDispatchTarget) {
+    if (
+      !preparedTool.deferredToolFamily &&
+      preparedTool.canDispatchExec &&
+      preparedTool.execDispatchTarget
+    ) {
       yield* this.dispatchExecMessagesForTool(
         conversationId,
         session,
-        toolCall,
-        input,
-        execDispatchTarget
+        activeToolCall,
+        preparedTool.input,
+        preparedTool.execDispatchTarget
       )
-    } else if (!deferredToolFamily && !canDispatchExec) {
-      this.logger.warn(
-        dispatchErrorMessage ||
-          `Tool "${toolCall.name}" has no ExecServerMessage mapping; using inline error completion`
-      )
+      return "waiting_for_result"
     }
 
-    yield this.createPendingToolCheckpointResponse(
-      conversationId,
-      session,
-      checkpointModel,
-      workspaceRootPath,
-      toolCall.id,
-      protocolToolName,
-      input
-    )
-
-    this.appendAssistantToolUseMessage(
-      conversationId,
-      toolCall.id,
-      protocolToolName,
-      input,
-      accumulatedText
-    )
-
-    if (deferredToolFamily) {
-      const handledInline = yield* this.runDeferredToolIfNeeded(
+    if (preparedTool.deferredToolFamily) {
+      yield* this.runDeferredToolIfNeeded(
         conversationId,
-        toolCall.id,
-        protocolToolName,
-        input
+        activeToolCall.id,
+        preparedTool.protocolToolName,
+        preparedTool.protocolToolInput
       )
-      if (handledInline) {
-        return "completed_inline"
-      }
+      return this.sessionManager
+        .getPendingToolCallIds(conversationId)
+        .includes(activeToolCall.id)
+        ? "waiting_for_result"
+        : "completed_inline"
     }
 
-    if (!deferredToolFamily && !canDispatchExec) {
+    if (!preparedTool.canDispatchExec) {
       const message =
-        dispatchErrorMessage ||
-        `tool "${toolCall.name}" is not executable via ExecServerMessage`
+        preparedTool.dispatchErrorMessage ||
+        `tool "${activeToolCall.name}" is not executable via ExecServerMessage`
+      this.logger.warn(
+        preparedTool.dispatchErrorMessage ||
+          `Tool "${activeToolCall.name}" has no ExecServerMessage mapping; using inline error completion`
+      )
       yield* this.emitInlineToolResult(
         conversationId,
-        toolCall.id,
+        activeToolCall.id,
         `[tool error] ${message}`,
         { status: "error", message }
       )
@@ -7821,6 +9345,72 @@ ${raw}
     }
 
     return "waiting_for_result"
+  }
+
+  private async *dispatchPreparedToolBatch(
+    conversationId: string,
+    session: ChatSession,
+    streamId: string | undefined,
+    checkpointModel: string,
+    workspaceRootPath: string | undefined,
+    assistantBlocks: MessageContentItem[],
+    preparedTools: PreparedToolInvocation[]
+  ): AsyncGenerator<Buffer, ToolDispatchOutcome> {
+    if (preparedTools.length === 0) {
+      return "completed_inline"
+    }
+
+    for (const preparedTool of preparedTools) {
+      yield* this.registerPreparedToolInvocation(
+        conversationId,
+        session,
+        streamId,
+        preparedTool
+      )
+    }
+
+    const registeredSession =
+      this.sessionManager.getSession(conversationId) || session
+    yield this.createPendingToolCheckpointResponse(
+      conversationId,
+      registeredSession,
+      checkpointModel,
+      workspaceRootPath
+    )
+    this.persistAssistantToolBatchMessage(conversationId, assistantBlocks)
+    this.notePreparedToolBatch(
+      conversationId,
+      registeredSession,
+      assistantBlocks,
+      preparedTools
+    )
+
+    // Wire up the turn-level batch barrier: register ALL tool call IDs in the
+    // batch so that shouldDeferToolBatchContinuation() can block continuation
+    // until every tool (including inline-completed ones) has settled.
+    const batchToolCallIds = preparedTools.map((tool) => tool.activeToolCall.id)
+    const route = this.modelRouter.resolveModel(
+      registeredSession.model || checkpointModel
+    )
+    this.sessionManager.startAssistantToolBatch(
+      conversationId,
+      route.backend,
+      batchToolCallIds
+    )
+
+    for (const preparedTool of preparedTools) {
+      yield* this.executePreparedToolInvocation(
+        conversationId,
+        registeredSession,
+        streamId,
+        preparedTool
+      )
+    }
+
+    const activeSession = this.sessionManager.getSession(conversationId)
+    return activeSession && activeSession.pendingToolCalls.size > 0
+      ? "waiting_for_result"
+      : "completed_inline"
   }
 
   private *emitToolCompletedAndStep(
@@ -7833,7 +9423,10 @@ ${raw}
     extraData?: ToolCompletedExtraData,
     toolInputOverride?: Record<string, unknown>
   ): Generator<Buffer> {
-    if (!pendingToolCall.startedEmitted) {
+    const shouldSuppressStartedFallback =
+      this.shouldSuppressTodoLifecycleStarted(pendingToolCall.toolName)
+
+    if (!pendingToolCall.startedEmitted && !shouldSuppressStartedFallback) {
       this.logger.warn(
         `toolCallStarted missing before completion for ${toolCallId} (${pendingToolCall.toolName}); emitting fallback started`
       )
@@ -7845,6 +9438,8 @@ ${raw}
         pendingToolCall.modelCallId
       )
       yield startedFallback
+      pendingToolCall.startedEmitted = true
+    } else if (shouldSuppressStartedFallback) {
       pendingToolCall.startedEmitted = true
     }
 
@@ -7889,9 +9484,33 @@ ${raw}
     }
   }
 
-  private extractShellResultPayload(
-    toolResult: ParsedToolResult
-  ): { stdout: string; stderr: string; exitCode: number } | null {
+  private extractShellResultPayload(toolResult: ParsedToolResult): {
+    stdout: string
+    stderr: string
+    exitCode: number
+    outputLocation?: {
+      filePath?: string
+      sizeBytes?: bigint | number
+      lineCount?: bigint | number
+    }
+    abortReason?: number
+    localExecutionTimeMs?: number
+    interleavedOutput?: string
+    pid?: number
+    shellId?: number
+    terminalsFolder?: string
+    requestedSandboxPolicy?: { type?: unknown } | null
+    isBackground?: boolean
+    description?: string
+    classifierResult?: Record<string, unknown>
+    closeStdin?: boolean
+    fileOutputThresholdBytes?: bigint | number
+    hardTimeout?: number
+    timeoutBehavior?: number
+    msToWait?: number
+    backgroundReason?: number
+    aborted?: boolean
+  } | null {
     if (!toolResult.resultData || toolResult.resultData.length === 0) {
       return null
     }
@@ -7908,6 +9527,17 @@ ${raw}
           stdout: shellResult.value.stdout || "",
           stderr: shellResult.value.stderr || "",
           exitCode: shellResult.value.exitCode ?? 0,
+          outputLocation: shellResult.value.outputLocation,
+          interleavedOutput: shellResult.value.interleavedOutput,
+          pid: shellResult.value.pid,
+          shellId: shellResult.value.shellId,
+          localExecutionTimeMs: shellResult.value.localExecutionTimeMs,
+          msToWait: shellResult.value.msToWait,
+          backgroundReason: shellResult.value.backgroundReason,
+          requestedSandboxPolicy: execMsg.message.value.sandboxPolicy,
+          isBackground: execMsg.message.value.isBackground,
+          terminalsFolder: execMsg.message.value.terminalsFolder,
+          description: undefined,
         }
       }
       if (shellResult.case === "failure") {
@@ -7915,6 +9545,15 @@ ${raw}
           stdout: shellResult.value.stdout || "",
           stderr: shellResult.value.stderr || "",
           exitCode: shellResult.value.exitCode ?? 1,
+          outputLocation: shellResult.value.outputLocation,
+          interleavedOutput: shellResult.value.interleavedOutput,
+          abortReason: shellResult.value.abortReason,
+          localExecutionTimeMs: shellResult.value.localExecutionTimeMs,
+          aborted: shellResult.value.aborted,
+          requestedSandboxPolicy: execMsg.message.value.sandboxPolicy,
+          isBackground: execMsg.message.value.isBackground,
+          terminalsFolder: execMsg.message.value.terminalsFolder,
+          pid: execMsg.message.value.pid,
         }
       }
       if (shellResult.case === "rejected") {
@@ -7922,6 +9561,10 @@ ${raw}
           stdout: "",
           stderr: shellResult.value.reason || "",
           exitCode: 126,
+          requestedSandboxPolicy: execMsg.message.value.sandboxPolicy,
+          isBackground: execMsg.message.value.isBackground,
+          terminalsFolder: execMsg.message.value.terminalsFolder,
+          pid: execMsg.message.value.pid,
         }
       }
       if (shellResult.case === "permissionDenied") {
@@ -7929,6 +9572,10 @@ ${raw}
           stdout: "",
           stderr: shellResult.value.error || "",
           exitCode: 126,
+          requestedSandboxPolicy: execMsg.message.value.sandboxPolicy,
+          isBackground: execMsg.message.value.isBackground,
+          terminalsFolder: execMsg.message.value.terminalsFolder,
+          pid: execMsg.message.value.pid,
         }
       }
       if (shellResult.case === "spawnError") {
@@ -7936,6 +9583,10 @@ ${raw}
           stdout: "",
           stderr: shellResult.value.error || "",
           exitCode: 127,
+          requestedSandboxPolicy: execMsg.message.value.sandboxPolicy,
+          isBackground: execMsg.message.value.isBackground,
+          terminalsFolder: execMsg.message.value.terminalsFolder,
+          pid: execMsg.message.value.pid,
         }
       }
       if (shellResult.case === "timeout") {
@@ -7943,6 +9594,10 @@ ${raw}
           stdout: "",
           stderr: "",
           exitCode: 124,
+          requestedSandboxPolicy: execMsg.message.value.sandboxPolicy,
+          isBackground: execMsg.message.value.isBackground,
+          terminalsFolder: execMsg.message.value.terminalsFolder,
+          pid: execMsg.message.value.pid,
         }
       }
     } catch (error) {
@@ -8368,16 +10023,16 @@ ${raw}
             // Stale pending tool calls from a previous (now-closed) BiDi stream.
             // These tool results will NEVER arrive because the old stream is gone.
             // Clear them to avoid a permanent dead-lock where the system waits forever.
-            const clearedCount = this.sessionManager.clearStalePendingToolCalls(
-              conversationId!
+            const stalePendingIds = Array.from(
+              sessionBeforeRun.pendingToolCalls.keys()
+            )
+            const clearedCount = this.interruptPendingToolCallsForRecovery(
+              conversationId!,
+              stalePendingIds,
+              "previous bidi stream closed before tool results arrived"
             )
             this.logger.warn(
-              `Cleared ${clearedCount} stale pending tool call(s) from previous stream; proceeding with new chat turn`
-            )
-            this.sanitizeSessionToolProtocol(
-              conversationId!,
-              `Protocol repair (stale pending clear: ${conversationId!})`,
-              []
+              `Interrupted ${clearedCount} stale pending tool call(s) from previous stream; proceeding with new chat turn`
             )
           }
 
@@ -8432,10 +10087,10 @@ ${raw}
    * Handle initial chat message
    * conversationId is now guaranteed to be set by handleBidiStream
    *
-   * CRITICAL CHANGE: Real-time tool call sending
-   * - Tool calls are sent IMMEDIATELY when detected (content_block_stop)
-   * - No batching or waiting for message_stop
-   * - Text streaming continues concurrently with tool execution
+   * CCR-aligned turn handling:
+   * - Stream the full assistant turn through message_stop when possible
+   * - Accumulate the tool batch for that assistant turn before dispatch
+   * - Persist assistant tool_use history once per turn, then continue after the full batch
    */
   private async *handleChatMessage(
     conversationId: string,
@@ -8444,6 +10099,7 @@ ${raw}
   ): AsyncGenerator<Buffer> {
     // Get or create session with the provided conversationId
     let session = this.sessionManager.getOrCreateSession(conversationId, parsed)
+    this.resetTopLevelAgentTurnState(session, conversationId)
 
     // Map Cursor model name to backend model name
     const route = this.modelRouter.resolveModel(parsed.model)
@@ -8580,7 +10236,7 @@ ${raw}
     const budget = this.resolveMessageBudget(route.backend, {
       parsed,
       session,
-      contextTokens: contextMessages.length
+      protectedContextTokens: contextMessages.length
         ? this.tokenCounter.countMessages(contextMessages as UnifiedMessage[])
         : 0,
       systemPrompt,
@@ -8646,6 +10302,7 @@ ${raw}
       })
 
     const dto = buildChatDtoForRoute(route)
+    yield* this.emitPendingContextSummaryUiUpdate(conversationId)
     this.logger.debug(`Added ${apiTools.length} tool definition(s) to request`)
 
     // Call backend API (routed based on model name)
@@ -8660,301 +10317,30 @@ ${raw}
               }
             : undefined,
       })
+      const outcome = yield* this.processAssistantTurnStream({
+        conversationId,
+        session,
+        stream,
+        streamId,
+        checkpointModel: parsed.model,
+        workspaceRootPath: parsed.projectContext?.rootPath,
+        mode: "initial",
+        emitInitialHeartbeat: true,
+        emitTokenDeltas: true,
+        streamAbortContext: "initial backend stream",
+        messageStopAbortContext: "initial backend message_stop",
+      })
 
-      // Generate base modelCallId for this conversation turn
-      const modelCallBaseId = crypto.randomUUID()
-      let toolCallIndex = 0
-
-      // Track accumulated text for history
-      let accumulatedText = ""
-      let finalUsage: ContextUsageSnapshot | undefined
-
-      // Track current tool call being accumulated
-      // 使用会话级 execId（单调递增跨多轮对话）
-      let currentToolCall: ActiveToolCall | null = null
-
-      // Track edit content streaming state (for real-time edit UI)
-      let editStreamState: {
-        markerFound: boolean
-        contentStartIdx: number
-        lastSentRawLen: number
-      } | null = null
-
-      // Track thinking block state
-      let isInThinkingBlock = false
-      let thinkingStartTime = 0
-
-      yield this.grpcService.createHeartbeatResponse()
-
-      for await (const item of this.streamWithHeartbeat(stream)) {
-        if (
-          this.shouldAbortSupersededStream(
-            conversationId,
-            streamId,
-            "initial backend stream"
-          )
-        ) {
-          return
-        }
-
-        // 心跳：保持 Cursor 连接活跃
-        if (item.type === "heartbeat") {
-          yield this.grpcService.createHeartbeatResponse()
-          continue
-        }
-        const sseEvent = item.value
-
-        // Parse SSE event (format: "event: type\ndata: {...}\n\n")
-        const event = this.parseSseEvent(sseEvent)
-        if (!event) continue
-
-        // Convert backend event to Cursor protobuf format
-        if (event.type === "content_block_start") {
-          const contentBlock = event.data.content_block
-          if (
-            contentBlock?.type === "tool_use" &&
-            contentBlock.id &&
-            contentBlock.name
-          ) {
-            // Start accumulating tool call with unique modelCallId
-            const modelCallId = this.generateModelCallId(
-              modelCallBaseId,
-              toolCallIndex++
-            )
-            currentToolCall = {
-              id: contentBlock.id,
-              name: contentBlock.name,
-              inputJson: "",
-              modelCallId,
-            }
-            // Initialize edit content streaming for edit tools
-            if (this.isEditToolInvocation(currentToolCall.name)) {
-              editStreamState = {
-                markerFound: false,
-                contentStartIdx: 0,
-                lastSentRawLen: 0,
-              }
-            } else {
-              editStreamState = null
-            }
-            this.logger.debug(
-              `Tool call started: ${currentToolCall.name} (${currentToolCall.id}) modelCallId: ${modelCallId}`
-            )
-          } else if (contentBlock?.type === "thinking") {
-            // Thinking block started - track state for thinkingCompleted
-            isInThinkingBlock = true
-            thinkingStartTime = Date.now()
-            this.logger.debug("Thinking block started")
-          }
-        } else if (event.type === "content_block_delta") {
-          const delta = event.data.delta
-          if (delta?.type === "text_delta" && delta.text) {
-            // AgentService/Run: send text delta using AgentServerMessage format
-            const textResponse = this.grpcService.createAgentTextResponse(
-              delta.text
-            )
-            yield textResponse
-
-            // Accumulate text for history
-            accumulatedText += delta.text
-
-            // Send tokenDelta for Agent mode (estimate tokens from text)
-            const { estimateTokenCount } = await import("./agent-helpers")
-            const outputTokens = estimateTokenCount(delta.text)
-            if (outputTokens > 0) {
-              const tokenDelta = this.grpcService.createTokenDeltaResponse(
-                0,
-                outputTokens
-              )
-              yield tokenDelta
-            }
-          } else if (delta?.type === "input_json_delta" && currentToolCall) {
-            // Accumulate tool input JSON
-            currentToolCall.inputJson += delta.partial_json || ""
-            // Do not emit partial tool-call deltas for each JSON chunk.
-            // In Cursor plain-text fallback this creates repeated "[Tool: ...]" lines.
-
-            // Real-time edit content streaming: extract new_text field content incrementally
-            if (editStreamState && currentToolCall) {
-              const json = currentToolCall.inputJson
-              if (!editStreamState.markerFound) {
-                // Search for the content field marker in accumulated JSON
-                for (const key of [
-                  '"new_text":"',
-                  '"new_text": "',
-                  '"file_text":"',
-                  '"file_text": "',
-                ]) {
-                  const idx = json.indexOf(key)
-                  if (idx >= 0) {
-                    editStreamState.markerFound = true
-                    editStreamState.contentStartIdx = idx + key.length
-                    this.logger.debug(
-                      `Edit stream: found content marker at idx=${editStreamState.contentStartIdx}`
-                    )
-                    break
-                  }
-                }
-              }
-              if (editStreamState.markerFound) {
-                const rawContent = json.substring(
-                  editStreamState.contentStartIdx
-                )
-                // Avoid cutting in the middle of an escape sequence
-                let safeEnd = rawContent.length
-                if (rawContent.endsWith("\\")) safeEnd--
-                if (safeEnd > editStreamState.lastSentRawLen) {
-                  const newRaw = rawContent.substring(
-                    editStreamState.lastSentRawLen,
-                    safeEnd
-                  )
-                  editStreamState.lastSentRawLen = safeEnd
-                  // JSON string unescape
-                  const unescaped = newRaw
-                    .replace(/\\n/g, "\n")
-                    .replace(/\\t/g, "\t")
-                    .replace(/\\r/g, "\r")
-                    .replace(/\\\\/g, "\\")
-                    .replace(/\\"/g, '"')
-                  if (unescaped) {
-                    const toolCallDelta =
-                      this.grpcService.createToolCallDeltaResponse(
-                        currentToolCall.id,
-                        currentToolCall.name,
-                        "stream_content",
-                        unescaped,
-                        currentToolCall.modelCallId
-                      )
-                    if (toolCallDelta.length > 0) {
-                      yield toolCallDelta
-                    }
-                  }
-                }
-              }
-            }
-          } else if (delta?.type === "thinking_delta" && delta.thinking) {
-            // Send thinking delta for Agent mode
-            const thinkingDelta = this.grpcService.createThinkingDeltaResponse(
-              delta.thinking
-            )
-            yield thinkingDelta
-          }
-        } else if (event.type === "message_delta") {
-          finalUsage = this.extractUsageSnapshot(event) || finalUsage
-        } else if (event.type === "content_block_stop") {
-          // Handle thinking block end
-          if (isInThinkingBlock) {
-            const thinkingDurationMs = Date.now() - thinkingStartTime
-            this.logger.debug(
-              `Thinking block ended, duration: ${thinkingDurationMs}ms`
-            )
-            const thinkingCompleted =
-              this.grpcService.createThinkingCompletedResponse(
-                thinkingDurationMs
-              )
-            yield thinkingCompleted
-            isInThinkingBlock = false
-          }
-
-          if (currentToolCall) {
-            this.logger.log(
-              `Tool call completed: ${currentToolCall.name}, sending IMMEDIATELY and waiting for result`
-            )
-            const dispatchOutcome =
-              yield* this.registerAndDispatchToolInvocation({
-                conversationId: session.conversationId,
-                session,
-                streamId,
-                toolCall: currentToolCall,
-                accumulatedText,
-                checkpointModel: parsed.model,
-                workspaceRootPath: parsed.projectContext?.rootPath,
-              })
-            if (dispatchOutcome === "waiting_for_result") {
-              this.logger.log(`Waiting for tool result: ${currentToolCall.id}`)
-            }
-            return
-          }
-        } else if (event.type === "message_stop") {
-          if (
-            this.shouldAbortSupersededStream(
-              conversationId,
-              streamId,
-              "initial backend message_stop"
-            )
-          ) {
-            return
-          }
-
-          // No tool calls - message complete
-          // Agent mode: text was already sent in real-time, just send turn_ended signal
-          // CRITICAL: Agent mode requires turn_ended signal to complete
-          this.logger.log("Agent mode: sending turn_ended signal")
-
-          // CRITICAL: Add text-only message to history
-          let assistantRecordId: string | undefined
-          if (accumulatedText) {
-            assistantRecordId = this.sessionManager.addMessage(
-              session.conversationId,
-              "assistant",
-              accumulatedText
-            )
-            this.logger.log(
-              `Added text message to history (${accumulatedText.length} chars)`
-            )
-          }
-          if (assistantRecordId && finalUsage) {
-            this.commitAssistantUsageLedger(
-              session,
-              assistantRecordId,
-              finalUsage,
-              accumulatedText
-            )
-          }
-
-          const completedSession = this.recordCompletedTurnIfNeeded(
-            session,
-            !!assistantRecordId,
-            `message_stop: ${conversationId}`
-          )
-
-          // CRITICAL: Send conversationCheckpointUpdate before turn_ended
-          // This is required for multi-turn conversations to work properly
-
-          const checkpoint =
-            this.grpcService.createConversationCheckpointResponse(
-              completedSession.conversationId,
-              completedSession.model,
-              {
-                messageBlobIds: completedSession.messageBlobIds,
-                usedTokens: completedSession.usedTokens || 0,
-                maxTokens: this.resolveCheckpointMaxTokens(completedSession),
-                workspaceUri: completedSession.projectContext?.rootPath
-                  ? `file://${completedSession.projectContext.rootPath}`
-                  : undefined,
-                readPaths: Array.from(completedSession.readPaths),
-                fileStates: Object.fromEntries(completedSession.fileStates),
-                turns: completedSession.turns,
-                todos: completedSession.todos,
-              }
-            )
-          yield checkpoint
-          this.logger.log("Sent conversationCheckpointUpdate")
-
-          const serverHeartbeat =
-            this.grpcService.createServerHeartbeatResponse()
-          yield serverHeartbeat
-          const turnEnded = this.grpcService.createAgentTurnEndedResponse()
-          yield turnEnded
-
-          // After sending turn_ended, return from handleChatMessage
-          // The handleBidiStream will check for pending tool calls and end the stream
-          // Cursor expects each turn to be a separate BiDi stream request
-          this.logger.log(
-            "Turn ended, returning to handleBidiStream to close stream"
-          )
-          return
-        }
+      if (outcome.kind === "partial_without_message_stop") {
+        this.logger.warn(
+          `Initial backend stream exited without message_stop after ${outcome.accumulatedText.length} chars; finalizing defensively`
+        )
+        yield* this.finalizeInitialAssistantTurn(
+          session,
+          conversationId,
+          outcome.accumulatedText,
+          outcome.finalUsage
+        )
       }
     } catch (error) {
       if (error instanceof UpstreamRequestAbortedError) {
@@ -9205,14 +10591,20 @@ ${raw}
       this.sessionManager.initShellStream(conversationId, toolCallId)
     }
 
-    // Handle start event
+    // Handle start event — emit ShellOutputDeltaUpdate so Cursor UI expands the shell panel
     if (eventCase === "start") {
       this.logger.debug(`Shell stream start for ${toolCallId}`)
       this.sessionManager.markShellStarted(conversationId, toolCallId)
+      const startEvent = shellStream.event.value as {
+        sandboxPolicy?: { type?: unknown } | null
+      }
+      yield this.grpcService.createShellOutputStartResponse(
+        startEvent?.sandboxPolicy
+      )
       return
     }
 
-    // Handle stdout event - send real-time update
+    // Handle stdout event - send real-time update via ShellOutputDeltaUpdate
     if (eventCase === "stdout") {
       const stdoutEvent = shellStream.event.value as
         | { data?: string }
@@ -9223,17 +10615,12 @@ ${raw}
           `Shell stream stdout for ${toolCallId}: ${data.length} chars`
         )
         this.sessionManager.appendShellStdout(conversationId, toolCallId, data)
-        yield* this.emitShellToolDelta(
-          toolCallId,
-          activePendingToolCall,
-          "stdout",
-          data
-        )
+        yield this.grpcService.createShellOutputStdoutResponse(data)
       }
       return
     }
 
-    // Handle stderr event - send real-time update
+    // Handle stderr event - send real-time update via ShellOutputDeltaUpdate
     if (eventCase === "stderr") {
       const stderrEvent = shellStream.event.value as
         | { data?: string }
@@ -9244,12 +10631,7 @@ ${raw}
           `Shell stream stderr for ${toolCallId}: ${data.length} chars`
         )
         this.sessionManager.appendShellStderr(conversationId, toolCallId, data)
-        yield* this.emitShellToolDelta(
-          toolCallId,
-          activePendingToolCall,
-          "stderr",
-          data
-        )
+        yield this.grpcService.createShellOutputStderrResponse(data)
       }
       return
     }
@@ -9277,12 +10659,7 @@ ${raw}
         toolCallId,
         denialMessage
       )
-      yield* this.emitShellToolDelta(
-        toolCallId,
-        activePendingToolCall,
-        "stderr",
-        denialMessage
-      )
+      yield this.grpcService.createShellOutputStderrResponse(denialMessage)
 
       // Cursor may not send an explicit exit after rejection. Synthesize one so
       // pending shell tool calls can be completed deterministically.
@@ -9319,6 +10696,22 @@ ${raw}
       this.logger.log(
         `Shell stream exit for ${toolCallId}: code=${exitCode}, signal=${signal}, cwd=${exitCwd}, aborted=${exitAborted}`
       )
+
+      // Emit ShellOutputDeltaUpdate exit event to UI
+      yield this.grpcService.createShellOutputExitResponse(
+        exitCode,
+        exitAborted,
+        exitCwd,
+        shellStream.event.case === "exit"
+          ? {
+              outputLocation: shellStream.event.value.outputLocation,
+              abortReason: shellStream.event.value.abortReason,
+              localExecutionTimeMs:
+                shellStream.event.value.localExecutionTimeMs,
+            }
+          : undefined
+      )
+
       this.sessionManager.setShellExit(
         conversationId,
         toolCallId,
@@ -9410,6 +10803,7 @@ ${raw}
 
       if (
         this.shouldDeferToolBatchContinuation(
+          conversationId,
           route.backend,
           remainingPendingToolUseIds
         )
@@ -9482,17 +10876,7 @@ ${raw}
         })
 
       const dto = buildShellContinuationDtoForRoute(route)
-
-      let accumulatedText = ""
-      const continuationModelCallBaseId = crypto.randomUUID()
-      let continuationToolCallIndex = 0
-      // 使用会话级 session.execId（已在 handleChatMessage 中初始化）
-
-      // Track thinking block state
-      let isInThinkingBlock = false
-      let thinkingStartTime = 0
-
-      let currentToolCall: ActiveToolCall | null = null
+      yield* this.emitPendingContextSummaryUiUpdate(conversationId)
 
       try {
         const stream = this.getBackendStream(dto, {
@@ -9504,145 +10888,30 @@ ${raw}
               }
             : undefined,
         })
-        let finalUsage: ContextUsageSnapshot | undefined
+        const outcome = yield* this.processAssistantTurnStream({
+          conversationId,
+          session: activeSession,
+          stream,
+          streamId: pendingToolCall.streamId,
+          checkpointModel: activeSession.model,
+          workspaceRootPath: activeSession.projectContext?.rootPath,
+          mode: "continuation",
+          emitInitialHeartbeat: false,
+          emitTokenDeltas: false,
+          streamAbortContext: "shell continuation stream",
+          messageStopAbortContext: "shell continuation message_stop",
+        })
 
-        for await (const sseEvent of stream) {
-          if (
-            this.shouldAbortSupersededStream(
-              conversationId,
-              pendingToolCall.streamId,
-              "shell continuation stream"
-            )
-          ) {
-            return
-          }
-
-          const event = this.parseSseEvent(sseEvent)
-          if (!event) continue
-
-          if (event.type === "content_block_start") {
-            const contentBlock = event.data.content_block
-            if (
-              contentBlock?.type === "tool_use" &&
-              contentBlock.id &&
-              contentBlock.name
-            ) {
-              const modelCallId = this.generateModelCallId(
-                continuationModelCallBaseId,
-                continuationToolCallIndex++
-              )
-              currentToolCall = {
-                id: contentBlock.id,
-                name: contentBlock.name,
-                inputJson: "",
-                modelCallId,
-              }
-            } else if (contentBlock?.type === "thinking") {
-              // Thinking block started
-              isInThinkingBlock = true
-              thinkingStartTime = Date.now()
-            }
-          } else if (event.type === "content_block_delta") {
-            const delta = event.data.delta
-            if (delta?.type === "text_delta" && delta.text) {
-              const textResponse = this.grpcService.createAgentTextResponse(
-                delta.text
-              )
-              yield textResponse
-              accumulatedText += delta.text
-            } else if (delta?.type === "input_json_delta" && currentToolCall) {
-              currentToolCall.inputJson += delta.partial_json || ""
-              // Suppress per-chunk partial tool deltas to avoid duplicated tool
-              // markers in plain-text fallback UI.
-            } else if (delta?.type === "thinking_delta" && delta.thinking) {
-              // Send thinking delta
-              yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
-            }
-          } else if (event.type === "message_delta") {
-            finalUsage = this.extractUsageSnapshot(event) || finalUsage
-          } else if (event.type === "content_block_stop") {
-            // Handle thinking block end
-            if (isInThinkingBlock) {
-              const thinkingDurationMs = Date.now() - thinkingStartTime
-              yield this.grpcService.createThinkingCompletedResponse(
-                thinkingDurationMs
-              )
-              isInThinkingBlock = false
-            }
-            if (currentToolCall) {
-              const dispatchOutcome =
-                yield* this.registerAndDispatchToolInvocation({
-                  conversationId,
-                  session,
-                  streamId: pendingToolCall.streamId,
-                  toolCall: currentToolCall,
-                  accumulatedText,
-                  checkpointModel: session.model,
-                  workspaceRootPath: session.projectContext?.rootPath,
-                })
-              if (dispatchOutcome === "waiting_for_result") {
-                this.logger.log(
-                  `Waiting for tool result: ${currentToolCall.id}`
-                )
-              }
-              return
-            }
-          } else if (event.type === "message_stop") {
-            if (
-              this.shouldAbortSupersededStream(
-                conversationId,
-                pendingToolCall.streamId,
-                "shell continuation message_stop"
-              )
-            ) {
-              return
-            }
-
-            // AI finished without more tool calls
-            let assistantRecordId: string | undefined
-            if (accumulatedText) {
-              assistantRecordId = this.sessionManager.addMessage(
-                session.conversationId,
-                "assistant",
-                accumulatedText
-              )
-            }
-            if (assistantRecordId && finalUsage) {
-              this.commitAssistantUsageLedger(
-                session,
-                assistantRecordId,
-                finalUsage,
-                accumulatedText
-              )
-            }
-
-            // Send turn completion messages（与 handleChatMessage 一致：先 checkpoint 再 turnEnded）
-            const checkpointData = {
-              messageBlobIds: session.messageBlobIds,
-              usedTokens: session.usedTokens,
-              maxTokens: this.resolveCheckpointMaxTokens(session),
-              workspaceUri: session.projectContext?.rootPath
-                ? `file://${session.projectContext.rootPath}`
-                : undefined,
-              readPaths: Array.from(session.readPaths),
-              fileStates: Object.fromEntries(session.fileStates),
-              turns: session.turns,
-              todos: session.todos,
-            }
-
-            const checkpoint =
-              this.grpcService.createConversationCheckpointResponse(
-                session.conversationId,
-                session.model,
-                checkpointData
-              )
-            yield checkpoint
-
-            const heartbeat = this.grpcService.createServerHeartbeatResponse()
-            yield heartbeat
-            const turnEnded = this.grpcService.createAgentTurnEndedResponse()
-            yield turnEnded
-          }
+        if (outcome.kind === "partial_without_message_stop") {
+          this.logger.warn(
+            `Shell continuation stream exited without message_stop after ${outcome.accumulatedText.length} chars; finalizing defensively`
+          )
+          yield* this.finalizeAssistantContinuationTurn(
+            activeSession,
+            conversationId,
+            outcome.accumulatedText || undefined,
+            outcome.finalUsage
+          )
         }
       } catch (error) {
         if (error instanceof UpstreamRequestAbortedError) {
@@ -9907,20 +11176,20 @@ ${raw}
     const heartbeat = this.grpcService.createHeartbeatResponse()
     yield heartbeat
 
-    // For run_terminal_command, stream incremental output through ToolCallDelta.
+    // For run_terminal_command, stream shell output via ShellOutputDeltaUpdate.
     // Started/completed updates already cover lifecycle boundaries.
     if (
       pendingToolCall.toolName === "run_terminal_command" ||
       pendingToolCall.toolName === "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2"
     ) {
+      // Emit start event so Cursor UI expands the shell panel
+      yield this.grpcService.createShellOutputStartResponse()
+
       if (parsedShellResult?.stdout) {
         this.logger.debug(
           `Agent mode: sending shell stdout delta (${parsedShellResult.stdout.length} chars)`
         )
-        yield* this.emitShellToolDelta(
-          toolCallId,
-          pendingToolCall,
-          "stdout",
+        yield this.grpcService.createShellOutputStdoutResponse(
           parsedShellResult.stdout
         )
       }
@@ -9929,10 +11198,7 @@ ${raw}
         this.logger.debug(
           `Agent mode: sending shell stderr delta (${parsedShellResult.stderr.length} chars)`
         )
-        yield* this.emitShellToolDelta(
-          toolCallId,
-          pendingToolCall,
-          "stderr",
+        yield this.grpcService.createShellOutputStderrResponse(
           parsedShellResult.stderr
         )
       }
@@ -9945,13 +11211,22 @@ ${raw}
         this.logger.debug(
           `Agent mode: sending fallback shell stdout delta (${toolResultContent.length} chars)`
         )
-        yield* this.emitShellToolDelta(
-          toolCallId,
-          pendingToolCall,
-          "stdout",
+        yield this.grpcService.createShellOutputStdoutResponse(
           toolResultContent
         )
       }
+
+      // Emit exit event
+      yield this.grpcService.createShellOutputExitResponse(
+        parsedShellResult?.exitCode ?? 0,
+        Boolean(parsedShellResult?.aborted),
+        "",
+        {
+          outputLocation: parsedShellResult?.outputLocation,
+          abortReason: parsedShellResult?.abortReason,
+          localExecutionTimeMs: parsedShellResult?.localExecutionTimeMs,
+        }
+      )
     } else if (this.isEditToolInvocation(pendingToolCall.toolName)) {
       // For edit tools, avoid replaying the full replacement text as a live delta.
       // Cursor can render this as a brand-new unnamed buffer / full-file rewrite.
@@ -9979,6 +11254,12 @@ ${raw}
       extraData = {
         ...(extraData || {}),
         askQuestionResult: toolResult.inlineProjection.askQuestionResult,
+      }
+    }
+    if (toolResult.inlineProjection?.taskSuccess) {
+      extraData = {
+        ...(extraData || {}),
+        taskSuccess: toolResult.inlineProjection.taskSuccess,
       }
     }
 
@@ -10029,6 +11310,11 @@ ${raw}
             ...(extraData || {}),
             beforeContent,
             afterContent,
+            editSuccess: this.buildEditSuccessExtraData(
+              filePath,
+              beforeContent,
+              afterContent
+            ),
           }
           this.logger.debug(
             `Prepared edit diff data: ${resolvedFilePath} (before=${beforeContent.length}, after=${afterContent.length} bytes)`
@@ -10080,6 +11366,25 @@ ${raw}
             stdout: parsedShellResult.stdout || toolResultContent,
             stderr: parsedShellResult.stderr,
             exitCode: parsedShellResult.exitCode,
+            outputLocation: parsedShellResult.outputLocation,
+            abortReason: parsedShellResult.abortReason,
+            localExecutionTimeMs: parsedShellResult.localExecutionTimeMs,
+            interleavedOutput: parsedShellResult.interleavedOutput,
+            pid: parsedShellResult.pid,
+            shellId: parsedShellResult.shellId,
+            terminalsFolder: parsedShellResult.terminalsFolder,
+            requestedSandboxPolicy: parsedShellResult.requestedSandboxPolicy,
+            isBackground: parsedShellResult.isBackground,
+            description: parsedShellResult.description,
+            classifierResult: parsedShellResult.classifierResult,
+            closeStdin: parsedShellResult.closeStdin,
+            fileOutputThresholdBytes:
+              parsedShellResult.fileOutputThresholdBytes,
+            hardTimeout: parsedShellResult.hardTimeout,
+            timeoutBehavior: parsedShellResult.timeoutBehavior,
+            msToWait: parsedShellResult.msToWait,
+            backgroundReason: parsedShellResult.backgroundReason,
+            aborted: parsedShellResult.aborted,
           },
         }
       }
@@ -10382,6 +11687,18 @@ ${raw}
       historyToolResultContent
     )
 
+    const completedBatchSummary = this.recordCompletedToolResultInTopLevelState(
+      conversationId,
+      session,
+      toolCallId,
+      historyToolResultContent
+    )
+    if (completedBatchSummary) {
+      this.logger.debug(
+        `Recorded internal tool-batch summary for working memory: ${completedBatchSummary.label}`
+      )
+    }
+
     if (options.continueGeneration === false) {
       this.logger.log(
         `Tool result finalized without AI continuation: ${toolCallId}`
@@ -10414,6 +11731,7 @@ ${raw}
 
       if (
         this.shouldDeferToolBatchContinuation(
+          conversationId,
           route.backend,
           remainingPendingToolUseIds
         )
@@ -10429,6 +11747,20 @@ ${raw}
           session,
           `tool continuation bootstrap: ${conversationId}`
         )
+
+      const topLevelTurnState = this.getTopLevelAgentTurnState(
+        activeSession,
+        conversationId
+      )
+      topLevelTurnState.llmTurnCount += 1
+      const adviseSynthesis =
+        this.shouldAdviseTopLevelReadOnlySynthesis(activeSession)
+      if (adviseSynthesis) {
+        this.logger.warn(
+          `Top-level agent turn exceeded read-only investigation budget (${topLevelTurnState.readOnlyBatchCount} batches); preferring synthesis while keeping tools available`
+        )
+      }
+      this.sessionManager.markSessionDirty(conversationId)
 
       const toolsForContinuation = activeSession.supportedTools || []
       if (toolsForContinuation.length === 0) {
@@ -10458,6 +11790,16 @@ ${raw}
       activeSession =
         this.sessionManager.getSession(conversationId) || activeSession
 
+      const summaryMemoryPrompt =
+        this.buildTopLevelSummaryMemoryPrompt(activeSession)
+      const synthesisAdvisoryPrompt = adviseSynthesis
+        ? this.buildReadOnlySynthesisAdvisoryPrompt(activeSession)
+        : undefined
+      const additionalSystemPrompt =
+        [summaryMemoryPrompt, synthesisAdvisoryPrompt]
+          .filter((prompt): prompt is string => typeof prompt === "string")
+          .join("\n\n") || undefined
+
       const buildContinuationDtoForRoute = (streamRoute: ModelRouteResult) =>
         this.buildStreamingDtoForRoute(streamRoute, {
           model: activeSession.model,
@@ -10465,6 +11807,8 @@ ${raw}
           conversationId,
           session: activeSession,
           toolDefinitions: continuationTools,
+          additionalSystemPrompt,
+          disableTools: false,
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
           buildMessages: (routeBudget) =>
@@ -10484,6 +11828,7 @@ ${raw}
         })
 
       const dto = buildContinuationDtoForRoute(route)
+      yield* this.emitPendingContextSummaryUiUpdate(conversationId)
 
       // Stream the continuation - may include more tool calls (routed based on model)
       const stream = this.getBackendStream(dto, {
@@ -10495,248 +11840,21 @@ ${raw}
             }
           : undefined,
       })
+      const outcome = yield* this.processAssistantTurnStream({
+        conversationId,
+        session: activeSession,
+        stream,
+        streamId: options.streamId,
+        checkpointModel: activeSession.model,
+        workspaceRootPath: activeSession.projectContext?.rootPath,
+        mode: "continuation",
+        emitInitialHeartbeat: true,
+        emitTokenDeltas: true,
+        streamAbortContext: "tool continuation stream",
+        messageStopAbortContext: "tool continuation message_stop",
+      })
 
-      // Generate base modelCallId for continuation tool calls
-      const continuationModelCallBaseId = crypto.randomUUID()
-      let continuationToolCallIndex = 0
-
-      // Track accumulated text for history
-      let accumulatedText = ""
-      let finalUsage: ContextUsageSnapshot | undefined
-
-      // Track thinking block state
-      let isInThinkingBlock = false
-      let thinkingStartTime = 0
-
-      // Track edit content streaming state (for real-time edit UI)
-      let editStreamState: {
-        markerFound: boolean
-        contentStartIdx: number
-        lastSentRawLen: number
-      } | null = null
-
-      // Track tool calls for registration (same as handleChatMessage)
-      // 使用会话级 session.execId
-      let currentToolCall: ActiveToolCall | null = null
-
-      yield this.grpcService.createHeartbeatResponse()
-
-      for await (const item of this.streamWithHeartbeat(stream)) {
-        if (
-          this.shouldAbortSupersededStream(
-            conversationId,
-            options.streamId,
-            "tool continuation stream"
-          )
-        ) {
-          return
-        }
-
-        // 心跳：保持 Cursor 连接活跃
-        if (item.type === "heartbeat") {
-          yield this.grpcService.createHeartbeatResponse()
-          continue
-        }
-
-        const sseEvent = item.value
-
-        const event = this.parseSseEvent(sseEvent)
-        if (!event) continue
-
-        if (event.type === "content_block_start") {
-          const contentBlock = event.data.content_block
-          if (
-            contentBlock?.type === "tool_use" &&
-            contentBlock.id &&
-            contentBlock.name
-          ) {
-            const modelCallId = this.generateModelCallId(
-              continuationModelCallBaseId,
-              continuationToolCallIndex++
-            )
-            currentToolCall = {
-              id: contentBlock.id,
-              name: contentBlock.name,
-              inputJson: "",
-              modelCallId,
-            }
-            // Initialize edit content streaming for edit tools
-            if (this.isEditToolInvocation(currentToolCall.name)) {
-              editStreamState = {
-                markerFound: false,
-                contentStartIdx: 0,
-                lastSentRawLen: 0,
-              }
-            } else {
-              editStreamState = null
-            }
-            this.logger.debug(
-              `Tool call started: ${currentToolCall.name} (${currentToolCall.id}) modelCallId: ${modelCallId}`
-            )
-          } else if (contentBlock?.type === "thinking") {
-            // Thinking block started
-            isInThinkingBlock = true
-            thinkingStartTime = Date.now()
-          }
-        } else if (event.type === "content_block_delta") {
-          const delta = event.data.delta
-          if (delta?.type === "text_delta" && delta.text) {
-            // Agent mode: send text delta immediately for real-time streaming
-            const textResponse = this.grpcService.createAgentTextResponse(
-              delta.text
-            )
-            yield textResponse
-
-            // Accumulate text
-            accumulatedText += delta.text
-
-            // Send tokenDelta (match handleChatMessage flow)
-            const { estimateTokenCount } = await import("./agent-helpers")
-            const outputTokens = estimateTokenCount(delta.text)
-            if (outputTokens > 0) {
-              const tokenDelta = this.grpcService.createTokenDeltaResponse(
-                0,
-                outputTokens
-              )
-              yield tokenDelta
-            }
-          } else if (delta?.type === "input_json_delta" && currentToolCall) {
-            currentToolCall.inputJson += delta.partial_json || ""
-            // Do not emit per-chunk partial tool deltas. Cursor plain-text
-            // fallback can render each delta as duplicated tool text.
-
-            // Real-time edit content streaming: extract new_text field content incrementally
-            if (editStreamState && currentToolCall) {
-              const json = currentToolCall.inputJson
-              if (!editStreamState.markerFound) {
-                for (const key of [
-                  '"new_text":"',
-                  '"new_text": "',
-                  '"file_text":"',
-                  '"file_text": "',
-                ]) {
-                  const idx = json.indexOf(key)
-                  if (idx >= 0) {
-                    editStreamState.markerFound = true
-                    editStreamState.contentStartIdx = idx + key.length
-                    this.logger.debug(
-                      `Edit stream (continuation): found content marker at idx=${editStreamState.contentStartIdx}`
-                    )
-                    break
-                  }
-                }
-              }
-              if (editStreamState.markerFound) {
-                const rawContent = json.substring(
-                  editStreamState.contentStartIdx
-                )
-                let safeEnd = rawContent.length
-                if (rawContent.endsWith("\\")) safeEnd--
-                if (safeEnd > editStreamState.lastSentRawLen) {
-                  const newRaw = rawContent.substring(
-                    editStreamState.lastSentRawLen,
-                    safeEnd
-                  )
-                  editStreamState.lastSentRawLen = safeEnd
-                  const unescaped = newRaw
-                    .replace(/\\n/g, "\n")
-                    .replace(/\\t/g, "\t")
-                    .replace(/\\r/g, "\r")
-                    .replace(/\\\\/g, "\\")
-                    .replace(/\\"/g, '"')
-                  if (unescaped) {
-                    const toolCallDelta =
-                      this.grpcService.createToolCallDeltaResponse(
-                        currentToolCall.id,
-                        currentToolCall.name,
-                        "stream_content",
-                        unescaped,
-                        currentToolCall.modelCallId
-                      )
-                    if (toolCallDelta.length > 0) {
-                      yield toolCallDelta
-                    }
-                  }
-                }
-              }
-            }
-          } else if (delta?.type === "thinking_delta" && delta.thinking) {
-            // Send thinking delta
-            yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
-          }
-        } else if (event.type === "message_delta") {
-          finalUsage = this.extractUsageSnapshot(event) || finalUsage
-        } else if (event.type === "content_block_stop") {
-          // Handle thinking block end
-          if (isInThinkingBlock) {
-            const thinkingDurationMs = Date.now() - thinkingStartTime
-            yield this.grpcService.createThinkingCompletedResponse(
-              thinkingDurationMs
-            )
-            isInThinkingBlock = false
-          }
-          if (currentToolCall) {
-            this.logger.log(
-              `Tool call completed: ${currentToolCall.name}, sending IMMEDIATELY and waiting for result`
-            )
-            const dispatchOutcome =
-              yield* this.registerAndDispatchToolInvocation({
-                conversationId,
-                session,
-                streamId: options.streamId,
-                toolCall: currentToolCall,
-                accumulatedText,
-                checkpointModel: session.model,
-                workspaceRootPath: session.projectContext?.rootPath,
-              })
-            if (dispatchOutcome === "waiting_for_result") {
-              this.logger.log(`Waiting for tool result: ${currentToolCall.id}`)
-            }
-            return
-          }
-        } else if (event.type === "message_stop") {
-          if (
-            this.shouldAbortSupersededStream(
-              conversationId,
-              options.streamId,
-              "tool continuation message_stop"
-            )
-          ) {
-            return
-          }
-
-          // No tool calls - conversation complete
-          // Agent mode: send turn_ended signal (text was already sent in real-time)
-          this.logger.log(
-            "Agent mode: no more tool calls, sending turn_ended signal"
-          )
-
-          yield* this.finalizeAssistantContinuationTurn(
-            session,
-            conversationId,
-            accumulatedText || undefined,
-            finalUsage
-          )
-          this.logger.log("Sent conversationCheckpointUpdate (continuation)")
-          return
-        }
-      }
-
-      // ─── Empty stream detection & retry ───────────────────────────────
-      // If we reach here, the for-await loop exited without hitting
-      // message_stop or dispatching a tool call. This means the backend
-      // returned an empty stream (0 blocks, no text, no tool calls).
-      // This is abnormal — a well-behaved AI should always produce output.
-      //
-      // Protocol requirement: Cursor expects every turn to end with either
-      // a tool dispatch (waiting_for_result) or a turn_ended signal with
-      // text content. An empty stream exit violates this contract and
-      // causes Cursor to open a new chat window via resumeAction.
-      //
-      // Strategy: retry the continuation request once. If still empty,
-      // emit a fallback text response to maintain protocol integrity.
-
-      if (!accumulatedText && !currentToolCall) {
+      if (outcome.kind === "empty") {
         this.logger.warn(
           `[Empty Stream] Continuation returned empty response for ${conversationId}; retrying once`
         )
@@ -10752,157 +11870,34 @@ ${raw}
                 }
               : undefined,
           })
-          let retryAccumulatedText = ""
-          let retryHasToolCall = false
-          let retryUsage: ContextUsageSnapshot | undefined
-          const retryModelCallBaseId = crypto.randomUUID()
-          let retryToolCallIndex = 0
-          let retryCurrentToolCall: ActiveToolCall | null = null
-          let retryIsInThinkingBlock = false
-          let retryThinkingStartTime = 0
+          const retryOutcome = yield* this.processAssistantTurnStream({
+            conversationId,
+            session: activeSession,
+            stream: retryStream,
+            streamId: options.streamId,
+            checkpointModel: activeSession.model,
+            workspaceRootPath: activeSession.projectContext?.rootPath,
+            mode: "continuation",
+            emitInitialHeartbeat: false,
+            emitTokenDeltas: true,
+            streamAbortContext: "tool continuation retry stream",
+            messageStopAbortContext: "tool continuation retry message_stop",
+          })
 
-          for await (const retryItem of this.streamWithHeartbeat(retryStream)) {
-            if (
-              this.shouldAbortSupersededStream(
-                conversationId,
-                options.streamId,
-                "tool continuation retry stream"
-              )
-            ) {
-              return
-            }
-
-            if (retryItem.type === "heartbeat") {
-              yield this.grpcService.createHeartbeatResponse()
-              continue
-            }
-
-            const retrySseEvent = retryItem.value
-            const retryEvent = this.parseSseEvent(retrySseEvent)
-            if (!retryEvent) continue
-
-            if (retryEvent.type === "content_block_start") {
-              const contentBlock = retryEvent.data.content_block
-              if (
-                contentBlock?.type === "tool_use" &&
-                contentBlock.id &&
-                contentBlock.name
-              ) {
-                const modelCallId = this.generateModelCallId(
-                  retryModelCallBaseId,
-                  retryToolCallIndex++
-                )
-                retryCurrentToolCall = {
-                  id: contentBlock.id,
-                  name: contentBlock.name,
-                  inputJson: "",
-                  modelCallId,
-                }
-                retryHasToolCall = true
-              } else if (contentBlock?.type === "thinking") {
-                retryIsInThinkingBlock = true
-                retryThinkingStartTime = Date.now()
-              }
-            } else if (retryEvent.type === "content_block_delta") {
-              const delta = retryEvent.data.delta
-              if (delta?.type === "text_delta" && delta.text) {
-                const textResponse = this.grpcService.createAgentTextResponse(
-                  delta.text
-                )
-                yield textResponse
-                retryAccumulatedText += delta.text
-
-                const { estimateTokenCount } = await import("./agent-helpers")
-                const outputTokens = estimateTokenCount(delta.text)
-                if (outputTokens > 0) {
-                  yield this.grpcService.createTokenDeltaResponse(
-                    0,
-                    outputTokens
-                  )
-                }
-              } else if (
-                delta?.type === "input_json_delta" &&
-                retryCurrentToolCall
-              ) {
-                retryCurrentToolCall.inputJson += delta.partial_json || ""
-              } else if (delta?.type === "thinking_delta" && delta.thinking) {
-                yield this.grpcService.createThinkingDeltaResponse(
-                  delta.thinking
-                )
-              }
-            } else if (retryEvent.type === "message_delta") {
-              retryUsage = this.extractUsageSnapshot(retryEvent) || retryUsage
-            } else if (retryEvent.type === "content_block_stop") {
-              if (retryIsInThinkingBlock) {
-                const thinkingDurationMs = Date.now() - retryThinkingStartTime
-                yield this.grpcService.createThinkingCompletedResponse(
-                  thinkingDurationMs
-                )
-                retryIsInThinkingBlock = false
-              }
-              if (retryCurrentToolCall) {
-                this.logger.log(
-                  `[Retry] Tool call completed: ${retryCurrentToolCall.name}, dispatching`
-                )
-                const dispatchOutcome =
-                  yield* this.registerAndDispatchToolInvocation({
-                    conversationId,
-                    session,
-                    streamId: options.streamId,
-                    toolCall: retryCurrentToolCall,
-                    accumulatedText: retryAccumulatedText,
-                    checkpointModel: session.model,
-                    workspaceRootPath: session.projectContext?.rootPath,
-                  })
-                if (dispatchOutcome === "waiting_for_result") {
-                  this.logger.log(
-                    `[Retry] Waiting for tool result: ${retryCurrentToolCall.id}`
-                  )
-                }
-                return
-              }
-            } else if (retryEvent.type === "message_stop") {
-              if (
-                this.shouldAbortSupersededStream(
-                  conversationId,
-                  options.streamId,
-                  "tool continuation retry message_stop"
-                )
-              ) {
-                return
-              }
-
-              this.logger.log(
-                "[Retry] message_stop received, ending continuation"
-              )
-              yield* this.finalizeAssistantContinuationTurn(
-                session,
-                conversationId,
-                retryAccumulatedText || undefined,
-                retryUsage
-              )
-              return
-            }
-          }
-
-          // Retry also produced output — check if it was meaningful
-          if (retryAccumulatedText || retryHasToolCall) {
-            if (retryHasToolCall) {
-              this.logger.warn(
-                `[Retry] Stream exited after tool-call output without message_stop for ${conversationId}; awaiting tool result path`
-              )
-              return
-            }
-
+          if (retryOutcome.kind === "partial_without_message_stop") {
             this.logger.warn(
               `[Retry] Stream exited after text output without message_stop for ${conversationId}; finalizing turn defensively`
             )
             yield* this.finalizeAssistantContinuationTurn(
-              session,
+              activeSession,
               conversationId,
-              retryAccumulatedText || undefined,
-              retryUsage
+              retryOutcome.accumulatedText || undefined,
+              retryOutcome.finalUsage
             )
+            return
+          }
+
+          if (retryOutcome.kind !== "empty") {
             return
           }
         } catch (retryError) {
@@ -10936,6 +11931,21 @@ ${raw}
         )
         return
       }
+
+      if (outcome.kind === "partial_without_message_stop") {
+        this.logger.warn(
+          `Continuation stream exited after text output without message_stop for ${conversationId}; finalizing turn defensively`
+        )
+        yield* this.finalizeAssistantContinuationTurn(
+          activeSession,
+          conversationId,
+          outcome.accumulatedText || undefined,
+          outcome.finalUsage
+        )
+        return
+      }
+
+      return
     } catch (error) {
       if (error instanceof UpstreamRequestAbortedError) {
         this.logger.log(
@@ -11987,6 +12997,92 @@ ${raw}
     return parts.join("\n\n")
   }
 
+  private normalizeMessageContentToText(content: MessageContent): string {
+    if (typeof content === "string") return content
+    if (!Array.isArray(content)) return ""
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item
+        if (!item || typeof item !== "object") return ""
+        const record = item as Record<string, unknown>
+        if (typeof record.text === "string") return record.text
+        if (typeof record.thinking === "string") return record.thinking
+        return ""
+      })
+      .filter((text) => text.trim().length > 0)
+      .join("\n")
+  }
+
+  private buildGoogleOfficialMessages(
+    contextMessages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+    }>,
+    historyMessages: CreateMessageDto["messages"]
+  ): CreateMessageDto["messages"] {
+    const passthroughHistory: CreateMessageDto["messages"] = []
+    const latestUserTexts: string[] = []
+
+    for (const message of historyMessages || []) {
+      if (!message || typeof message !== "object") continue
+      if (message.role === "user") {
+        const text = this.normalizeMessageContentToText(
+          message.content as MessageContent
+        )
+        if (text.trim()) latestUserTexts.push(text.trim())
+      } else {
+        passthroughHistory.push(message)
+      }
+    }
+
+    const findContextText = (tag: string): string => {
+      const openTag = `<${tag}>`
+      return (
+        contextMessages
+          .map((message) => this.normalizeMessageContentToText(message.content))
+          .find((text) => text.includes(openTag)) || ""
+      )
+    }
+
+    const userInformation = findContextText("user_information")
+    const userRules = findContextText("user_rules")
+    const artifacts = findContextText("artifacts")
+    const mcpServers = findContextText("mcp_servers")
+    const workflows = findContextText("workflows")
+    const metadata = findContextText("ADDITIONAL_METADATA").replace(
+      /^Step Id:\s*\d+\s*/,
+      ""
+    )
+    const ephemeral = findContextText("EPHEMERAL_MESSAGE").replace(
+      /^Step Id:\s*\d+\s*/,
+      ""
+    )
+    const userRequest = latestUserTexts[latestUserTexts.length - 1] || ""
+
+    const first = [userInformation, artifacts, mcpServers]
+      .filter((part) => part.trim().length > 0)
+      .join("\n")
+    const second = [userRules, workflows]
+      .filter((part) => part.trim().length > 0)
+      .join("\n")
+    const thirdParts: string[] = []
+    if (userRequest) {
+      thirdParts.push(`<USER_REQUEST>\n${userRequest}\n</USER_REQUEST>`)
+    }
+    if (metadata) thirdParts.push(metadata.trim())
+    if (ephemeral) thirdParts.push(ephemeral.trim())
+
+    const officialMessages: CreateMessageDto["messages"] = []
+    if (first.trim()) officialMessages.push({ role: "user", content: first })
+    if (second.trim()) officialMessages.push({ role: "user", content: second })
+    if (passthroughHistory.length > 0)
+      officialMessages.push(...passthroughHistory)
+    const third = thirdParts.join("\n")
+    if (third.trim()) officialMessages.push({ role: "user", content: third })
+
+    return officialMessages
+  }
+
   private buildGoogleContextMessages(
     context: PromptContext,
     conversationId: string
@@ -12299,51 +13395,102 @@ ${raw}
   }
 
   /**
-   * Check if a model supports adaptive thinking (Claude 4.6+).
-   * Adaptive thinking lets the model self-regulate reasoning depth
-   * via an effort parameter instead of a fixed budget_tokens.
+   * Build backend-agnostic thinking intent for Cursor requests.
+   *
+   * The intent stays semantic at this layer and is serialized by each backend
+   * into its own wire format later.
    */
-  private isAdaptiveThinkingModel(model: string): boolean {
-    const m = model.toLowerCase()
-    return (
-      (m.includes("claude") || m.includes("opus") || m.includes("sonnet")) &&
-      (m.includes("4-6") || m.includes("4.6"))
-    )
+  private buildCursorThinkingIntent(
+    thinkingLevel: number,
+    model: string,
+    requestedEffort?: string
+  ) {
+    return buildThinkingIntentFromCursorRequest({
+      model,
+      thinkingLevel,
+      requestedEffort,
+    })
   }
 
-  /**
-   * Build thinking configuration for Cursor requests.
-   *
-   * Claude 4.6+ models use adaptive thinking with effort levels.
-   * Older models use extended thinking with explicit budget_tokens.
-   *
-   * thinkingLevel mapping:
-   *   0 → no thinking
-   *   1 → standard thinking (not Max)
-   *   2 → max thinking (Max mode)
-   */
-  private buildCursorThinkingConfig(
-    thinkingLevel: number,
-    model: string
-  ): {
-    thinking: CreateMessageDto["thinking"]
-    output_config?: CreateMessageDto["output_config"]
-  } | null {
-    if (thinkingLevel <= 0) return null
+  private resolveRequestedReasoningEffort(
+    requestedModelParameters?: Record<string, string>
+  ): string | undefined {
+    if (!requestedModelParameters) {
+      return undefined
+    }
 
-    if (this.isAdaptiveThinkingModel(model)) {
-      // Claude 4.6+: adaptive thinking with effort
-      const effort = thinkingLevel >= 2 ? "max" : "high"
-      return {
-        thinking: { type: "adaptive" },
-        output_config: { effort },
+    const exactIds = [
+      "reasoning_effort",
+      "thinking_effort",
+      "effort_mode",
+      "cloud_agent_effort_mode",
+      "prompt_effort_level",
+      "effort",
+    ]
+
+    for (const id of exactIds) {
+      const normalized = this.normalizeRequestedReasoningEffort(
+        requestedModelParameters[id]
+      )
+      if (normalized) {
+        return normalized
       }
     }
 
-    // Legacy models: explicit budget_tokens
-    const budgetTokens = thinkingLevel >= 2 ? 32768 : 16384
-    return {
-      thinking: { type: "enabled", budget_tokens: budgetTokens },
+    for (const [id, rawValue] of Object.entries(requestedModelParameters)) {
+      const looksLikeReasoningControl =
+        id.includes("reason") ||
+        id.includes("think") ||
+        (id.includes("effort") && !id.includes("discovery"))
+      if (!looksLikeReasoningControl) {
+        continue
+      }
+
+      const normalized = this.normalizeRequestedReasoningEffort(rawValue)
+      if (normalized) {
+        return normalized
+      }
+    }
+
+    return undefined
+  }
+
+  private normalizeRequestedReasoningEffort(
+    rawValue?: string
+  ): "none" | "low" | "medium" | "high" | "xhigh" | undefined {
+    if (!rawValue) {
+      return undefined
+    }
+
+    const normalized = rawValue
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+
+    switch (normalized) {
+      case "none":
+      case "off":
+      case "disabled":
+        return "none"
+      case "minimal":
+      case "min":
+      case "low":
+        return "low"
+      case "medium":
+      case "med":
+      case "normal":
+      case "standard":
+      case "auto":
+        return "medium"
+      case "high":
+        return "high"
+      case "max":
+      case "xhigh":
+      case "very_high":
+      case "ultra":
+        return "xhigh"
+      default:
+        return undefined
     }
   }
 

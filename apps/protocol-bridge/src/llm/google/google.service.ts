@@ -10,29 +10,23 @@ import {
   doesModelSupportThinking,
   resolveCloudCodeModel,
 } from "../model-registry"
-import { ProcessPoolService } from "../native/process-pool.service"
+import {
+  ProcessPoolService,
+  WorkerPoolCooldownError,
+} from "../native/process-pool.service"
 import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import { BackendApiError } from "../shared/backend-errors"
 import { findPendingToolUseIdsInMessages } from "../tool-continuation-policy"
 import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
+import { GoogleModelCacheService } from "./google-model-cache.service"
+import { resolveThinkingIntentFromDto } from "../thinking-intent"
 
 class FatalCloudCodeRequestError extends Error {
   constructor(message: string) {
     super(message)
     this.name = "FatalCloudCodeRequestError"
   }
-}
-
-interface ConversationRecoveryState {
-  retryAt: number
-  updatedAt: number
-  reason: string
-}
-
-interface RecoveryBackoffState {
-  attemptCount: number
-  totalWaitMs: number
 }
 
 /**
@@ -46,7 +40,7 @@ interface RecoveryBackoffState {
 @Injectable()
 export class GoogleService {
   private readonly logger = new Logger(GoogleService.name)
-  private readonly ANTIGRAVITY_IDE_VERSION = "1.21.9"
+  private readonly ANTIGRAVITY_IDE_VERSION = "1.22.2"
 
   // Official Antigravity system prompt baked into source.
   private readonly officialSystemPrompt = ANTIGRAVITY_SYSTEM_PROMPT
@@ -68,14 +62,26 @@ export class GoogleService {
   private readonly MAX_RETRY_DELAY = 60000 // Cap for exponential backoff (60s for rate limit recovery)
   private readonly MAX_429_WAIT_MS = 3 * 60 * 1000 // Cap API retryMs (3 min), allow longer recovery
   private readonly QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS = 3 * 60 * 1000 // Fallback cooldown when quota exhausted but no reset time parsed (aligned with MAX_429_WAIT_MS)
-  private readonly MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS = 60 * 1000
+  private readonly MIN_QUOTA_EXHAUSTED_COOLDOWN_MS = 1000
+  // Pool recovery. Official Antigravity gives imminent quota resets one
+  // fixed grace retry before surfacing/rotating the 429.
+  private readonly QUOTA_RESET_GRACE_WINDOW_MS = 1500
+  private readonly QUOTA_RESET_RETRY_DELAY_MS = 5000
+  private readonly INSTANT_RETRY_THRESHOLD_MS = 3000 // retryAfter < 3s: wait in-place, same worker
+  private readonly MAX_INSTANT_RETRIES = 3 // max consecutive instant retries before falling through
+  private readonly RECOVERY_PASS_MAX_WAIT_MS = 5000 // max single recovery wait
+  private readonly RECOVERY_BUDGET_MS = 30_000 // total time budget for recovery waits per request
+  private readonly MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS = 2 * 1000
   private readonly TRANSIENT_WORKER_FAILURE_COOLDOWN_MS = 5 * 60 * 1000
   private readonly TRANSIENT_TRANSPORT_FAILURE_COOLDOWN_MS = 60 * 1000
-  private readonly MAX_PROGRESSIVE_RECOVERY_DELAY_MS = 5 * 60 * 1000
-  private readonly MAX_PROGRESSIVE_RECOVERY_TOTAL_WAIT_MS = 20 * 60 * 1000
+  private readonly STREAM_FIRST_PROGRESS_WATCHDOG_MS = 60 * 1000
+  private readonly STREAM_STALL_COOLDOWN_MS = 10 * 1000
+  private readonly STREAM_PROGRESS_WATCHDOG_ABORT_PREFIX =
+    "Cloud Code stream watchdog"
   private readonly MAX_PROMPT_SHRINK_RETRIES: number = 3
-  private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 65536
-  private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 65536
+  // Official Antigravity Claude agent traffic uses a 64k output budget.
+  private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 64000
+  private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 64000
   private readonly CLOUD_CODE_MIN_OUTPUT_TOKENS: number = 256
   // Hard token limit for Cloud Code API (from Anthropic error messages)
   private readonly CLOUD_CODE_HARD_TOKEN_LIMIT = 200_000
@@ -92,21 +98,12 @@ export class GoogleService {
     string,
     { projectId?: string; traceId?: string; updatedAt: number }
   >()
-  private readonly conversationRecoveryById = new Map<
-    string,
-    ConversationRecoveryState
-  >()
   private lastToolNameCacheCleanupAt = 0
   private lastConversationMetricContextCleanupAt = 0
-  private lastConversationRecoveryCleanupAt = 0
   private readonly TOOL_NAME_CACHE_TTL_MS = 24 * 60 * 60 * 1000
   private readonly TOOL_NAME_CACHE_MAX_SIZE = 4096
   private readonly CONVERSATION_METRIC_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000
   private readonly CONVERSATION_METRIC_CONTEXT_MAX_SIZE = 4096
-  private readonly CONVERSATION_RECOVERY_TTL_MS = 24 * 60 * 60 * 1000
-  private readonly CONVERSATION_RECOVERY_MAX_SIZE = 4096
-  private readonly MAX_AUTOMATIC_CONVERSATION_RECOVERY_WAIT_MS =
-    this.MAX_PROGRESSIVE_RECOVERY_TOTAL_WAIT_MS
 
   /**
    * Parse duration string like "1.203608125s" or "1h16m0.667923083s" to milliseconds
@@ -160,13 +157,13 @@ export class GoogleService {
     return Math.max(0, targetTimestamp - now)
   }
 
-  private async describeCloudCodeAccountStatuses(
+  private describeCloudCodeAccountStatuses(
     model: string,
     limit: number = 10
-  ): Promise<string> {
+  ): string {
     const now = Date.now()
     const pool = this.processPool.getPoolStatus()
-    const quotaSnapshots = await this.processPool.fetchGoogleQuotaSnapshots()
+    const quotaSnapshots = this.processPool.getCachedGoogleQuotaSnapshots()
     const quotaByEmail = new Map(
       quotaSnapshots.map((entry) => [entry.email, entry])
     )
@@ -200,8 +197,12 @@ export class GoogleService {
         let detail = "ready"
         if (entry.state === "unavailable" || entry.ready === false) {
           detail = "unavailable"
+        } else if (modelCooldown?.reason === "capacity_exhausted") {
+          detail = `model busy, retry in ${Math.ceil(effectiveRemainingMs / 1000)}s`
         } else if (modelCooldown?.quotaExhausted) {
           detail = `quota exhausted, retry in ${Math.ceil(effectiveRemainingMs / 1000)}s`
+        } else if (modelCooldown?.reason === "rate_limited") {
+          detail = `rate-limited, retry in ${Math.ceil(effectiveRemainingMs / 1000)}s`
         } else if (effectiveRemainingMs > 0) {
           const reasons: string[] = []
           if (globalRemainingMs > 0) {
@@ -280,13 +281,14 @@ export class GoogleService {
     ].join("\n")
   }
 
-  private async buildCloudCodeRateLimitMessage(
+  private buildCloudCodeRateLimitMessage(
     model: string,
     waitMs: number
-  ): Promise<string> {
+  ): string {
     return [
-      `All Cloud Code accounts are rate-limited for ${model}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
-      await this.describeCloudCodeAccountStatuses(model),
+      `All Cloud Code Claude accounts are rate-limited for ${model}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+      "Note: Codex rate-limit probes are a separate quota surface and do not imply Cloud Code Claude availability.",
+      this.describeCloudCodeAccountStatuses(model),
     ].join("\n")
   }
 
@@ -295,6 +297,45 @@ export class GoogleService {
     waitMs: number
   ): string {
     return `All Cloud Code workers are temporarily unavailable for ${model}. Retry after ${Math.ceil(waitMs / 1000)}s.`
+  }
+
+  private markCurrentWorkerAttempted(
+    excludedWorkerEmails: Set<string>
+  ): string | null {
+    const lastWorkerEmail = this.processPool.getLastWorkerEmail()?.trim()
+    if (lastWorkerEmail) {
+      excludedWorkerEmails.add(lastWorkerEmail)
+      return lastWorkerEmail
+    }
+    return null
+  }
+
+  private hasAnotherWorkerAvailable(
+    model: string,
+    excludedWorkerEmails: Set<string>
+  ): boolean {
+    return this.processPool.hasAvailableWorkerForModel(model, {
+      excludedWorkerEmails,
+      requireGenerationCapacity: true,
+    })
+  }
+
+  private buildWorkerPoolCooldownException(
+    model: string,
+    waitMs: number,
+    reason?: WorkerPoolCooldownError["reason"]
+  ): HttpException {
+    if (reason === "capacity_exhausted" || reason === "transient") {
+      return new HttpException(
+        this.buildCloudCodeTemporaryUnavailableMessage(model, waitMs),
+        HttpStatus.SERVICE_UNAVAILABLE
+      )
+    }
+
+    return new HttpException(
+      this.buildCloudCodeRateLimitMessage(model, waitMs),
+      HttpStatus.TOO_MANY_REQUESTS
+    )
   }
 
   private getTelemetryPlatform(): string {
@@ -403,137 +444,6 @@ export class GoogleService {
         this.conversationMetricContextById.delete(conversationId)
       }
     }
-  }
-
-  private getConversationRecoveryKey(
-    conversationId: string | null | undefined,
-    model: string
-  ): string | null {
-    const normalizedConversationId =
-      typeof conversationId === "string" ? conversationId.trim() : ""
-    const normalizedModel = typeof model === "string" ? model.trim() : ""
-    if (!normalizedConversationId || !normalizedModel) return null
-    return `${normalizedConversationId}::${normalizedModel}`
-  }
-
-  private cleanupConversationRecovery(force: boolean = false): void {
-    const now = Date.now()
-    if (
-      !force &&
-      now - this.lastConversationRecoveryCleanupAt < 5 * 60 * 1000 &&
-      this.conversationRecoveryById.size < this.CONVERSATION_RECOVERY_MAX_SIZE
-    ) {
-      return
-    }
-
-    this.lastConversationRecoveryCleanupAt = now
-    for (const [key, entry] of this.conversationRecoveryById) {
-      if (
-        !entry.reason ||
-        entry.retryAt <= now ||
-        now - entry.updatedAt > this.CONVERSATION_RECOVERY_TTL_MS
-      ) {
-        this.conversationRecoveryById.delete(key)
-      }
-    }
-
-    if (
-      this.conversationRecoveryById.size <= this.CONVERSATION_RECOVERY_MAX_SIZE
-    ) {
-      return
-    }
-
-    const entries = Array.from(this.conversationRecoveryById.entries()).sort(
-      (left, right) => left[1].updatedAt - right[1].updatedAt
-    )
-    const overflow =
-      this.conversationRecoveryById.size - this.CONVERSATION_RECOVERY_MAX_SIZE
-    for (let index = 0; index < overflow; index++) {
-      const key = entries[index]?.[0]
-      if (key) {
-        this.conversationRecoveryById.delete(key)
-      }
-    }
-  }
-
-  private getConversationRecoveryState(
-    dto: CreateMessageDto,
-    model: string
-  ): ConversationRecoveryState | null {
-    this.cleanupConversationRecovery()
-    const key = this.getConversationRecoveryKey(dto._conversationId, model)
-    if (!key) return null
-    const state = this.conversationRecoveryById.get(key) || null
-    if (!state) return null
-    if (state.retryAt <= Date.now()) {
-      this.conversationRecoveryById.delete(key)
-      return null
-    }
-    return state
-  }
-
-  private scheduleConversationRecovery(
-    dto: CreateMessageDto,
-    model: string,
-    waitMs: number,
-    reason: string
-  ): void {
-    if (!Number.isFinite(waitMs) || waitMs <= 0) return
-    const key = this.getConversationRecoveryKey(dto._conversationId, model)
-    if (!key) return
-
-    this.cleanupConversationRecovery()
-    const now = Date.now()
-    const requestedRetryAt = now + Math.max(0, Math.round(waitMs))
-    const existing = this.conversationRecoveryById.get(key)
-    const retryAt = existing
-      ? Math.max(existing.retryAt, requestedRetryAt)
-      : requestedRetryAt
-
-    this.conversationRecoveryById.set(key, {
-      retryAt,
-      updatedAt: now,
-      reason,
-    })
-  }
-
-  private clearConversationRecovery(
-    dto: CreateMessageDto,
-    model: string
-  ): void {
-    const key = this.getConversationRecoveryKey(dto._conversationId, model)
-    if (!key) return
-    this.conversationRecoveryById.delete(key)
-  }
-
-  private async waitForActiveConversationRecovery(
-    dto: CreateMessageDto,
-    model: string,
-    contextLabel: string
-  ): Promise<void> {
-    const state = this.getConversationRecoveryState(dto, model)
-    if (!state) return
-
-    const remainingMs = Math.max(0, state.retryAt - Date.now())
-    if (remainingMs <= 0) {
-      this.clearConversationRecovery(dto, model)
-      return
-    }
-
-    if (remainingMs > this.MAX_AUTOMATIC_CONVERSATION_RECOVERY_WAIT_MS) {
-      this.logger.warn(
-        `${contextLabel}: recovery gate active for ${model}, remaining ${remainingMs}ms exceeds auto-wait cap`
-      )
-      throw new HttpException(
-        `Conversation recovery is still active for ${model}. Retry after ${Math.ceil(remainingMs / 1000)}s.`,
-        HttpStatus.TOO_MANY_REQUESTS
-      )
-    }
-
-    this.logger.warn(
-      `${contextLabel}: waiting ${remainingMs}ms before retrying ${model} in the same conversation (${state.reason})`
-    )
-    await this.sleep(remainingMs)
   }
 
   private rememberConversationMetricContext(
@@ -723,6 +633,128 @@ export class GoogleService {
     return parseDelayFromMessage(errText)
   }
 
+  private parseQuotaResetDelayFromMessage(message: string): number | null {
+    const patterns = [
+      /quota will reset after\s+((?:[\d.]+\s*(?:ms|s|m|h))+)\.?/i,
+      /quota reset after\s+((?:[\d.]+\s*(?:ms|s|m|h))+)\.?/i,
+      /quotaResetDelay["'=:\s]+([^\s,"}\]]+)/i,
+    ]
+
+    for (const pattern of patterns) {
+      const match = message.match(pattern)
+      if (!match?.[1]) continue
+      const durationMs = this.parseDurationMs(match[1])
+      if (durationMs != null) {
+        return durationMs
+      }
+    }
+
+    return null
+  }
+
+  private parseQuotaResetTimestampMs(
+    timestamp: string | null | undefined
+  ): number | null {
+    if (!timestamp) return null
+    const resetAt = Date.parse(String(timestamp).trim())
+    if (Number.isNaN(resetAt)) return null
+    return Math.max(0, resetAt - Date.now())
+  }
+
+  /**
+   * Parse durable quota reset timing only.
+   * This intentionally ignores Retry-After / RetryInfo because those can be
+   * request-local backoff hints rather than the true quota reset boundary.
+   */
+  private parseQuotaResetDelayMs(errText: string): number | null {
+    const errObj = this.parseCloudCodeErrorEnvelope(errText)
+    if (!errObj?.error) {
+      return this.parseQuotaResetDelayFromMessage(errText)
+    }
+
+    const candidates = [errObj.error]
+    if (typeof errObj.error.message === "string") {
+      const nested = this.parseCloudCodeErrorEnvelope(errObj.error.message)
+      if (nested?.error) {
+        candidates.push(nested.error)
+      }
+    }
+
+    for (const candidate of candidates) {
+      const details = Array.isArray(candidate.details) ? candidate.details : []
+      const metaTimestamp =
+        details.find((d) => d["@type"]?.includes("ErrorInfo"))?.metadata
+          ?.quotaResetTimeStamp ??
+        details.find((d) => d["@type"]?.includes("ErrorInfo"))?.metadata
+          ?.quotaResetUTCTimestamp ??
+        details.find((d) => d.metadata?.quotaResetTimeStamp)?.metadata
+          ?.quotaResetTimeStamp ??
+        details.find((d) => d.metadata?.quotaResetUTCTimestamp)?.metadata
+          ?.quotaResetUTCTimestamp
+      if (metaTimestamp) {
+        const ms = this.parseQuotaResetTimestampMs(metaTimestamp)
+        if (ms != null) {
+          return ms
+        }
+      }
+
+      const metaDelay =
+        details.find((d) => d["@type"]?.includes("ErrorInfo"))?.metadata
+          ?.quotaResetDelay ??
+        details.find((d) => d.metadata?.quotaResetDelay)?.metadata
+          ?.quotaResetDelay
+      if (metaDelay) {
+        const ms = this.parseDurationMs(metaDelay)
+        if (ms != null) {
+          return ms
+        }
+      }
+
+      const message =
+        typeof candidate.message === "string" ? candidate.message : ""
+      const messageDelayMs = this.parseQuotaResetDelayFromMessage(message)
+      if (messageDelayMs != null) {
+        return messageDelayMs
+      }
+    }
+
+    return this.parseQuotaResetDelayFromMessage(errText)
+  }
+
+  private getCachedQuotaResetDelayMs(
+    model: string,
+    workerEmail?: string | null
+  ): number | null {
+    const normalizedEmail = workerEmail?.trim()
+    if (!normalizedEmail) return null
+
+    const snapshot = this.processPool
+      .getCachedGoogleQuotaSnapshots()
+      .find((entry) => entry.email === normalizedEmail)
+    const resetTime = snapshot?.models.find(
+      (entry) => entry.name === model
+    )?.resetTime
+    if (!resetTime) return null
+
+    const resetAt = Date.parse(resetTime)
+    if (Number.isNaN(resetAt)) return null
+    return Math.max(0, resetAt - Date.now())
+  }
+
+  private resolveQuotaExhaustedCooldownMs(
+    model: string,
+    errText: string,
+    workerEmail?: string | null
+  ): number {
+    const stableResetDelayMs =
+      this.parseQuotaResetDelayMs(errText) ??
+      this.getCachedQuotaResetDelayMs(model, workerEmail)
+    if (stableResetDelayMs != null) {
+      return Math.max(stableResetDelayMs, this.MIN_QUOTA_EXHAUSTED_COOLDOWN_MS)
+    }
+    return this.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS
+  }
+
   /**
    * Get 429 retry delay: use parsed retryMs if available (capped), else exponential backoff
    */
@@ -733,51 +765,6 @@ export class GoogleService {
     }
     const backoff = this.BASE_RETRY_DELAY * Math.pow(2, Math.min(attempt, 4))
     return Math.min(backoff, this.MAX_RETRY_DELAY)
-  }
-
-  private getProgressiveRecoveryWaitMs(
-    baseWaitMs: number,
-    recoveryAttempt: number
-  ): number {
-    const normalizedBase = Math.max(baseWaitMs, this.BASE_RETRY_DELAY)
-    const multiplier = Math.pow(2, Math.min(recoveryAttempt, 4))
-    return Math.min(
-      normalizedBase * multiplier,
-      this.MAX_PROGRESSIVE_RECOVERY_DELAY_MS
-    )
-  }
-
-  private async waitForProgressiveRecovery(
-    dto: CreateMessageDto,
-    model: string,
-    reason: string,
-    baseWaitMs: number,
-    state: RecoveryBackoffState,
-    contextLabel: string
-  ): Promise<{ waited: boolean; waitMs: number }> {
-    const waitMs = this.getProgressiveRecoveryWaitMs(
-      baseWaitMs,
-      state.attemptCount
-    )
-
-    this.scheduleConversationRecovery(dto, model, waitMs, reason)
-
-    const nextTotalWaitMs = state.totalWaitMs + waitMs
-    if (nextTotalWaitMs > this.MAX_PROGRESSIVE_RECOVERY_TOTAL_WAIT_MS) {
-      this.logger.error(
-        `${contextLabel}: recovery budget exhausted for ${model} after ${Math.ceil(state.totalWaitMs / 1000)}s; latest suggested wait ${waitMs}ms (${reason})`
-      )
-      return { waited: false, waitMs }
-    }
-
-    state.attemptCount += 1
-    state.totalWaitMs = nextTotalWaitMs
-
-    this.logger.warn(
-      `${contextLabel}: waiting ${waitMs}ms before retrying ${model} (${reason}, recovery attempt ${state.attemptCount}, total waited ${Math.ceil(state.totalWaitMs / 1000)}s)`
-    )
-    await this.sleep(waitMs)
-    return { waited: true, waitMs }
   }
 
   /**
@@ -800,6 +787,39 @@ export class GoogleService {
         normalized.includes("backenderror") &&
         normalized.includes("claude-opus"))
     )
+  }
+
+  private summarizeCloudCodeErrorForLog(errMsg: string): string {
+    const traceMatch = errMsg.match(/trace-id=([^\]\s]+)/i)
+    const statusMatch = errMsg.match(/\b(\d{3})\b/)
+    const normalized = this.extractCloudCodeErrorText(errMsg)
+      .replace(/\s+/g, " ")
+      .trim()
+
+    let summary = normalized
+    if (this.isModelCapacityExhausted(errMsg)) {
+      summary = "model capacity exhausted"
+    } else if (this.isQuotaExhausted(errMsg)) {
+      summary = "quota exhausted"
+    } else if (normalized.length > 240) {
+      summary = normalized.slice(0, 240) + "…"
+    }
+
+    const tags: string[] = []
+    if (statusMatch?.[1]) tags.push(`status=${statusMatch[1]}`)
+    if (traceMatch?.[1]) tags.push(`trace=${traceMatch[1]}`)
+    return tags.length > 0 ? `${summary} [${tags.join(" ")}]` : summary
+  }
+
+  private buildStreamProgressWatchdogReason(
+    model: string,
+    elapsedMs: number
+  ): string {
+    return `${this.STREAM_PROGRESS_WATCHDOG_ABORT_PREFIX}: no effective progress for ${model} after ${elapsedMs}ms`
+  }
+
+  private isStreamProgressWatchdogAbort(errMsg: string): boolean {
+    return errMsg.includes(this.STREAM_PROGRESS_WATCHDOG_ABORT_PREFIX)
   }
 
   private isRetryableWorkerFailure(errMsg: string): boolean {
@@ -886,7 +906,11 @@ export class GoogleService {
       details?: Array<{
         "@type"?: string
         retryDelay?: string
-        metadata?: { quotaResetDelay?: string }
+        metadata?: {
+          quotaResetDelay?: string
+          quotaResetTimeStamp?: string
+          quotaResetUTCTimestamp?: string
+        }
       }>
     }
   } | null {
@@ -905,7 +929,11 @@ export class GoogleService {
             details?: Array<{
               "@type"?: string
               retryDelay?: string
-              metadata?: { quotaResetDelay?: string }
+              metadata?: {
+                quotaResetDelay?: string
+                quotaResetTimeStamp?: string
+                quotaResetUTCTimestamp?: string
+              }
             }>
           }
         }
@@ -1292,6 +1320,70 @@ export class GoogleService {
     })
   }
 
+  private async sleepAbortable(
+    ms: number,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (!abortSignal) {
+      await this.sleep(ms)
+      return
+    }
+    if (abortSignal.aborted) {
+      throw new UpstreamRequestAbortedError(
+        "Request aborted during recovery wait"
+      )
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        abortSignal.removeEventListener("abort", onAbort)
+        resolve()
+      }, ms)
+      if (timer && typeof timer.unref === "function") {
+        timer.unref()
+      }
+      const onAbort = () => {
+        clearTimeout(timer)
+        reject(
+          new UpstreamRequestAbortedError(
+            "Request aborted during recovery wait"
+          )
+        )
+      }
+      abortSignal.addEventListener("abort", onAbort, { once: true })
+    })
+  }
+
+  /**
+   * When all workers are exhausted (429 or 503), wait for the shortest
+   * cooldown to expire, then clear the exclusion set so the next iteration
+   * performs a fresh sweep of the entire pool.
+   *
+   * Returns true if recovery was initiated (caller should reset the loop
+   * counter via `attempt = -1` and continue).
+   */
+  private async maybeRecoveryPass(
+    model: string,
+    waitMs: number,
+    excludedWorkerEmails: Set<string>,
+    recoveryState: { totalWaitedMs: number },
+    abortSignal?: AbortSignal
+  ): Promise<boolean> {
+    if (
+      waitMs <= 0 ||
+      waitMs > this.RECOVERY_PASS_MAX_WAIT_MS ||
+      recoveryState.totalWaitedMs + waitMs > this.RECOVERY_BUDGET_MS
+    ) {
+      return false
+    }
+    recoveryState.totalWaitedMs += waitMs
+    this.logger.warn(
+      `[pool-recover] All workers exhausted for ${model}; waiting ${waitMs}ms before recovery sweep (budget ${recoveryState.totalWaitedMs}/${this.RECOVERY_BUDGET_MS}ms)`
+    )
+    await this.sleepAbortable(waitMs, abortSignal)
+    excludedWorkerEmails.clear()
+    return true
+  }
+
   private cleanupToolNameCache(force: boolean = false): void {
     const now = Date.now()
     if (
@@ -1390,6 +1482,7 @@ export class GoogleService {
   constructor(
     private readonly configService: ConfigService,
     private readonly processPool: ProcessPoolService,
+    private readonly modelCache: GoogleModelCacheService,
     private readonly signatureStore: ToolThoughtSignatureService,
     private readonly tokenCounter: TokenCounterService
   ) {
@@ -1912,14 +2005,20 @@ export class GoogleService {
             ? part.functionCall.id
             : makeToolUseId()
 
+        const originalToolName = part.functionCall.name
+        const mappedToolName =
+          this.fromOfficialAntigravityToolName(originalToolName)
         const toolUseBlock = {
           type: "tool_use",
           id: toolId,
-          name: part.functionCall.name,
-          input: part.functionCall.args || {},
+          name: mappedToolName,
+          input: this.adaptOfficialAntigravityToolInput(
+            originalToolName,
+            part.functionCall.args || {}
+          ),
         }
 
-        this.rememberToolName(toolId, part.functionCall.name)
+        this.rememberToolName(toolId, mappedToolName)
 
         // Cache signature for next turn
         const sigForToolCache = signature || pendingToolThoughtSignature
@@ -2091,8 +2190,143 @@ export class GoogleService {
     return model.toLowerCase().includes("claude")
   }
 
+  private normalizeCloudCodeToolToken(name: string): string {
+    return name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+  }
+
   private sanitizeCloudCodeToolName(name: string): string {
     return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64)
+  }
+
+  private toOfficialAntigravityToolName(name: string): string {
+    const normalized = this.normalizeCloudCodeToolToken(name)
+    const map: Record<string, string> = {
+      read_file: "view_file",
+      read_file_v2: "view_file",
+      view_file: "view_file",
+      list_directory: "list_dir",
+      list_dir: "list_dir",
+      grep_search: "grep_search",
+      ripgrep_search: "grep_search",
+      edit_file: "replace_file_content",
+      edit_file_v2: "replace_file_content",
+      replace_file_content: "replace_file_content",
+      multi_replace_file_content: "multi_replace_file_content",
+      write_to_file: "write_to_file",
+      run_terminal_command: "run_command",
+      run_terminal_command_v2: "run_command",
+      shell: "run_command",
+      run_command: "run_command",
+      background_shell_spawn: "run_command",
+      write_shell_stdin: "send_command_input",
+      send_command_input: "send_command_input",
+      command_status: "command_status",
+      web_search: "search_web",
+      search_web: "search_web",
+      web_fetch: "read_url_content",
+      read_url_content: "read_url_content",
+      generate_image: "generate_image",
+      browser_subagent: "browser_subagent",
+    }
+    return map[normalized] || normalized
+  }
+
+  private fromOfficialAntigravityToolName(name: string): string {
+    const normalized = this.normalizeCloudCodeToolToken(name)
+    const map: Record<string, string> = {
+      view_file: "read_file",
+      list_dir: "list_directory",
+      run_command: "run_terminal_command",
+      send_command_input: "write_shell_stdin",
+      replace_file_content: "edit_file_v2",
+      multi_replace_file_content: "edit_file_v2",
+      write_to_file: "edit_file_v2",
+      search_web: "web_search",
+      read_url_content: "web_fetch",
+      command_status: "run_terminal_command",
+      browser_subagent: "task",
+    }
+    return map[normalized] || name
+  }
+
+  private adaptOfficialAntigravityToolInput(
+    officialName: string,
+    input: Record<string, unknown>
+  ): Record<string, unknown> {
+    const normalized = this.normalizeCloudCodeToolToken(officialName)
+    switch (normalized) {
+      case "view_file":
+        return {
+          path: input.path || input.file_path || input.filePath,
+          start_line: input.start_line || input.startLine,
+          end_line: input.end_line || input.endLine,
+        }
+      case "list_dir":
+        return {
+          path: input.path || input.dir || input.directory,
+          recursive: input.recursive,
+        }
+      case "run_command":
+        return {
+          command: input.command || input.cmd,
+          cwd: input.cwd || input.working_directory || input.workingDirectory,
+        }
+      case "send_command_input":
+        return {
+          shellId:
+            input.shellId ||
+            input.shell_id ||
+            input.command_id ||
+            input.commandId,
+          data: input.data || input.input || input.text,
+        }
+      case "replace_file_content":
+      case "multi_replace_file_content":
+        return {
+          path: input.path || input.file_path || input.filePath,
+          search:
+            input.search || input.old_text || input.oldText || input.target,
+          replace:
+            input.replace ||
+            input.new_text ||
+            input.newText ||
+            input.replacement,
+        }
+      case "write_to_file":
+        return {
+          path: input.path || input.file_path || input.filePath,
+          search: input.search || "",
+          replace:
+            input.content || input.file_text || input.fileText || input.text,
+        }
+      case "search_web":
+        return {
+          query: input.query || input.search_query || input.searchQuery,
+          domain: input.domain,
+        }
+      case "read_url_content":
+        return {
+          url: input.url || input.Url || input.URL,
+        }
+      case "command_status":
+        return {
+          command: input.command || `echo "command_status unsupported"`,
+          cwd: input.cwd,
+        }
+      case "browser_subagent":
+        return {
+          description:
+            input.Task || input.task || input.description || input.TaskSummary,
+          prompt: input.Task || input.task || input.description,
+          subagent_type: "browser",
+        }
+      default:
+        return input
+    }
   }
 
   private resolveCloudCodeToolChoice(
@@ -2135,9 +2369,9 @@ export class GoogleService {
       case "none":
         return { mode: "NONE" }
       case "any":
-        return { mode: "ANY" }
+        return { mode: "VALIDATED" }
       case "tool": {
-        const config: Record<string, unknown> = { mode: "ANY" }
+        const config: Record<string, unknown> = { mode: "VALIDATED" }
         if (resolved.name) {
           config.allowedFunctionNames = [
             this.sanitizeCloudCodeToolName(resolved.name),
@@ -2168,61 +2402,183 @@ export class GoogleService {
     return Array.from(merged)
   }
 
-  private normalizeCloudCodeThinkingLevel(effort: string): "medium" | "high" {
-    switch (effort.trim().toLowerCase()) {
-      case "max":
-      case "high":
-      case "xhigh":
-      case "auto":
-        return "high"
-      case "medium":
-      case "low":
-      case "minimal":
-      default:
-        return "medium"
+  private getOfficialThinkingProfile(model: string): {
+    supportsThinking?: boolean
+    thinkingBudget?: number
+    minThinkingBudget?: number
+  } {
+    const cached = this.modelCache.getModelInfo(model)
+    if (
+      cached &&
+      (cached.supportsThinking === true ||
+        typeof cached.thinkingBudget === "number" ||
+        typeof cached.minThinkingBudget === "number")
+    ) {
+      return {
+        supportsThinking: cached.supportsThinking,
+        thinkingBudget: cached.thinkingBudget,
+        minThinkingBudget: cached.minThinkingBudget,
+      }
     }
+
+    const fallback: Record<
+      string,
+      {
+        supportsThinking: boolean
+        thinkingBudget?: number
+        minThinkingBudget?: number
+      }
+    > = {
+      "claude-opus-4-6-thinking": {
+        supportsThinking: true,
+        thinkingBudget: 1024,
+      },
+      "claude-sonnet-4-6": {
+        supportsThinking: true,
+        thinkingBudget: 1024,
+      },
+      "gemini-2.5-pro": {
+        supportsThinking: true,
+        thinkingBudget: 1024,
+        minThinkingBudget: 128,
+      },
+      "gemini-3.1-pro-low": {
+        supportsThinking: true,
+        thinkingBudget: 1001,
+        minThinkingBudget: 128,
+      },
+      "gemini-3.1-pro-high": {
+        supportsThinking: true,
+        thinkingBudget: 10001,
+        minThinkingBudget: 128,
+      },
+      "gemini-3-pro-low": {
+        supportsThinking: true,
+        thinkingBudget: 128,
+        minThinkingBudget: 128,
+      },
+      "gpt-oss-120b-medium": {
+        supportsThinking: true,
+        thinkingBudget: 8192,
+      },
+      "gemini-3-flash": {
+        supportsThinking: true,
+        minThinkingBudget: 32,
+      },
+      "gemini-3-flash-agent": {
+        supportsThinking: true,
+        minThinkingBudget: 32,
+      },
+      "gemini-3-pro-high": {
+        supportsThinking: true,
+        minThinkingBudget: 128,
+      },
+    }
+    return fallback[model] || {}
+  }
+
+  private resolveCloudCodeThinkingBudget(
+    model: string,
+    explicitBudget: number | undefined,
+    requestedEffort: string | undefined
+  ): number {
+    if (model.startsWith("claude-")) {
+      return 1024
+    }
+
+    const profile = this.getOfficialThinkingProfile(model)
+    const normalizedEffort = requestedEffort?.trim().toLowerCase()
+    const minBudget =
+      typeof profile.minThinkingBudget === "number" &&
+      profile.minThinkingBudget > 0
+        ? profile.minThinkingBudget
+        : undefined
+    const defaultBudget =
+      typeof profile.thinkingBudget === "number" && profile.thinkingBudget > 0
+        ? profile.thinkingBudget
+        : undefined
+
+    if (typeof explicitBudget === "number" && explicitBudget > 0) {
+      return Math.max(explicitBudget, minBudget || 0)
+    }
+
+    if (normalizedEffort === "low" || normalizedEffort === "minimal") {
+      return minBudget || defaultBudget || 1024
+    }
+
+    if (
+      normalizedEffort === "medium" ||
+      normalizedEffort === "high" ||
+      normalizedEffort === "xhigh" ||
+      normalizedEffort === "max" ||
+      normalizedEffort === "auto"
+    ) {
+      return defaultBudget || minBudget || 1024
+    }
+
+    return defaultBudget || minBudget || 1024
   }
 
   private buildClaudeThinkingConfig(
-    dto: CreateMessageDto
+    dto: CreateMessageDto,
+    resolvedModel: string
   ): Record<string, unknown> | null {
     if (this.shouldDisableThinkingForToolChoice(dto.tool_choice)) {
       return null
     }
 
-    const thinkingType =
-      typeof dto.thinking?.type === "string"
-        ? dto.thinking.type.trim().toLowerCase()
-        : ""
-
-    if (!thinkingType || thinkingType === "disabled") {
+    const thinkingIntent = resolveThinkingIntentFromDto(dto)
+    if (thinkingIntent?.mode === "disabled") {
       return null
     }
 
-    if (thinkingType === "enabled") {
-      const thinkingBudget = Math.max(dto.thinking?.budget_tokens || 1024, 1024)
+    // Official Antigravity sends Cloud Code thinkingConfig for Claude thinking
+    // model IDs even when the Cursor-side request does not carry explicit
+    // thinkingDetails. Keep that default at the Cloud Code serialization layer
+    // so non-Claude/non-thinking routes remain controlled by the parsed request.
+    if (!thinkingIntent && resolvedModel.includes("thinking")) {
+      const thinkingBudget = this.resolveCloudCodeThinkingBudget(
+        resolvedModel,
+        undefined,
+        undefined
+      )
       return {
         includeThoughts: true,
         thinkingBudget,
       }
     }
 
-    if (thinkingType === "adaptive" || thinkingType === "auto") {
-      const effort =
-        typeof dto.output_config?.effort === "string"
-          ? dto.output_config.effort.trim().toLowerCase()
-          : ""
-      const thinkingLevel = this.normalizeCloudCodeThinkingLevel(
-        effort || "high"
+    if (!thinkingIntent) {
+      return null
+    }
+
+    if (thinkingIntent.mode === "explicit_budget") {
+      const thinkingBudget = this.resolveCloudCodeThinkingBudget(
+        resolvedModel,
+        thinkingIntent.budgetTokens,
+        undefined
       )
-      if (effort && effort !== thinkingLevel) {
+      return {
+        includeThoughts: true,
+        thinkingBudget,
+      }
+    }
+
+    if (thinkingIntent.mode === "adaptive") {
+      const effort = thinkingIntent.effort
+      const thinkingBudget = this.resolveCloudCodeThinkingBudget(
+        resolvedModel,
+        undefined,
+        effort
+      )
+      if (effort) {
         this.logger.debug(
-          `Normalizing Cloud Code adaptive thinking effort from ${effort} to ${thinkingLevel}`
+          `Normalizing Cloud Code adaptive thinking effort ${effort} to budget ${thinkingBudget} for ${resolvedModel}`
         )
       }
       return {
         includeThoughts: true,
-        thinkingLevel,
+        thinkingBudget,
       }
     }
 
@@ -2425,7 +2781,7 @@ export class GoogleService {
     const resolvedMaxOutputTokens = this.resolveCloudCodeMaxOutputTokens(
       dto.max_tokens
     )
-    const thinkingConfig = this.buildClaudeThinkingConfig(dto)
+    const thinkingConfig = this.buildClaudeThinkingConfig(dto, resolvedModel)
     const genConfig: Record<string, unknown> = {
       temperature:
         typeof dto.temperature === "number" && Number.isFinite(dto.temperature)
@@ -2471,15 +2827,17 @@ export class GoogleService {
       generationConfig: genConfig,
     }
 
-    // Add tools if present
-    // Wrap each tool in its own {functionDeclarations: [tool]} group
+    // Add tools if present. Claude Cloud Code uses the official
+    // Antigravity-native tool surface; other Google routes can keep the
+    // direct tool names.
     if (dto.tools && dto.tools.length > 0) {
       const toolDeclarations = this.buildCloudCodeToolDeclarations(
         dto.tools as Array<{
           name?: unknown
           description?: unknown
           input_schema?: unknown
-        }>
+        }>,
+        this.isClaudeModel(resolvedModel)
       )
       if (toolDeclarations.length > 0) {
         request.tools = toolDeclarations
@@ -2487,7 +2845,9 @@ export class GoogleService {
           dto.tool_choice
         )
         request.toolConfig = {
-          functionCallingConfig: functionCallingConfig || { mode: "AUTO" },
+          functionCallingConfig: functionCallingConfig || {
+            mode: "VALIDATED",
+          },
         }
       }
     }
@@ -2521,8 +2881,12 @@ export class GoogleService {
       name?: unknown
       description?: unknown
       input_schema?: unknown
-    }>
+    }>,
+    useOfficialAntigravityTools = false
   ): Array<{ functionDeclarations: Array<Record<string, unknown>> }> {
+    if (useOfficialAntigravityTools) {
+      return this.buildOfficialAntigravityToolDeclarations(tools)
+    }
     const declarations: Array<{
       functionDeclarations: Array<Record<string, unknown>>
     }> = []
@@ -2661,6 +3025,170 @@ export class GoogleService {
         }
       )
     }
+
+    return declarations
+  }
+
+  private buildOfficialAntigravityToolDeclarations(
+    tools: Array<{
+      name?: unknown
+      description?: unknown
+      input_schema?: unknown
+    }>
+  ): Array<{ functionDeclarations: Array<Record<string, unknown>> }> {
+    const available = new Set<string>()
+    for (const tool of tools) {
+      if (typeof tool?.name !== "string") continue
+      available.add(this.toOfficialAntigravityToolName(tool.name))
+    }
+
+    const declarations: Array<{
+      functionDeclarations: Array<Record<string, unknown>>
+    }> = []
+    const add = (
+      name: string,
+      description: string,
+      properties: Record<string, unknown>,
+      required: string[] = []
+    ) => {
+      declarations.push({
+        functionDeclarations: [
+          {
+            name,
+            description,
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                ...properties,
+                waitForPreviousTools: {
+                  type: "BOOLEAN",
+                  description:
+                    "If true, wait for all previous tool calls from this turn to complete before executing (sequential). If false or omitted, execute this tool immediately (parallel with other tools).",
+                },
+              },
+              ...(required.length > 0 ? { required } : {}),
+            },
+          },
+        ],
+      })
+    }
+
+    add(
+      "command_status",
+      "Check the status of a previously started command.",
+      {
+        command_id: { type: "STRING", description: "Command/process id" },
+      },
+      ["command_id"]
+    )
+    add(
+      "generate_image",
+      "Generate an image from a prompt.",
+      { prompt: { type: "STRING", description: "Image generation prompt" } },
+      ["prompt"]
+    )
+    add(
+      "grep_search",
+      "Search file contents using ripgrep.",
+      {
+        query: { type: "STRING", description: "Search query or regex" },
+        path: { type: "STRING", description: "Path to search in" },
+        case_sensitive: { type: "BOOLEAN" },
+      },
+      ["query"]
+    )
+    add(
+      "list_dir",
+      "List the contents of a directory.",
+      {
+        path: { type: "STRING", description: "Directory path" },
+        recursive: { type: "BOOLEAN" },
+      },
+      ["path"]
+    )
+    add(
+      "multi_replace_file_content",
+      "Replace one or more text ranges in a file.",
+      {
+        path: { type: "STRING" },
+        replacements: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              search: { type: "STRING" },
+              replace: { type: "STRING" },
+            },
+          },
+        },
+      },
+      ["path", "replacements"]
+    )
+    add(
+      "read_url_content",
+      "Fetch content from a URL via HTTP request (invisible to USER). Supports HTML and PDF content types. No JavaScript execution, no authentication.",
+      { Url: { type: "STRING", description: "URL to read content from" } },
+      ["Url"]
+    )
+    add(
+      "replace_file_content",
+      "Replace text in a file.",
+      {
+        path: { type: "STRING" },
+        search: { type: "STRING" },
+        replace: { type: "STRING" },
+      },
+      ["path", "search", "replace"]
+    )
+    add(
+      "run_command",
+      "Run a shell command in the workspace.",
+      {
+        command: { type: "STRING", description: "Command to run" },
+        cwd: { type: "STRING", description: "Working directory" },
+      },
+      ["command"]
+    )
+    add(
+      "search_web",
+      "Performs a web search for a given query. Returns a summary of relevant information along with URL citations.",
+      {
+        domain: {
+          type: "STRING",
+          description: "Optional domain to recommend the search prioritize",
+        },
+        query: { type: "STRING" },
+      },
+      ["query"]
+    )
+    add(
+      "send_command_input",
+      "Send input to a running command.",
+      {
+        command_id: { type: "STRING" },
+        input: { type: "STRING" },
+      },
+      ["command_id", "input"]
+    )
+    add(
+      "view_file",
+      "Read the contents of a file at the specified path.",
+      {
+        path: { type: "STRING", description: "File path" },
+        start_line: { type: "INTEGER" },
+        end_line: { type: "INTEGER" },
+      },
+      ["path"]
+    )
+    add(
+      "write_to_file",
+      "Write content to a file.",
+      {
+        path: { type: "STRING" },
+        content: { type: "STRING" },
+      },
+      ["path", "content"]
+    )
 
     return declarations
   }
@@ -3376,11 +3904,6 @@ export class GoogleService {
     )
 
     const payload = this.buildClaudePayload(dto)
-    await this.waitForActiveConversationRecovery(
-      dto,
-      resolvedModel,
-      "sendClaudeMessage"
-    )
     const requestStartedAt = process.hrtime.bigint()
     const protectedContextMessageCount =
       this.normalizeProtectedContextPrefixCount(
@@ -3409,26 +3932,25 @@ export class GoogleService {
 
     let lastError: Error | null = null
     let promptShrinkRetries = 0
-    const rateLimitRecoveryState: RecoveryBackoffState = {
-      attemptCount: 0,
-      totalWaitMs: 0,
-    }
-    const workerRecoveryState: RecoveryBackoffState = {
-      attemptCount: 0,
-      totalWaitMs: 0,
-    }
 
     let consecutiveAuthErrors = 0
     const maxAuthRetries = Math.max(this.processPool.workerCount, 2)
+    const maxWorkerAttempts = Math.max(
+      this.processPool.workerCount,
+      this.MAX_RETRIES
+    )
+    const excludedWorkerEmails = new Set<string>()
+    const recoveryState = { totalWaitedMs: 0 }
+    let instantRetry429 = 0
+    let instantRetry503 = 0
 
-    for (let attempt = 0; attempt < this.MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < maxWorkerAttempts; attempt++) {
       try {
         this.logger.debug(`Attempt ${attempt + 1}, model: ${resolvedModel}`)
 
-        const data = (await this.processPool.generate(
-          payload,
-          resolvedModel
-        )) as Record<string, unknown>
+        const data = (await this.processPool.generate(payload, resolvedModel, {
+          excludedWorkerEmails,
+        })) as Record<string, unknown>
         const traceId = this.getCloudCodeTraceId(data)
         this.rememberConversationMetricContext(dto, payload, traceId)
 
@@ -3443,24 +3965,51 @@ export class GoogleService {
         this.logger.log(`Claude response received from Cloud Code API`)
         // Mark this worker as preferred for future requests with this model
         this.processPool.markSuccessForModel(resolvedModel)
-        this.clearConversationRecovery(dto, resolvedModel)
         return this.convertToAnthropicFormat(data, dto.model)
       } catch (error) {
-        const errMsg = (error as Error).message || ""
-
-        // 401 — switch account and retry (cap to avoid infinite loop)
-        if (errMsg.includes("401")) {
-          consecutiveAuthErrors++
-          if (consecutiveAuthErrors > maxAuthRetries) {
+        if (error instanceof WorkerPoolCooldownError) {
+          if (this.processPool.hasOnlyDisabledWorkers()) {
             throw new HttpException(
               "All accounts authentication failed",
               HttpStatus.UNAUTHORIZED
             )
           }
           this.logger.warn(
-            `Auth error (${consecutiveAuthErrors}/${maxAuthRetries}), switching account...`
+            `[pool-gate] Pre-dispatch worker gate for ${resolvedModel}, failing fast: ${error.message}`
           )
-          this.processPool.switchToNextWorker()
+          throw this.buildWorkerPoolCooldownException(
+            resolvedModel,
+            error.waitMs,
+            error.reason
+          )
+        }
+
+        const errMsg = (error as Error).message || ""
+
+        // 401 / token refresh failed — permanently remove the current account
+        // from scheduling until the worker is reloaded.
+        if (errMsg.includes("401") || errMsg.includes("Token refresh failed")) {
+          consecutiveAuthErrors++
+          const authReason = errMsg.includes("Token refresh failed")
+            ? "token refresh failed"
+            : "authentication failed"
+          if (consecutiveAuthErrors > maxAuthRetries) {
+            throw new HttpException(
+              "All accounts authentication failed",
+              HttpStatus.UNAUTHORIZED
+            )
+          }
+          this.markCurrentWorkerAttempted(excludedWorkerEmails)
+          this.processPool.disableLastWorker(authReason)
+          if (!this.processPool.hasEligibleWorker({ excludedWorkerEmails })) {
+            throw new HttpException(
+              "All accounts authentication failed",
+              HttpStatus.UNAUTHORIZED
+            )
+          }
+          this.logger.warn(
+            `Auth error (${consecutiveAuthErrors}/${maxAuthRetries}), disabled current account and rotating...`
+          )
           lastError = error as Error
           continue
         }
@@ -3468,19 +4017,62 @@ export class GoogleService {
 
         // 429 — rate limited: precisely cooldown the worker that reported the error
         if (errMsg.includes("429")) {
-          const retryMs = this.parseRetryDelayMs(errMsg)
+          const retryDelayMs = this.parseRetryDelayMs(errMsg)
+
+          // Official Antigravity grace retry: if quota reset is imminent,
+          // wait a fixed 5s once on the same worker instead of rotating.
           const exhausted = this.isQuotaExhausted(errMsg)
+          if (
+            exhausted &&
+            retryDelayMs != null &&
+            retryDelayMs <= this.QUOTA_RESET_GRACE_WINDOW_MS &&
+            instantRetry429 < 1
+          ) {
+            instantRetry429++
+            this.logger.warn(
+              `[pool-retry] Quota reset is imminent for ${resolvedModel} [${this.processPool.getLastWorkerEmail()}], waiting ${this.QUOTA_RESET_RETRY_DELAY_MS}ms`
+            )
+            await this.sleep(this.QUOTA_RESET_RETRY_DELAY_MS)
+            lastError = error as Error
+            attempt-- // don't consume worker rotation budget
+            continue
+          }
+
+          // Non-quota short 429s can still be retried in place briefly.
+          if (
+            !exhausted &&
+            retryDelayMs != null &&
+            retryDelayMs < this.INSTANT_RETRY_THRESHOLD_MS &&
+            instantRetry429 < this.MAX_INSTANT_RETRIES
+          ) {
+            instantRetry429++
+            this.logger.warn(
+              `[pool-retry] Instant retry for ${resolvedModel} [${this.processPool.getLastWorkerEmail()}], waiting ${Math.max(retryDelayMs, 500)}ms (429 instant ${instantRetry429}/${this.MAX_INSTANT_RETRIES})`
+            )
+            await this.sleep(Math.max(retryDelayMs, 500))
+            lastError = error as Error
+            attempt-- // don't consume worker rotation budget
+            continue
+          }
+          instantRetry429 = 0 // reset on fallthrough to rotation
+
+          const failedWorkerEmail =
+            this.markCurrentWorkerAttempted(excludedWorkerEmails)
           // Quota exhausted: use full reset duration (hours/days), uncapped
           // Transient rate limit: keep capped behavior
           const cooldownMs = exhausted
-            ? (retryMs ?? this.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS)
-            : Math.min(retryMs ?? 60_000, this.MAX_429_WAIT_MS)
+            ? this.resolveQuotaExhaustedCooldownMs(
+                resolvedModel,
+                errMsg,
+                failedWorkerEmail
+              )
+            : Math.min(retryDelayMs ?? 60_000, this.MAX_429_WAIT_MS)
 
           // Precisely target the worker that actually failed (not a random one)
           this.processPool.setModelCooldownForLastWorker(
             resolvedModel,
             cooldownMs,
-            exhausted
+            exhausted ? "quota_exhausted" : "rate_limited"
           )
           await this.processPool.recycleLastOfficialClient(
             exhausted
@@ -3489,55 +4081,42 @@ export class GoogleService {
           )
 
           // Check if another worker is available for this specific model
-          if (this.processPool.hasAvailableWorkerForModel(resolvedModel)) {
+          const hasAvailableWorker = this.hasAnotherWorkerAvailable(
+            resolvedModel,
+            excludedWorkerEmails
+          )
+          if (hasAvailableWorker) {
             this.logger.warn(
-              `Rate limited${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker for ${resolvedModel}`
+              `[pool-rotate] Rate limited${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker for ${resolvedModel}`
             )
             lastError = error as Error
             continue
           }
 
-          // All workers exhausted for this model — graceful degradation instead of crash
-          // Wait for the shortest model-specific cooldown, then retry
-          const waitMs =
-            this.processPool.getMinCooldownMsForModel(resolvedModel)
-          if (waitMs > this.MAX_429_WAIT_MS) {
-            this.scheduleConversationRecovery(
-              dto,
+          // All workers exhausted — attempt recovery pass before giving up
+          const waitMs = Math.max(
+            this.processPool.getMinCooldownMsForModel(resolvedModel),
+            cooldownMs
+          )
+          if (
+            await this.maybeRecoveryPass(
               resolvedModel,
               waitMs,
-              exhausted ? "quota exhausted" : "rate limited"
+              excludedWorkerEmails,
+              recoveryState
             )
-            this.logger.error(
-              `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
-            )
-            throw new HttpException(
-              await this.buildCloudCodeRateLimitMessage(resolvedModel, waitMs),
-              HttpStatus.TOO_MANY_REQUESTS
-            )
+          ) {
+            lastError = error as Error
+            attempt = -1 // recovery cleared excludedWorkerEmails; restart full sweep
+            continue
           }
-
-          const recovery = await this.waitForProgressiveRecovery(
-            dto,
-            resolvedModel,
-            exhausted ? "quota exhausted" : "rate limited",
-            waitMs,
-            rateLimitRecoveryState,
-            "All workers rate-limited"
+          this.logger.warn(
+            `[pool-rotate] All workers rate-limited for ${resolvedModel}, failing after recovery: ${this.summarizeCloudCodeErrorForLog(errMsg)}`
           )
-          if (!recovery.waited) {
-            throw new HttpException(
-              await this.buildCloudCodeRateLimitMessage(
-                resolvedModel,
-                recovery.waitMs
-              ),
-              HttpStatus.TOO_MANY_REQUESTS
-            )
-          }
-
-          lastError = error as Error
-          attempt--
-          continue
+          throw new HttpException(
+            this.buildCloudCodeRateLimitMessage(resolvedModel, waitMs),
+            HttpStatus.TOO_MANY_REQUESTS
+          )
         }
 
         // 400 — check for prompt-too-long
@@ -3570,28 +4149,30 @@ export class GoogleService {
           }
         }
 
-        if (errMsg.includes("Token refresh failed")) {
-          this.logger.warn("Token refresh failed, switching account...")
-          this.processPool.switchToNextWorker()
-        }
-
         if (this.isRetryableWorkerFailure(errMsg)) {
           const isModelCapacityExhausted = this.isModelCapacityExhausted(errMsg)
           const cooldownMs = isModelCapacityExhausted
             ? this.MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS
             : this.getRetryableWorkerFailureCooldownMs(errMsg)
 
-          if (isModelCapacityExhausted) {
-            this.processPool.setModelCooldownForLastWorker(
-              resolvedModel,
-              cooldownMs,
-              false
+          // Capacity exhausted is a backend-wide issue — instant retry same worker
+          if (
+            isModelCapacityExhausted &&
+            instantRetry503 < this.MAX_INSTANT_RETRIES
+          ) {
+            instantRetry503++
+            this.logger.warn(
+              `[pool-retry] Model capacity exhausted for ${resolvedModel} [${this.processPool.getLastWorkerEmail()}], waiting ${cooldownMs}ms (503 instant ${instantRetry503}/${this.MAX_INSTANT_RETRIES})`
             )
-          } else {
-            this.processPool.setCooldownForLastWorker(
-              cooldownMs,
-              "temporarily unavailable"
-            )
+            await this.sleep(cooldownMs)
+            lastError = error as Error
+            attempt-- // don't consume worker rotation budget
+            continue
+          }
+          instantRetry503 = 0
+
+          if (!isModelCapacityExhausted) {
+            this.processPool.setCooldownForLastWorker(cooldownMs, "transient")
           }
 
           await this.processPool.recycleLastOfficialClient(
@@ -3600,50 +4181,55 @@ export class GoogleService {
               : `transient failure for ${resolvedModel}`
           )
 
-          if (this.processPool.hasAvailableWorkerForModel(resolvedModel)) {
+          this.markCurrentWorkerAttempted(excludedWorkerEmails)
+
+          const hasAvailableWorker = this.hasAnotherWorkerAvailable(
+            resolvedModel,
+            excludedWorkerEmails
+          )
+          if (hasAvailableWorker) {
             this.logger.warn(
-              `${isModelCapacityExhausted ? "Model capacity exhausted" : "Transient worker failure"} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker for ${resolvedModel}: ${errMsg}`
+              `[pool-rotate] ${isModelCapacityExhausted ? "Model capacity exhausted" : "Transient worker failure"} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker for ${resolvedModel}: ${this.summarizeCloudCodeErrorForLog(errMsg)}`
             )
             lastError = error as Error
             continue
           }
 
-          const waitMs =
-            this.processPool.getMinCooldownMsForModel(resolvedModel)
-          if (waitMs > 0 && waitMs <= this.MAX_RETRY_DELAY) {
-            const recovery = await this.waitForProgressiveRecovery(
-              dto,
+          const waitMs = isModelCapacityExhausted
+            ? cooldownMs
+            : Math.max(
+                this.processPool.getMinCooldownMsForModel(resolvedModel),
+                cooldownMs
+              )
+          // All workers exhausted — attempt recovery pass before giving up
+          if (
+            await this.maybeRecoveryPass(
               resolvedModel,
-              isModelCapacityExhausted
-                ? "model capacity exhausted"
-                : "temporarily unavailable",
               waitMs,
-              workerRecoveryState,
-              "All workers temporarily unavailable"
+              excludedWorkerEmails,
+              recoveryState
             )
-            if (recovery.waited) {
-              lastError = error as Error
-              attempt--
-              continue
-            }
-
-            this.logger.error(
-              `All workers still temporarily unavailable for ${resolvedModel} after ${Math.ceil(workerRecoveryState.totalWaitMs / 1000)}s of recovery waits, giving up`
-            )
-            throw new HttpException(
-              this.buildCloudCodeTemporaryUnavailableMessage(
-                resolvedModel,
-                recovery.waitMs
-              ),
-              HttpStatus.SERVICE_UNAVAILABLE
-            )
+          ) {
+            lastError = error as Error
+            attempt = -1 // recovery cleared excludedWorkerEmails; restart full sweep
+            continue
           }
+          this.logger.warn(
+            `[pool-rotate] All workers temporarily unavailable for ${resolvedModel}, failing after recovery: ${this.summarizeCloudCodeErrorForLog(errMsg)}`
+          )
+          throw new HttpException(
+            this.buildCloudCodeTemporaryUnavailableMessage(
+              resolvedModel,
+              waitMs
+            ),
+            HttpStatus.SERVICE_UNAVAILABLE
+          )
         }
 
         lastError = error as Error
         this.logger.error(`Request failed: ${errMsg}`)
 
-        if (attempt < this.MAX_RETRIES - 1) {
+        if (attempt < maxWorkerAttempts - 1) {
           const delay =
             this.PRIME_RETRY_DELAYS[attempt] ??
             this.PRIME_RETRY_DELAYS[this.PRIME_RETRY_DELAYS.length - 1] ??
@@ -3679,11 +4265,6 @@ export class GoogleService {
     )
 
     const payload = this.buildClaudePayload(dto)
-    await this.waitForActiveConversationRecovery(
-      dto,
-      resolvedModel,
-      "sendClaudeMessageStream"
-    )
     const requestStartedAt = process.hrtime.bigint()
     const protectedContextMessageCount =
       this.normalizeProtectedContextPrefixCount(
@@ -3823,8 +4404,56 @@ export class GoogleService {
     const eventQueue: string[] = []
     let resolveWaiting: (() => void) | null = null
     let streamDone = false
+    let currentAttemptStartedAt = 0
+    let currentAttemptWorkerEmail: string | null = null
+    let currentAttemptSawProgress = false
+    let currentAttemptWatchdog: ReturnType<typeof setTimeout> | null = null
+
+    const clearCurrentAttemptWatchdog = () => {
+      if (currentAttemptWatchdog) {
+        clearTimeout(currentAttemptWatchdog)
+        currentAttemptWatchdog = null
+      }
+    }
+
+    const markEffectiveStreamProgress = () => {
+      if (currentAttemptSawProgress) return
+      currentAttemptSawProgress = true
+      clearCurrentAttemptWatchdog()
+      if (currentAttemptStartedAt > 0) {
+        this.logger.debug(
+          `[pool-watchdog] First effective stream progress [${currentAttemptWorkerEmail ?? "unknown"}] for ${resolvedModel} after ${Date.now() - currentAttemptStartedAt}ms`
+        )
+      }
+    }
+
+    const armCurrentAttemptWatchdog = (controller: AbortController) => {
+      clearCurrentAttemptWatchdog()
+      if (currentAttemptSawProgress) return
+      currentAttemptWatchdog = setTimeout(() => {
+        if (currentAttemptSawProgress || controller.signal.aborted) {
+          return
+        }
+        const elapsedMs =
+          currentAttemptStartedAt > 0
+            ? Date.now() - currentAttemptStartedAt
+            : this.STREAM_FIRST_PROGRESS_WATCHDOG_MS
+        const workerLabel = currentAttemptWorkerEmail ?? "unknown"
+        this.logger.warn(
+          `[pool-watchdog] No effective stream progress [${workerLabel}] for ${resolvedModel} after ${elapsedMs}ms; aborting current stream attempt`
+        )
+        controller.abort(
+          new Error(
+            this.buildStreamProgressWatchdogReason(resolvedModel, elapsedMs)
+          )
+        )
+      }, this.STREAM_FIRST_PROGRESS_WATCHDOG_MS)
+    }
 
     const push = (...events: string[]) => {
+      if (events.length > 0) {
+        markEffectiveStreamProgress()
+      }
       eventQueue.push(...events)
       if (resolveWaiting) {
         resolveWaiting()
@@ -3832,12 +4461,31 @@ export class GoogleService {
       }
     }
 
+    const payloadRequest = payload.request as Record<string, unknown>
+    const payloadToolNames = Array.isArray(payloadRequest?.tools)
+      ? payloadRequest.tools
+          .flatMap(
+            (tool) =>
+              (tool as { functionDeclarations?: Array<{ name?: unknown }> })
+                .functionDeclarations || []
+          )
+          .map((declaration) =>
+            typeof declaration.name === "string" ? declaration.name : ""
+          )
+          .filter(Boolean)
+      : []
+    const payloadSessionId =
+      typeof payloadRequest?.sessionId === "string" ||
+      typeof payloadRequest?.sessionId === "number"
+        ? payloadRequest.sessionId
+        : ""
     this.logger.debug(
       `[Payload] model=${String(payload.model)}, ` +
         `project=${String(payload.project)}, ` +
         `requestType=${String(payload.requestType)}, ` +
-        `tools=${(payload.request as Record<string, unknown>)?.tools ? "yes" : "no"}, ` +
-        `thinkingConfig=${JSON.stringify((payload.request as Record<string, unknown>)?.generationConfig)?.slice(0, 200)}`
+        `sessionId=${String(payloadSessionId)}, ` +
+        `tools=${payloadToolNames.length ? payloadToolNames.join(",") : "no"}, ` +
+        `generationConfig=${JSON.stringify(payloadRequest?.generationConfig)?.slice(0, 400)}`
     )
 
     // ---------------------------------------------------------------------------
@@ -3845,54 +4493,178 @@ export class GoogleService {
     // ---------------------------------------------------------------------------
     const maxWorkerRetries = Math.max(this.processPool.workerCount, 2)
     let promptShrinkRetries = 0
+    const excludedWorkerEmails = new Set<string>()
+    const recoveryState = { totalWaitedMs: 0 }
+    let instantRetry429 = 0
+    let instantRetry503 = 0
 
     const attemptStream = async (): Promise<void> => {
-      const rateLimitRecoveryState: RecoveryBackoffState = {
-        attemptCount: 0,
-        totalWaitMs: 0,
-      }
-      const workerRecoveryState: RecoveryBackoffState = {
-        attemptCount: 0,
-        totalWaitMs: 0,
-      }
-
+      let lastAttemptError: Error | null = null
       for (
         let workerAttempt = 0;
         workerAttempt < maxWorkerRetries;
         workerAttempt++
       ) {
+        let attemptAbortController: AbortController | null = null
         try {
-          await this.processPool.generateStream(
+          currentAttemptStartedAt = Date.now()
+          currentAttemptWorkerEmail = null
+          currentAttemptSawProgress = false
+          attemptAbortController = new AbortController()
+          const streamAbortSignal = abortSignal
+            ? AbortSignal.any([abortSignal, attemptAbortController.signal])
+            : attemptAbortController.signal
+
+          const streamPromise = this.processPool.generateStream(
             payload,
             onChunkHandler,
             resolvedModel,
-            abortSignal
+            streamAbortSignal,
+            { excludedWorkerEmails }
           )
+          currentAttemptWorkerEmail = self.processPool.getLastWorkerEmail()
+          armCurrentAttemptWatchdog(attemptAbortController)
+          await streamPromise
+          clearCurrentAttemptWatchdog()
           // Mark this worker as preferred for future requests with this model
           self.processPool.markSuccessForModel(resolvedModel)
-          self.clearConversationRecovery(dto, resolvedModel)
           return // success
         } catch (err) {
+          clearCurrentAttemptWatchdog()
+          const errMsg = (err as Error).message || ""
+          lastAttemptError =
+            err instanceof Error ? err : new Error(errMsg || "stream failed")
+
+          if (
+            err instanceof UpstreamRequestAbortedError &&
+            self.isStreamProgressWatchdogAbort(errMsg)
+          ) {
+            self.markCurrentWorkerAttempted(excludedWorkerEmails)
+            self.processPool.setModelCooldownForLastWorker(
+              resolvedModel,
+              self.STREAM_STALL_COOLDOWN_MS,
+              "transient"
+            )
+            await self.processPool.recycleLastOfficialClient(
+              `stream watchdog stalled before progress for ${resolvedModel}`
+            )
+
+            const hasAvailableWorker = self.hasAnotherWorkerAvailable(
+              resolvedModel,
+              excludedWorkerEmails
+            )
+            if (hasAvailableWorker) {
+              self.logger.warn(
+                `[pool-watchdog] Streaming no-progress watchdog [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}`
+              )
+              continue
+            }
+
+            const waitMs = Math.max(
+              self.processPool.getMinCooldownMsForModel(resolvedModel),
+              self.STREAM_STALL_COOLDOWN_MS
+            )
+            self.logger.warn(
+              `[pool-watchdog] All workers stalled before progress for ${resolvedModel}, failing fast instead of recovery wait`
+            )
+            throw new HttpException(
+              self.buildCloudCodeTemporaryUnavailableMessage(
+                resolvedModel,
+                waitMs
+              ),
+              HttpStatus.SERVICE_UNAVAILABLE
+            )
+          }
+
           if (err instanceof UpstreamRequestAbortedError) {
             throw err
           }
 
-          const errMsg = (err as Error).message || ""
-          const isLast = workerAttempt >= maxWorkerRetries - 1
+          if (err instanceof WorkerPoolCooldownError) {
+            if (self.processPool.hasOnlyDisabledWorkers()) {
+              throw new HttpException(
+                "All accounts authentication failed",
+                HttpStatus.UNAUTHORIZED
+              )
+            }
+            self.logger.warn(
+              `[pool-gate] Streaming pre-dispatch worker gate for ${resolvedModel}, failing fast: ${err.message}`
+            )
+            throw self.buildWorkerPoolCooldownException(
+              resolvedModel,
+              err.waitMs,
+              err.reason
+            )
+          }
 
           if (errMsg.includes("429")) {
-            const retryMs = self.parseRetryDelayMs(errMsg)
+            const retryDelayMs = self.parseRetryDelayMs(errMsg)
+
+            // Official Antigravity grace retry: if quota reset is imminent,
+            // wait a fixed 5s once on the same worker instead of rotating.
             const exhausted = self.isQuotaExhausted(errMsg)
+            if (
+              exhausted &&
+              retryDelayMs != null &&
+              retryDelayMs <= self.QUOTA_RESET_GRACE_WINDOW_MS &&
+              instantRetry429 < 1
+            ) {
+              instantRetry429++
+              self.logger.warn(
+                `[pool-retry] Streaming quota reset is imminent for ${resolvedModel} [${self.processPool.getLastWorkerEmail()}], waiting ${self.QUOTA_RESET_RETRY_DELAY_MS}ms`
+              )
+              await self.sleepAbortable(
+                self.QUOTA_RESET_RETRY_DELAY_MS,
+                abortSignal
+              )
+              lastAttemptError =
+                err instanceof Error
+                  ? err
+                  : new Error(errMsg || "stream failed")
+              workerAttempt-- // don't consume worker rotation budget
+              continue
+            }
+
+            // Non-quota short 429s can still be retried in place briefly.
+            if (
+              !exhausted &&
+              retryDelayMs != null &&
+              retryDelayMs < self.INSTANT_RETRY_THRESHOLD_MS &&
+              instantRetry429 < self.MAX_INSTANT_RETRIES
+            ) {
+              instantRetry429++
+              self.logger.warn(
+                `[pool-retry] Streaming instant retry for ${resolvedModel} [${self.processPool.getLastWorkerEmail()}], waiting ${Math.max(retryDelayMs, 500)}ms (429 instant ${instantRetry429}/${self.MAX_INSTANT_RETRIES})`
+              )
+              await self.sleepAbortable(
+                Math.max(retryDelayMs, 500),
+                abortSignal
+              )
+              lastAttemptError =
+                err instanceof Error
+                  ? err
+                  : new Error(errMsg || "stream failed")
+              workerAttempt-- // don't consume worker rotation budget
+              continue
+            }
+            instantRetry429 = 0 // reset on fallthrough to rotation
+
+            const failedWorkerEmail =
+              self.markCurrentWorkerAttempted(excludedWorkerEmails)
             // Quota exhausted: use full reset duration, uncapped
             const cooldownMs = exhausted
-              ? (retryMs ?? self.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS)
-              : Math.min(retryMs ?? 60_000, self.MAX_429_WAIT_MS)
+              ? self.resolveQuotaExhaustedCooldownMs(
+                  resolvedModel,
+                  errMsg,
+                  failedWorkerEmail
+                )
+              : Math.min(retryDelayMs ?? 60_000, self.MAX_429_WAIT_MS)
 
             // Precisely target the worker that actually failed
             self.processPool.setModelCooldownForLastWorker(
               resolvedModel,
               cooldownMs,
-              exhausted
+              exhausted ? "quota_exhausted" : "rate_limited"
             )
             await self.processPool.recycleLastOfficialClient(
               exhausted
@@ -3901,56 +4673,43 @@ export class GoogleService {
             )
 
             // Check if another worker is available for this model
-            if (self.processPool.hasAvailableWorkerForModel(resolvedModel)) {
+            const hasAvailableWorker = self.hasAnotherWorkerAvailable(
+              resolvedModel,
+              excludedWorkerEmails
+            )
+            if (hasAvailableWorker) {
               self.logger.warn(
-                `Streaming 429${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}`
+                `[pool-rotate] Streaming 429${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}`
               )
               continue
             }
 
-            // All workers exhausted for this model — check if we can wait for recovery
-            const waitMs =
-              self.processPool.getMinCooldownMsForModel(resolvedModel)
-            if (waitMs > self.MAX_429_WAIT_MS) {
-              self.scheduleConversationRecovery(
-                dto,
+            // All workers exhausted — attempt recovery pass before giving up
+            const waitMs = Math.max(
+              self.processPool.getMinCooldownMsForModel(resolvedModel),
+              cooldownMs
+            )
+            if (
+              await self.maybeRecoveryPass(
                 resolvedModel,
                 waitMs,
-                exhausted ? "quota exhausted" : "rate limited"
+                excludedWorkerEmails,
+                recoveryState,
+                abortSignal
               )
-              self.logger.error(
-                `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait ${self.MAX_429_WAIT_MS}ms)`
-              )
-              throw new HttpException(
-                await this.buildCloudCodeRateLimitMessage(
-                  resolvedModel,
-                  waitMs
-                ),
-                HttpStatus.TOO_MANY_REQUESTS
-              )
-            }
-
-            const recovery = await self.waitForProgressiveRecovery(
-              dto,
-              resolvedModel,
-              exhausted ? "quota exhausted" : "rate limited",
-              waitMs,
-              rateLimitRecoveryState,
-              "All workers exhausted"
-            )
-            if (recovery.waited) {
-              workerAttempt-- // don't consume an attempt — give recovered worker a fair chance
+            ) {
+              lastAttemptError =
+                err instanceof Error
+                  ? err
+                  : new Error(errMsg || "stream failed")
+              workerAttempt = -1 // recovery cleared excludedWorkerEmails; restart full sweep
               continue
             }
-
-            self.logger.error(
-              `All workers still exhausted for ${resolvedModel} after ${Math.ceil(rateLimitRecoveryState.totalWaitMs / 1000)}s of recovery waits, giving up`
+            self.logger.warn(
+              `[pool-rotate] All streaming workers rate-limited for ${resolvedModel}, failing after recovery: ${self.summarizeCloudCodeErrorForLog(errMsg)}`
             )
             throw new HttpException(
-              await this.buildCloudCodeRateLimitMessage(
-                resolvedModel,
-                recovery.waitMs
-              ),
+              self.buildCloudCodeRateLimitMessage(resolvedModel, waitMs),
               HttpStatus.TOO_MANY_REQUESTS
             )
           }
@@ -3975,7 +4734,7 @@ export class GoogleService {
                   `[sendClaudeMessageStream] Prompt too long (${promptTooLong.actual} > ${promptTooLong.max}), ` +
                     `shrinking (attempt ${promptShrinkRetries}/${self.MAX_PROMPT_SHRINK_RETRIES})`
                 )
-                workerAttempt-- // don't consume a worker retry for prompt shrink
+                lastAttemptError = null
                 continue
               }
             }
@@ -3988,13 +4747,21 @@ export class GoogleService {
             errMsg.includes("Token refresh failed") ||
             errMsg.includes("401")
           ) {
-            self.processPool.switchToNextWorker()
-            if (!isLast) {
-              self.logger.warn(
-                `Streaming auth error (attempt ${workerAttempt + 1}/${maxWorkerRetries}), switched to next worker`
+            const authReason = errMsg.includes("Token refresh failed")
+              ? "token refresh failed"
+              : "authentication failed"
+            self.markCurrentWorkerAttempted(excludedWorkerEmails)
+            self.processPool.disableLastWorker(authReason)
+            if (!self.processPool.hasEligibleWorker({ excludedWorkerEmails })) {
+              throw new HttpException(
+                "All accounts authentication failed",
+                HttpStatus.UNAUTHORIZED
               )
-              continue
             }
+            self.logger.warn(
+              `Streaming auth error (attempt ${workerAttempt + 1}/${maxWorkerRetries}), disabled current account and rotating`
+            )
+            continue
           }
 
           if (self.isRetryableWorkerFailure(errMsg)) {
@@ -4004,17 +4771,27 @@ export class GoogleService {
               ? self.MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS
               : self.getRetryableWorkerFailureCooldownMs(errMsg)
 
-            if (isModelCapacityExhausted) {
-              self.processPool.setModelCooldownForLastWorker(
-                resolvedModel,
-                cooldownMs,
-                false
+            // Capacity exhausted is a backend-wide issue — instant retry same worker
+            if (
+              isModelCapacityExhausted &&
+              instantRetry503 < self.MAX_INSTANT_RETRIES
+            ) {
+              instantRetry503++
+              self.logger.warn(
+                `[pool-retry] Streaming model capacity exhausted for ${resolvedModel} [${self.processPool.getLastWorkerEmail()}], waiting ${cooldownMs}ms (503 instant ${instantRetry503}/${self.MAX_INSTANT_RETRIES})`
               )
-            } else {
-              self.processPool.setCooldownForLastWorker(
-                cooldownMs,
-                "temporarily unavailable"
-              )
+              await self.sleepAbortable(cooldownMs, abortSignal)
+              lastAttemptError =
+                err instanceof Error
+                  ? err
+                  : new Error(errMsg || "stream failed")
+              workerAttempt-- // don't consume worker rotation budget
+              continue
+            }
+            instantRetry503 = 0
+
+            if (!isModelCapacityExhausted) {
+              self.processPool.setCooldownForLastWorker(cooldownMs, "transient")
             }
 
             await self.processPool.recycleLastOfficialClient(
@@ -4023,48 +4800,63 @@ export class GoogleService {
                 : `transient failure for ${resolvedModel}`
             )
 
-            if (self.processPool.hasAvailableWorkerForModel(resolvedModel)) {
+            self.markCurrentWorkerAttempted(excludedWorkerEmails)
+
+            const hasAvailableWorker = self.hasAnotherWorkerAvailable(
+              resolvedModel,
+              excludedWorkerEmails
+            )
+            if (hasAvailableWorker) {
               self.logger.warn(
-                `${isModelCapacityExhausted ? "Streaming model capacity exhausted" : "Streaming transient worker failure"} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}: ${errMsg}`
+                `[pool-rotate] ${isModelCapacityExhausted ? "Streaming model capacity exhausted" : "Streaming transient worker failure"} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}: ${self.summarizeCloudCodeErrorForLog(errMsg)}`
               )
               continue
             }
 
-            const waitMs =
-              self.processPool.getMinCooldownMsForModel(resolvedModel)
-            if (waitMs > 0 && waitMs <= self.MAX_RETRY_DELAY) {
-              const recovery = await self.waitForProgressiveRecovery(
-                dto,
+            const waitMs = isModelCapacityExhausted
+              ? cooldownMs
+              : Math.max(
+                  self.processPool.getMinCooldownMsForModel(resolvedModel),
+                  cooldownMs
+                )
+            // All workers exhausted — attempt recovery pass before giving up
+            if (
+              await self.maybeRecoveryPass(
                 resolvedModel,
-                isModelCapacityExhausted
-                  ? "model capacity exhausted"
-                  : "temporarily unavailable",
                 waitMs,
-                workerRecoveryState,
-                "All workers temporarily unavailable"
+                excludedWorkerEmails,
+                recoveryState,
+                abortSignal
               )
-              if (recovery.waited) {
-                workerAttempt-- // give the recovered worker a fair chance
-                continue
-              }
-
-              self.logger.error(
-                `All workers still temporarily unavailable for ${resolvedModel} after ${Math.ceil(workerRecoveryState.totalWaitMs / 1000)}s of recovery waits, giving up`
-              )
-              throw new HttpException(
-                self.buildCloudCodeTemporaryUnavailableMessage(
-                  resolvedModel,
-                  recovery.waitMs
-                ),
-                HttpStatus.SERVICE_UNAVAILABLE
-              )
+            ) {
+              lastAttemptError =
+                err instanceof Error
+                  ? err
+                  : new Error(errMsg || "stream failed")
+              workerAttempt = -1 // recovery cleared excludedWorkerEmails; restart full sweep
+              continue
             }
+            self.logger.warn(
+              `[pool-rotate] All streaming workers temporarily unavailable for ${resolvedModel}, failing after recovery: ${self.summarizeCloudCodeErrorForLog(errMsg)}`
+            )
+            throw new HttpException(
+              self.buildCloudCodeTemporaryUnavailableMessage(
+                resolvedModel,
+                waitMs
+              ),
+              HttpStatus.SERVICE_UNAVAILABLE
+            )
           }
 
           // Non-retryable or last attempt
           throw err
         }
       }
+
+      throw (
+        lastAttemptError ??
+        new Error(`Cloud Code API streaming failed for ${resolvedModel}`)
+      )
     }
 
     // Chunk handler extracted so it can be reused across retry attempts
@@ -4131,16 +4923,23 @@ export class GoogleService {
             push(...emitSignatureBlock(signature))
           }
           const toolId = part.functionCall.id || makeToolUseId()
-          this.rememberToolName(toolId, part.functionCall.name)
+          const originalToolName = part.functionCall.name
+          const mappedToolName =
+            this.fromOfficialAntigravityToolName(originalToolName)
+          const mappedToolInput = this.adaptOfficialAntigravityToolInput(
+            originalToolName,
+            part.functionCall.args || {}
+          )
+          this.rememberToolName(toolId, mappedToolName)
           push(
             ...startBlock(BLOCK_TOOL_USE, {
               type: "tool_use",
               id: toolId,
-              name: part.functionCall.name,
+              name: mappedToolName,
               input: {},
             })
           )
-          const inputJson = JSON.stringify(part.functionCall.args || {})
+          const inputJson = JSON.stringify(mappedToolInput)
           const CHUNK_SIZE = 80
           for (let i = 0; i < inputJson.length; i += CHUNK_SIZE) {
             push(
@@ -4248,6 +5047,7 @@ export class GoogleService {
     // Producer: start streaming in background with worker rotation
     const streamPromise = attemptStream()
       .then(() => {
+        clearCurrentAttemptWatchdog()
         streamDone = true
         if (resolveWaiting) {
           resolveWaiting()
@@ -4255,6 +5055,7 @@ export class GoogleService {
         }
       })
       .catch((err) => {
+        clearCurrentAttemptWatchdog()
         if (err instanceof UpstreamRequestAbortedError) {
           fatalRequestError = err
           streamDone = true

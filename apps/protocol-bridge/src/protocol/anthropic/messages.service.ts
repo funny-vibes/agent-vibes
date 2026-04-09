@@ -315,6 +315,13 @@ export class MessagesService implements OnModuleInit {
           `${result.estimatedTokens} tokens (${dto.messages.length} -> ${result.messages.length} messages)`
       )
     }
+    if (result.toolResultCompaction?.changed) {
+      this.logger.log(
+        `Applied ${result.toolResultCompaction.trigger} tool-result compaction for ${route.backend}: ` +
+          `${result.toolResultCompaction.clearedToolResults} results across ` +
+          `${result.toolResultCompaction.compactedRounds} API rounds`
+      )
+    }
 
     return {
       ...dto,

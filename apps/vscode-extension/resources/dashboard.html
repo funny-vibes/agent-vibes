@@ -2148,8 +2148,66 @@
       return 'setting-badge-warn';
     }
 
-    function stateLabel(state) {
-      var labels = { ready: 'Ready', cooldown: 'Cooldown', degraded: 'Degraded', model_cooldown: 'Model Cooldown', disabled: 'Disabled', unavailable: 'Unavailable' };
+    function getActiveModelCooldowns(entry) {
+      if (!entry || !Array.isArray(entry.modelCooldowns)) return [];
+      var now = Date.now();
+      return entry.modelCooldowns.filter(function(mc) {
+        return mc && mc.cooldownUntil > now;
+      });
+    }
+
+    function getModelCooldownDisplay(entry) {
+      var active = getActiveModelCooldowns(entry);
+      if (!active.length) {
+        return { label: 'Model Hold', summary: '' };
+      }
+
+      var counts = {
+        capacity_exhausted: 0,
+        quota_exhausted: 0,
+        rate_limited: 0,
+        transient: 0,
+        unknown: 0
+      };
+
+      active.forEach(function(mc) {
+        var reason = mc.reason || (mc.quotaExhausted ? 'quota_exhausted' : 'unknown');
+        if (!Object.prototype.hasOwnProperty.call(counts, reason)) {
+          reason = 'unknown';
+        }
+        counts[reason] += 1;
+      });
+
+      var nonZeroReasons = Object.keys(counts).filter(function(key) {
+        return counts[key] > 0;
+      });
+
+      var label = 'Model Hold';
+      if (nonZeroReasons.length === 1) {
+        if (counts.capacity_exhausted > 0) label = 'Model Busy';
+        else if (counts.quota_exhausted > 0) label = 'Quota Cooldown';
+        else if (counts.rate_limited > 0) label = 'Rate Limit';
+        else if (counts.transient > 0) label = 'Temporary Hold';
+      }
+
+      var parts = [];
+      if (counts.capacity_exhausted > 0) parts.push(counts.capacity_exhausted + ' busy');
+      if (counts.quota_exhausted > 0) parts.push(counts.quota_exhausted + ' quota');
+      if (counts.rate_limited > 0) parts.push(counts.rate_limited + ' rate-limited');
+      if (counts.transient > 0) parts.push(counts.transient + ' transient');
+      if (counts.unknown > 0) parts.push(counts.unknown + ' other');
+
+      return {
+        label: label,
+        summary: parts.join(', ')
+      };
+    }
+
+    function stateLabel(state, entry) {
+      var labels = { ready: 'Ready', cooldown: 'Cooldown', degraded: 'Degraded', model_cooldown: 'Model Hold', disabled: 'Disabled', unavailable: 'Unavailable' };
+      if (state === 'model_cooldown') {
+        return getModelCooldownDisplay(entry).label;
+      }
       return labels[state] || state || '--';
     }
 
@@ -2535,7 +2593,7 @@
       h += '<div class="status-grid" style="grid-template-columns:repeat(5,1fr);margin-bottom:var(--sp-3)">' +
         '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Total</div><div class="status-card-value">' + esc(backend.total ?? 0) + '</div></div></div>' +
         '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Ready</div><div class="status-card-value">' + esc(backend.ready ?? 0) + '</div></div></div>' +
-        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Model Cooldown</div><div class="status-card-value">' + esc(backend.modelCooldown ?? 0) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Model Hold</div><div class="status-card-value">' + esc(backend.modelCooldown ?? 0) + '</div></div></div>' +
         '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Cooling</div><div class="status-card-value">' + esc(backend.cooling ?? 0) + '</div></div></div>' +
         '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Disabled</div><div class="status-card-value">' + esc(backend.disabled ?? 0) + '</div></div></div>' +
       '</div>';
@@ -2547,9 +2605,9 @@
         if (entry.cooldownUntil && entry.cooldownUntil > Date.now()) {
           cooldownInfo = ' · ' + formatRelativeTime(entry.cooldownUntil);
         }
-        var modelCdCount = Array.isArray(entry.modelCooldowns)
-          ? entry.modelCooldowns.filter(function(mc) { return mc.cooldownUntil > Date.now(); }).length
-          : 0;
+        var activeModelCooldowns = getActiveModelCooldowns(entry);
+        var modelCdCount = activeModelCooldowns.length;
+        var modelCdDisplay = getModelCooldownDisplay(entry);
         h += '<div style="padding:var(--sp-2) 0;border-top:1px solid var(--line)">';
         h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)">';
         h += '<div style="display:flex;align-items:center;gap:var(--sp-2);min-width:0">' +
@@ -2558,13 +2616,16 @@
           (entry.planType ? '<span class="setting-badge ' + planBadgeCls(entry.planType) + '">' + esc(entry.planType) + '</span>' : '') +
           (entry.source ? '<span class="acct-detail">' + esc(entry.source) + '</span>' : '') +
         '</div>';
-        h += '<div class="acct-detail">' + esc(stateLabel(entry.state)) + cooldownInfo + '</div>';
+        h += '<div class="acct-detail">' + esc(stateLabel(entry.state, entry)) + cooldownInfo + '</div>';
         h += '</div>';
         h += '<div class="acct-detail" style="margin-top:var(--sp-1)">';
         h += (entry.email ? esc(entry.email) : 'No email');
         if (entry.baseUrl) h += ' · ' + esc(entry.baseUrl);
         if (entry.proxyUrl) h += ' · proxy';
-        if (modelCdCount > 0) h += ' · ' + modelCdCount + ' model cooldown(s)';
+        if (modelCdCount > 0) {
+          h += ' · ' + modelCdCount + ' model hold(s)';
+          if (modelCdDisplay.summary) h += ' (' + esc(modelCdDisplay.summary) + ')';
+        }
         if (typeof entry.requestCount === 'number') h += ' · ' + entry.requestCount + ' req';
         h += '</div>';
         h += '</div>';

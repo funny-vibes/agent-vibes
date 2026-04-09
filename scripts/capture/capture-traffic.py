@@ -83,6 +83,19 @@ SENSITIVE_JSON_KEYS = {
     "proxy_url",
 }
 
+# These fields are token counts / output budgets, not credentials. Keep them
+# visible so Cloud Code payloads can be compared against official Antigravity
+# traffic without leaking secrets.
+SAFE_TOKEN_JSON_KEYS = {
+    "maxoutputtokens",
+    "prompttokencount",
+    "candidatestokencount",
+    "cachedcontenttokencount",
+    "toolusetokencount",
+    "thoughtstokencount",
+    "totaltokencount",
+}
+
 RAW_REDACTION_PATTERNS = [
     (
         re.compile(r"(?i)(authorization\"?\s*[:=]\s*\"?bearer\s+)([^\"\\\s]+)"),
@@ -179,6 +192,9 @@ class AntigravityCapture:
 
     def _is_sensitive_key(self, key: str) -> bool:
         normalized = key.strip().lower()
+        compact = re.sub(r"[^a-z0-9]", "", normalized)
+        if compact in SAFE_TOKEN_JSON_KEYS:
+            return False
         if normalized in SENSITIVE_JSON_KEYS:
             return True
         return (

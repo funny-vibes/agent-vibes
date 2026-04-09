@@ -3,6 +3,7 @@ import { randomUUID } from "crypto"
 import {
   ContextCompactionCommit,
   ContextConversationState,
+  ContextTranscriptRecord,
   ProjectedContextMessage,
   UnifiedMessage,
 } from "./types"
@@ -12,6 +13,10 @@ import {
 } from "./context-attachment-builder.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextSummaryService } from "./context-summary.service"
+import {
+  ToolResultCompactionResult,
+  ToolResultCompactionService,
+} from "./tool-result-compaction.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
 import { TokenCounterService } from "./token-counter.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
@@ -21,6 +26,7 @@ export interface ContextCompactionResult {
   projectedMessages: ProjectedContextMessage[]
   estimatedTokens: number
   wasCompacted: boolean
+  toolResultCompaction?: ToolResultCompactionResult
 }
 
 @Injectable()
@@ -37,6 +43,7 @@ export class ContextCompactionService {
     private readonly toolIntegrity: ToolIntegrityService,
     private readonly projection: ContextProjectionService,
     private readonly summary: ContextSummaryService,
+    private readonly toolResultCompaction: ToolResultCompactionService,
     private readonly attachments: ContextAttachmentBuilderService,
     private readonly usageLedger: ContextUsageLedgerService
   ) {}
@@ -102,6 +109,21 @@ export class ContextCompactionService {
       )
     }
 
+    const reactiveCompaction =
+      estimated > effectiveMaxTokens
+        ? this.applyReactiveToolResultCompaction(
+            state,
+            snapshot,
+            attachmentTokenBudget,
+            effectiveMaxTokens
+          )
+        : undefined
+
+    if (reactiveCompaction?.changed) {
+      projected = reactiveCompaction.projectedMessages
+      estimated = reactiveCompaction.estimatedTokens
+    }
+
     const fitted = this.hardFitProjection(projected, effectiveMaxTokens, {
       integrityMode: options.integrityMode,
       pendingToolUseIds: options.pendingToolUseIds,
@@ -119,6 +141,7 @@ export class ContextCompactionService {
         )
       ),
       wasCompacted,
+      toolResultCompaction: reactiveCompaction?.result,
     }
   }
 
@@ -143,7 +166,6 @@ export class ContextCompactionService {
     if (candidateRecords.length === 0) {
       return null
     }
-
     const liveAttachments = this.attachments.buildAttachments(snapshot, {
       maxTokens: attachmentTokenBudget,
     })
@@ -166,11 +188,12 @@ export class ContextCompactionService {
       role: record.role,
       content: record.content,
     })) as UnifiedMessage[]
-    const truncationIndex = this.toolIntegrity.findTruncationPointWithIntegrity(
-      retainedMessages,
-      targetRecentTokens,
-      { mode: integrityMode }
-    )
+    const truncationIndex =
+      this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
+        retainedMessages,
+        targetRecentTokens,
+        { mode: integrityMode }
+      )
     if (truncationIndex <= 0) {
       return null
     }
@@ -189,7 +212,9 @@ export class ContextCompactionService {
       return null
     }
 
-    const suffix = candidateRecords.slice(truncationIndex).map((record) => ({
+    const suffix = candidateRecords
+      .slice(truncationIndex)
+      .map((record) => ({
       role: record.role,
       content: record.content,
     })) as UnifiedMessage[]
@@ -305,6 +330,96 @@ export class ContextCompactionService {
     ])
   }
 
+  private applyReactiveToolResultCompaction(
+    state: ContextConversationState,
+    snapshot: ContextAttachmentSnapshot,
+    attachmentTokenBudget: number,
+    effectiveMaxTokens: number
+  ):
+    | {
+        changed: boolean
+        projectedMessages: ProjectedContextMessage[]
+        estimatedTokens: number
+        result: ToolResultCompactionResult
+      }
+    | undefined {
+    const activeCommit = this.projection.getActiveCommit(state)
+    const sourceRecords = state.records
+    const archivedIndex = activeCommit
+      ? sourceRecords.findIndex(
+          (record) => record.id === activeCommit.archivedThroughRecordId
+        )
+      : -1
+
+    const retainedRecords = sourceRecords.slice(archivedIndex + 1)
+    if (retainedRecords.length === 0) {
+      return undefined
+    }
+
+    const prefixProjection = this.projection.project(state, {
+      ...this.buildProjectionOptions(snapshot, attachmentTokenBudget),
+      recordsOverride:
+        archivedIndex >= 0 ? sourceRecords.slice(0, archivedIndex + 1) : [],
+    })
+    const prefixTokens = this.tokenCounter.countMessages(
+      this.toUnifiedMessages(prefixProjection)
+    )
+    const recordBudget = Math.max(0, effectiveMaxTokens - prefixTokens)
+
+    const result = this.toolResultCompaction.compactRecords(retainedRecords, {
+      trigger: "reactive",
+      targetTokens: recordBudget,
+    }, state.toolResultReplacementState)
+    if (!result.changed) {
+      return {
+        changed: false,
+        projectedMessages: this.projection.project(
+          state,
+          this.buildProjectionOptions(snapshot, attachmentTokenBudget)
+        ),
+        estimatedTokens: this.usageLedger.estimateProjectedTokens(
+          state,
+          undefined,
+          this.buildProjectionOptions(snapshot, attachmentTokenBudget)
+        ),
+        result,
+      }
+    }
+
+    const recordsOverride = this.mergeRetainedRecords(
+      sourceRecords,
+      archivedIndex,
+      result.records
+    )
+    const projectedMessages = this.projection.project(state, {
+      ...this.buildProjectionOptions(snapshot, attachmentTokenBudget),
+      recordsOverride,
+    })
+
+    return {
+      changed: true,
+      projectedMessages,
+      estimatedTokens: this.tokenCounter.countMessages(
+        this.toUnifiedMessages(projectedMessages)
+      ),
+      result,
+    }
+  }
+
+  private mergeRetainedRecords(
+    sourceRecords: readonly ContextTranscriptRecord[],
+    archivedIndex: number,
+    retainedRecords: readonly ContextTranscriptRecord[]
+  ): ContextTranscriptRecord[] {
+    if (archivedIndex < 0) {
+      return [...retainedRecords]
+    }
+    return [
+      ...sourceRecords.slice(0, archivedIndex + 1),
+      ...retainedRecords,
+    ]
+  }
+
   private hardFitProjection(
     projected: ProjectedContextMessage[],
     maxTokens: number,
@@ -346,23 +461,12 @@ export class ContextCompactionService {
 
       const recordBudget = Math.max(0, maxTokens - prefixTokens + 3)
       const retainedUnified = this.toUnifiedMessages(retainedRecords)
-      const truncationIndex =
-        this.toolIntegrity.findTruncationPointWithIntegrity(
-          retainedUnified,
-          recordBudget,
-          { mode: options?.integrityMode }
-        )
-
-      let fittedRecords = retainedUnified.slice(truncationIndex)
+      const fittedRecords = this.toolIntegrity.extractWithIntegrity(
+        retainedUnified,
+        recordBudget,
+        { mode: options?.integrityMode }
+      )
       fitted = [...fittedPrefix, ...fittedRecords]
-
-      while (
-        fittedRecords.length > 0 &&
-        this.tokenCounter.countMessages(fitted) > maxTokens
-      ) {
-        fittedRecords = fittedRecords.slice(1)
-        fitted = [...fittedPrefix, ...fittedRecords]
-      }
 
       if (this.tokenCounter.countMessages(fitted) <= maxTokens) {
         return this.toolIntegrity.sanitizeMessages(fitted, {
@@ -380,13 +484,6 @@ export class ContextCompactionService {
     fitted = this.truncateUnifiedMessagesToBudget(unified, maxTokens, {
       integrityMode: options?.integrityMode,
     })
-
-    while (
-      fitted.length > 1 &&
-      this.tokenCounter.countMessages(fitted) > maxTokens
-    ) {
-      fitted = fitted.slice(1)
-    }
 
     return this.toolIntegrity.sanitizeMessages(fitted, {
       mode: options?.integrityMode ?? "global",
@@ -447,11 +544,12 @@ export class ContextCompactionService {
       integrityMode?: "strict-adjacent" | "global"
     }
   ): UnifiedMessage[] {
-    const truncationIndex = this.toolIntegrity.findTruncationPointWithIntegrity(
-      messages,
-      maxTokens,
-      { mode: options?.integrityMode }
-    )
+    const truncationIndex =
+      this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
+        messages,
+        maxTokens,
+        { mode: options?.integrityMode }
+      )
     return messages.slice(truncationIndex)
   }
 

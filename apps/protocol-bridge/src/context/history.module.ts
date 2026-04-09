@@ -6,6 +6,7 @@ import { ContextCompactionService } from "./context-compaction.service"
 import { ContextManagerService } from "./context-manager.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextSummaryService } from "./context-summary.service"
+import { ToolResultCompactionService } from "./tool-result-compaction.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
 
 /**
@@ -30,6 +31,7 @@ import { ContextUsageLedgerService } from "./context-usage-ledger.service"
   providers: [
     TokenCounterService,
     ToolIntegrityService,
+    ToolResultCompactionService,
     ContextAttachmentBuilderService,
     ContextProjectionService,
     ContextSummaryService,
@@ -40,6 +42,7 @@ import { ContextUsageLedgerService } from "./context-usage-ledger.service"
   exports: [
     TokenCounterService,
     ToolIntegrityService,
+    ToolResultCompactionService,
     ContextAttachmentBuilderService,
     ContextProjectionService,
     ContextSummaryService,

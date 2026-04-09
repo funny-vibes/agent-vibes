@@ -20,6 +20,7 @@ import { getAccountConfigPathCandidates } from "../../shared/protocol-bridge-pat
 import { PersistenceService } from "../../persistence"
 import { UsageStatsService } from "../../usage/usage-stats.service"
 import { translateClaudeToCodex } from "../codex/codex-request-translator"
+import { resolveThinkingIntentFromDto } from "../thinking-intent"
 import {
   createStreamState as createCodexStreamState,
   translateCodexSseEvent,
@@ -144,25 +145,18 @@ function convertOpenAiCompatBudgetToEffort(budgetTokens: number): string {
 }
 
 function resolveOpenAiCompatReasoningEffort(dto: CreateMessageDto): string {
-  if (!dto.thinking) {
+  const intent = resolveThinkingIntentFromDto(dto)
+  if (!intent) {
     return "medium"
   }
 
-  switch (dto.thinking.type) {
-    case "enabled": {
-      const budget = dto.thinking.budget_tokens
-      if (budget == null) return "medium"
-      return convertOpenAiCompatBudgetToEffort(budget)
-    }
+  switch (intent.mode) {
+    case "explicit_budget":
+      return convertOpenAiCompatBudgetToEffort(intent.budgetTokens)
     case "disabled":
       return normalizeOpenAiCompatReasoningEffort("none")
     case "adaptive":
-    case "auto":
-      return normalizeOpenAiCompatReasoningEffort(
-        typeof dto.output_config?.effort === "string"
-          ? dto.output_config.effort
-          : "auto"
-      )
+      return normalizeOpenAiCompatReasoningEffort(intent.effort ?? "auto")
     default:
       return "medium"
   }

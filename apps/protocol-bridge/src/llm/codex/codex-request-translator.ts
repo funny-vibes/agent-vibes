@@ -10,6 +10,7 @@
 import { normalizeToolProtocolMessages } from "../../context/tool-protocol-normalizer"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
+import { resolveThinkingIntentFromDto } from "../thinking-intent"
 import { buildShortNameMap, shortenNameIfNeeded } from "./tool-name-shortener"
 
 // ── Types for Codex Responses API ──────────────────────────────────────
@@ -124,21 +125,18 @@ function resolveReasoningEffort(
   dto: CreateMessageDto,
   modelName: string
 ): string {
-  if (!dto.thinking) {
+  const intent = resolveThinkingIntentFromDto(dto)
+  if (!intent) {
     return "medium"
   }
 
-  switch (dto.thinking.type) {
-    case "enabled":
-      if (dto.thinking.budget_tokens != null) {
-        return convertBudgetToEffort(dto.thinking.budget_tokens, modelName)
-      }
-      return "medium"
+  switch (intent.mode) {
+    case "explicit_budget":
+      return convertBudgetToEffort(intent.budgetTokens, modelName)
     case "disabled":
       return normalizeDirectCodexEffort("none", modelName)
-    case "adaptive":
-    case "auto": {
-      const effort = dto.output_config?.effort
+    case "adaptive": {
+      const effort = intent.effort
       if (typeof effort === "string" && effort.trim()) {
         return normalizeDirectCodexEffort(effort, modelName)
       }

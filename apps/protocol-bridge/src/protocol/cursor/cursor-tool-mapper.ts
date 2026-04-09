@@ -1063,7 +1063,6 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   get_mcp_tools: "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
   read_lints: "CLIENT_SIDE_TOOL_V2_READ_LINTS",
   task: "CLIENT_SIDE_TOOL_V2_TASK_V2",
-  subagent: "CLIENT_SIDE_TOOL_V2_TASK_V2",
   read_todos: "CLIENT_SIDE_TOOL_V2_TODO_READ",
   update_todos: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
   todo_read: "CLIENT_SIDE_TOOL_V2_TODO_READ",

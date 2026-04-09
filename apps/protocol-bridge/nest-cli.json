@@ -8,7 +8,7 @@
     "tsConfigPath": "tsconfig.build.json",
     "assets": [
       {
-        "include": "llm/native/worker.js",
+        "include": "llm/native/go-worker/**/*",
         "watchAssets": true
       },
       {

@@ -16,19 +16,22 @@ export function registerRequestHooks(
       const url = request.url || ""
       const ct = request.headers["content-type"] || ""
 
-      // Log ALL proto requests for debugging routing issues
-      if (ct.includes("proto") || ct.includes("connect")) {
-        const rawEncoding =
-          request.headers["connect-content-encoding"] ||
-          request.headers["content-encoding"] ||
-          ""
-        const encoding = Array.isArray(rawEncoding)
-          ? rawEncoding[0]
-          : rawEncoding
-        logger.debug(
-          `[ALL-PROTO] ${request.method} ${url} - Content-Type: ${ct}` +
-            (encoding ? `, Encoding: ${encoding}` : "")
-        )
+      if (process.env.LOG_PROTO_TRAFFIC === "true") {
+        // Very noisy Cursor dashboard/analytics polling diagnostics. Keep this
+        // behind an explicit flag instead of LOG_DEBUG.
+        if (ct.includes("proto") || ct.includes("connect")) {
+          const rawEncoding =
+            request.headers["connect-content-encoding"] ||
+            request.headers["content-encoding"] ||
+            ""
+          const encoding = Array.isArray(rawEncoding)
+            ? rawEncoding[0]
+            : rawEncoding
+          logger.debug(
+            `[ALL-PROTO] ${request.method} ${url} - Content-Type: ${ct}` +
+              (encoding ? `, Encoding: ${encoding}` : "")
+          )
+        }
       }
 
       // Log Cursor gRPC requests (agent only)

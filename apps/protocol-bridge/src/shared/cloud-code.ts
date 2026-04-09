@@ -80,10 +80,8 @@ export interface CloudCodeGenerationConfig {
 /** Thinking/reasoning configuration */
 export interface CloudCodeThinkingConfig {
   includeThoughts: boolean
-  /** Explicit reasoning budget for non-adaptive thinking flows */
+  /** Official Cloud Code wire shape uses a model-specific thinking budget. */
   thinkingBudget?: number
-  /** Cloud Code adaptive thinking level */
-  thinkingLevel?: "medium" | "high"
 }
 
 /** Safety setting entry */
@@ -119,6 +117,7 @@ export interface CloudCodeGoogleSearchTool {
 export interface CloudCodeToolConfig {
   functionCallingConfig: {
     mode: "VALIDATED" | "AUTO" | "NONE"
+    allowedFunctionNames?: string[]
   }
 }
 

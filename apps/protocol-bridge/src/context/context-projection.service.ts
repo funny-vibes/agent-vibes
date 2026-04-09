@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common"
 import {
   ContextCompactionCommit,
   ContextConversationState,
+  ContextTranscriptRecord,
   ProjectedContextMessage,
 } from "./types"
 import {
@@ -18,6 +19,7 @@ export class ContextProjectionService {
     options?: {
       attachmentSnapshot?: ContextAttachmentSnapshot
       attachmentTokenBudget?: number
+      recordsOverride?: readonly ContextTranscriptRecord[]
     }
   ): ProjectedContextMessage[] {
     const liveAttachments = options?.attachmentSnapshot
@@ -25,23 +27,26 @@ export class ContextProjectionService {
           maxTokens: options.attachmentTokenBudget,
         })
       : []
+    const sourceRecords = options?.recordsOverride || state.records
     const activeCommit = this.getActiveCommit(state)
     if (!activeCommit) {
       return [
         ...this.buildAttachmentMessages(liveAttachments),
-        ...this.buildRecordMessages(state.records),
+        ...this.buildRecordMessages(sourceRecords),
       ]
     }
 
-    const archivedIndex = state.records.findIndex(
+    const archivedIndex = sourceRecords.findIndex(
       (record) => record.id === activeCommit.archivedThroughRecordId
     )
     if (archivedIndex < 0) {
       return [
         ...this.buildAttachmentMessages(liveAttachments),
-        ...this.buildRecordMessages(state.records),
+        ...this.buildRecordMessages(sourceRecords),
       ]
     }
+
+    const retainedRecords = sourceRecords.slice(archivedIndex + 1)
 
     const projected: ProjectedContextMessage[] = [
       {
@@ -60,7 +65,7 @@ export class ContextProjectionService {
     ]
 
     projected.push(
-      ...this.buildRecordMessages(state.records.slice(archivedIndex + 1))
+      ...this.buildRecordMessages(retainedRecords)
     )
 
     return projected
@@ -92,7 +97,7 @@ export class ContextProjectionService {
   }
 
   private buildRecordMessages(
-    records: ContextConversationState["records"]
+    records: readonly ContextTranscriptRecord[]
   ): ProjectedContextMessage[] {
     return records.map((record) => ({
       role: record.role,

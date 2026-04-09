@@ -118,6 +118,10 @@ export class ContextManagerService {
       })),
       compactionHistory: [],
       usageLedger: {},
+      toolResultReplacementState: {
+        seenToolUseIds: [],
+        replacementByToolUseId: {},
+      },
     }
   }
 }

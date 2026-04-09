@@ -16,6 +16,7 @@ import { getAntigravityAccountsConfigPathCandidates } from "../../shared/protoco
 import { UsageStatsService } from "../../usage/usage-stats.service"
 import {
   BackendPoolEntryState,
+  BackendPoolModelCooldownReason,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
 import { UpstreamRequestAbortedError } from "../shared/abort-signal"
@@ -63,6 +64,7 @@ interface PendingRequest {
 interface WorkerModelState {
   cooldownUntil: number // Date.now() timestamp; 0 = available
   quotaExhausted: boolean
+  reason?: BackendPoolModelCooldownReason
 }
 
 /**
@@ -85,13 +87,18 @@ interface WorkerHandle {
   draining: boolean
   pending: Map<string, PendingRequest>
   requestCount: number
+  activeGenerationRequests: number
   cooldownUntil: number // Date.now() timestamp; 0 = available
+  cooldownReason?: BackendPoolModelCooldownReason
   modelStates: Map<string, WorkerModelState> // per-model cooldown state
+  disabledAt?: number
+  disabledReason?: string
   bootstrapComplete: boolean
   readyResolve?: () => void // event-driven ready notification
   intentionalShutdown?: boolean
   drainReason?: string
   drainStartedAt?: number
+  stderrBuffer?: string
 }
 
 export interface GoogleQuotaModelSnapshot {
@@ -114,31 +121,33 @@ export interface GoogleQuotaAccountSnapshot {
   fetchedAt: number
 }
 
-const WORKER_SCRIPT = path.resolve(__dirname, "worker.js")
-
-const ANTIGRAVITY_HELPER_RELATIVE_PATH = path.join(
-  "Contents",
-  "Frameworks",
-  "Antigravity Helper (Plugin).app",
-  "Contents",
-  "MacOS",
-  "Antigravity Helper (Plugin)"
-)
-
-const ANTIGRAVITY_NODE_MODULES_RELATIVE_PATH = path.join(
-  "Contents",
-  "Resources",
-  "app",
-  "node_modules"
-)
-
-function expandHomeDir(inputPath: string): string {
-  if (inputPath === "~") return os.homedir()
-  if (inputPath.startsWith("~/")) {
-    return path.join(os.homedir(), inputPath.slice(2))
+export class WorkerPoolCooldownError extends Error {
+  constructor(
+    readonly waitMs: number,
+    readonly model?: string,
+    readonly reason?: BackendPoolModelCooldownReason
+  ) {
+    super(
+      `No available worker${model ? ` for ${model}` : ""}; shortest cooldown ${waitMs}ms${
+        reason ? ` (${reason})` : ""
+      }`
+    )
+    this.name = "WorkerPoolCooldownError"
   }
-  return inputPath
 }
+
+interface WorkerSelectionOptions {
+  excludedWorkerEmails?: ReadonlySet<string>
+  requireGenerationCapacity?: boolean
+}
+
+const GO_WORKER_DIR = path.resolve(__dirname, "go-worker")
+const GO_WORKER_MODULE_FILE = path.join(GO_WORKER_DIR, "go.mod")
+const GO_WORKER_SUM_FILE = path.join(GO_WORKER_DIR, "go.sum")
+const GO_WORKER_ENTRY = path.join(GO_WORKER_DIR, "main.go")
+const GO_WORKER_BINARY_NAME =
+  "agent-vibes-google-go-worker" + (process.platform === "win32" ? ".exe" : "")
+const GO_WORKER_BUNDLED_BINARY = path.join(GO_WORKER_DIR, GO_WORKER_BINARY_NAME)
 
 function pickFirstNonEmptyString(...values: unknown[]): string | undefined {
   for (const value of values) {
@@ -214,23 +223,12 @@ function resolveWorkerConversationSession(
   return created
 }
 
-function resolveAppBundlePaths(appPath: string): {
-  nodeBinary: string
-  nodeModules: string
-} {
-  return {
-    nodeBinary: path.join(appPath, ANTIGRAVITY_HELPER_RELATIVE_PATH),
-    nodeModules: path.join(appPath, ANTIGRAVITY_NODE_MODULES_RELATIVE_PATH),
-  }
-}
-
 /**
- * ProcessPoolService — Manages a pool of Antigravity native worker processes
+ * ProcessPoolService — Manages a pool of Go native worker processes
  *
  * Each worker process:
- * - Runs using the Antigravity IDE's Node.js binary
- * - Loads google-auth-library from the IDE's node_modules
- * - Makes Cloud Code API calls with 100% native fingerprint
+ * - Runs as a compiled Go binary (aligned with Antigravity Go LS fingerprint)
+ * - Makes Cloud Code API calls with native Go TLS/HTTP/2 fingerprint
  * - Communicates via JSON Lines over stdin/stdout
  */
 @Injectable()
@@ -256,14 +254,24 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   private lastUsedWorker: WorkerHandle | null = null
   /** Per-model sticky affinity: remember the last worker that succeeded for each model */
   private readonly preferredWorkerByModel = new Map<string, WorkerHandle>()
+  /** Pool-level model gates for transient global model saturation (e.g. 503 capacity exhausted). */
+  private readonly poolModelCooldowns = new Map<
+    string,
+    { cooldownUntil: number; reason?: BackendPoolModelCooldownReason }
+  >()
+  private readonly MAX_CONCURRENT_GENERATIONS_PER_WORKER = 1
+  private readonly WORKER_BUSY_RETRY_HINT_MS = 1000
+  private readonly GOOGLE_QUOTA_SNAPSHOT_CACHE_TTL_MS = 60_000
   /** Timeout for non-streaming generation (deep thinking models may take long) */
   private readonly GENERATE_TIMEOUT_MS = 3_600_000 // 1 hour
-  private antigravityNodeBinary: string | null = null
-  private antigravityNodeModules: string | null = null
+  private antigravityGoBinary: string | null = null
+  private antigravityGoBinaryOwned = false
   private accountsConfigPath: string | null = null
   private accountsWatcher: fs.FSWatcher | null = null
   private accountsReloadTimer: ReturnType<typeof setTimeout> | null = null
   private reloadAccountsPromise: Promise<number> | null = null
+  private googleQuotaSnapshotCache: GoogleQuotaAccountSnapshot[] = []
+  private googleQuotaSnapshotFetchedAt = 0
   /** Model to fallback to when all Claude workers are quota-exhausted (configured in antigravity-accounts.json) */
   private _quotaFallbackModel: string | null = null
 
@@ -275,23 +283,13 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit(): Promise<void> {
     this.logger.log("Initializing native process pool...")
 
-    const runtimePaths = this.resolveAntigravityRuntimePaths()
-    if (!runtimePaths) {
+    const goBinary = await this.prepareGoWorkerBinary()
+    if (!goBinary) {
+      this.logger.warn("Go worker binary unavailable — native pool disabled")
       return
     }
-    this.antigravityNodeBinary = runtimePaths.nodeBinary
-    this.antigravityNodeModules = runtimePaths.nodeModules
-    this.logger.log(
-      `Using Antigravity runtime: ${runtimePaths.nodeBinary} (NODE_PATH=${runtimePaths.nodeModules})`
-    )
-
-    // Verify worker script exists
-    if (!fs.existsSync(WORKER_SCRIPT)) {
-      this.logger.warn(
-        `Worker script not found: ${WORKER_SCRIPT} — native pool disabled`
-      )
-      return
-    }
+    this.antigravityGoBinary = goBinary
+    this.logger.log(`Using Go native worker backend: ${goBinary}`)
 
     // Load accounts and spawn workers
     const accounts = this.loadAccounts()
@@ -308,86 +306,148 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       `Process pool initialized: ${this.workers.length} worker(s)`
     )
 
-    // Pre-flight quota check: test each worker and cooldown exhausted ones
     await this.preflightQuotaCheck()
     this.startAccountsWatcher()
   }
 
-  private resolveAntigravityRuntimePaths(): {
-    nodeBinary: string
-    nodeModules: string
-  } | null {
-    const envBinary =
-      this.configService?.get<string>("ANTIGRAVITY_NODE_BINARY") ??
-      process.env.ANTIGRAVITY_NODE_BINARY
-    const envModules =
-      this.configService?.get<string>("ANTIGRAVITY_NODE_MODULES") ??
-      process.env.ANTIGRAVITY_NODE_MODULES
-    const envAppPath =
-      this.configService?.get<string>("ANTIGRAVITY_APP_PATH") ??
-      process.env.ANTIGRAVITY_APP_PATH
+  private spawnAsync(
+    command: string,
+    args: string[],
+    options?: { cwd?: string; env?: NodeJS.ProcessEnv }
+  ): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, args, {
+        ...options,
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout?.on("data", (data: Buffer) => {
+        stdout += data.toString()
+      })
+      child.stderr?.on("data", (data: Buffer) => {
+        stderr += data.toString()
+      })
+      child.on("error", (err) => reject(err))
+      child.on("close", (code) => {
+        if (code === 0) resolve({ stdout, stderr })
+        else reject(new Error(stderr.trim() || stdout.trim() || `exit ${code}`))
+      })
+    })
+  }
 
-    if (envBinary && envModules) {
-      const nodeBinary = expandHomeDir(envBinary.trim())
-      const nodeModules = expandHomeDir(envModules.trim())
-      if (!fs.existsSync(nodeBinary)) {
-        this.logger.error(
-          `Configured ANTIGRAVITY_NODE_BINARY does not exist: ${nodeBinary}`
-        )
+  private isGoBinaryCached(binaryPath: string): boolean {
+    try {
+      const binaryStat = fs.statSync(binaryPath)
+      const sourceFiles = [
+        GO_WORKER_MODULE_FILE,
+        GO_WORKER_SUM_FILE,
+        GO_WORKER_ENTRY,
+      ]
+      const latestSourceMtime = Math.max(
+        ...sourceFiles.map((f) => fs.statSync(f).mtimeMs)
+      )
+      return binaryStat.mtimeMs > latestSourceMtime
+    } catch {
+      return false
+    }
+  }
+
+  private hasBundledGoWorkerBinary(): boolean {
+    try {
+      return fs.statSync(GO_WORKER_BUNDLED_BINARY).isFile()
+    } catch {
+      return false
+    }
+  }
+
+  private async prepareGoWorkerBinary(): Promise<string | null> {
+    const sourceFiles = [
+      GO_WORKER_MODULE_FILE,
+      GO_WORKER_SUM_FILE,
+      GO_WORKER_ENTRY,
+    ]
+    const hasBundledBinary = this.hasBundledGoWorkerBinary()
+    for (const file of sourceFiles) {
+      if (!fs.existsSync(file)) {
+        if (hasBundledBinary) {
+          this.antigravityGoBinaryOwned = false
+          this.logger.warn(
+            `Go worker source not found: ${file}; using bundled Go worker binary`
+          )
+          return GO_WORKER_BUNDLED_BINARY
+        }
+        this.logger.error(`Go worker source not found: ${file}`)
         return null
       }
-      if (!fs.existsSync(nodeModules)) {
-        this.logger.error(
-          `Configured ANTIGRAVITY_NODE_MODULES does not exist: ${nodeModules}`
-        )
-        return null
-      }
-      return { nodeBinary, nodeModules }
     }
 
-    if (envBinary || envModules) {
-      this.logger.error(
-        "ANTIGRAVITY_NODE_BINARY and ANTIGRAVITY_NODE_MODULES must be set together"
+    const goCommand =
+      pickFirstNonEmptyString(
+        this.configService?.get<string>("GO_BINARY", ""),
+        process.env.GO_BINARY
+      ) || "go"
+
+    try {
+      await this.spawnAsync(goCommand, ["version"])
+    } catch {
+      if (hasBundledBinary) {
+        this.antigravityGoBinaryOwned = false
+        this.logger.warn(
+          `Go toolchain not available (tried: ${goCommand}). Using bundled Go worker binary.`
+        )
+        return GO_WORKER_BUNDLED_BINARY
+      }
+      this.logger.warn(
+        `Go toolchain not available (tried: ${goCommand}). Install Go or set GO_BINARY.`
       )
       return null
     }
 
-    const appCandidates = [
-      envAppPath?.trim(),
-      "/Applications/Antigravity.app",
-      path.join(os.homedir(), "Applications", "Antigravity.app"),
-    ]
-      .filter((candidate): candidate is string => Boolean(candidate))
-      .map((candidate) => expandHomeDir(candidate))
+    const outputDir = path.join(os.tmpdir(), "agent-vibes", "native-workers")
+    fs.mkdirSync(outputDir, { recursive: true })
+    const outputBinary = path.join(outputDir, GO_WORKER_BINARY_NAME)
 
-    for (const appPath of appCandidates) {
-      const resolved = resolveAppBundlePaths(appPath)
-      if (
-        fs.existsSync(resolved.nodeBinary) &&
-        fs.existsSync(resolved.nodeModules)
-      ) {
-        return resolved
-      }
+    if (this.isGoBinaryCached(outputBinary)) {
+      this.antigravityGoBinaryOwned = true
+      this.logger.log(`Using cached Go worker binary: ${outputBinary}`)
+      return outputBinary
     }
 
-    this.logger.error(
-      [
-        "Antigravity runtime not found.",
-        "Set ANTIGRAVITY_APP_PATH to the .app bundle, or set both ANTIGRAVITY_NODE_BINARY and ANTIGRAVITY_NODE_MODULES.",
-        `Checked app bundles: ${appCandidates.join(", ")}`,
-      ].join(" ")
-    )
-    return null
+    try {
+      await this.spawnAsync(goCommand, ["build", "-o", outputBinary, "."], {
+        cwd: GO_WORKER_DIR,
+        env: process.env,
+      })
+    } catch (err) {
+      this.logger.error(
+        `Failed to build Go native worker: ${(err as Error).message}`
+      )
+      if (hasBundledBinary) {
+        this.antigravityGoBinaryOwned = false
+        this.logger.warn(
+          `Falling back to bundled Go worker binary: ${GO_WORKER_BUNDLED_BINARY}`
+        )
+        return GO_WORKER_BUNDLED_BINARY
+      }
+      return null
+    }
+
+    try {
+      fs.chmodSync(outputBinary, 0o755)
+    } catch {
+      // chmod best-effort
+    }
+
+    this.antigravityGoBinaryOwned = true
+    return outputBinary
   }
 
   /**
    * Pre-flight quota check: probe each worker with a minimal request.
-   * Workers that return 429 get a long cooldown so they are not
-   * selected during rotation.
+   * This is observability-only and must not write pessimistic pool state.
    */
   private async preflightQuotaCheck(): Promise<void> {
-    const PREFLIGHT_COOLDOWN_MS = 5 * 60_000 // 5 minutes
-
     const checks = this.workers
       .filter((w) => w.ready)
       .map(async (worker) => {
@@ -400,17 +460,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         } catch (err) {
           const msg = (err as Error).message || ""
           if (msg.includes("429")) {
-            worker.cooldownUntil = Date.now() + PREFLIGHT_COOLDOWN_MS
             this.logger.warn(
-              `[Worker ${worker.account.email}] quota check: ✗ rate-limited, cooldown ${PREFLIGHT_COOLDOWN_MS / 1000}s`
+              `[Worker ${worker.account.email}] quota check: ✗ rate-limited (${msg.slice(0, 120)})`
             )
           } else if (
             msg.includes("Worker request timeout") ||
             msg.includes("Worker stream timeout")
           ) {
-            worker.cooldownUntil = Date.now() + PREFLIGHT_COOLDOWN_MS
             this.logger.warn(
-              `[Worker ${worker.account.email}] quota check: ✗ temporarily unavailable (${msg.slice(0, 120)}), cooldown ${PREFLIGHT_COOLDOWN_MS / 1000}s`
+              `[Worker ${worker.account.email}] quota check: ✗ temporarily unavailable (${msg.slice(0, 120)})`
             )
           } else {
             this.logger.warn(
@@ -437,6 +495,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       this.killWorker(worker)
     }
     this.workers.length = 0
+    if (this.antigravityGoBinary && this.antigravityGoBinaryOwned) {
+      try {
+        fs.unlinkSync(this.antigravityGoBinary)
+      } catch {
+        /* best-effort */
+      }
+    }
+    this.antigravityGoBinary = null
+    this.antigravityGoBinaryOwned = false
   }
 
   private getDefaultProxyUrl(): string | undefined {
@@ -591,19 +658,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    * Spawn a native worker process for the given account
    */
   private async spawnWorker(account: NativeAccount): Promise<void> {
-    if (!this.antigravityNodeBinary || !this.antigravityNodeModules) {
-      throw new Error("Antigravity runtime paths not initialized")
-    }
-
-    const child = spawn(this.antigravityNodeBinary, [WORKER_SCRIPT], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        ELECTRON_RUN_AS_NODE: "1",
-        NODE_PATH: this.antigravityNodeModules,
-        NODE_OPTIONS: "",
-      },
-    })
+    const child = this.spawnGoWorker()
 
     const normalizedAccount = {
       ...account,
@@ -621,9 +676,14 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       draining: false,
       pending: new Map(),
       requestCount: 0,
+      activeGenerationRequests: 0,
       cooldownUntil: 0,
+      cooldownReason: undefined,
       modelStates: new Map(),
+      disabledAt: undefined,
+      disabledReason: undefined,
       bootstrapComplete: false,
+      stderrBuffer: "",
     }
 
     // Parse stdout as JSON Lines
@@ -638,12 +698,11 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
 
     // Log stderr
     child.stderr?.on("data", (data: Buffer) => {
-      this.logger.debug(
-        `[Worker ${account.email}] stderr: ${data.toString().trim()}`
-      )
+      this.logWorkerStderr(handle, data.toString())
     })
 
     child.on("exit", (code: number | null) => {
+      this.flushWorkerStderr(handle)
       this.logger.warn(`[Worker ${account.email}] exited with code ${code}`)
       handle.ready = false
       // Reject all pending requests
@@ -687,6 +746,32 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
 
     handle.ready = true
     this.logger.log(`[Worker ${account.email}] initialized and ready`)
+  }
+
+  private spawnGoWorker(): ChildProcess {
+    if (!this.antigravityGoBinary) {
+      throw new Error("Go worker binary not initialized")
+    }
+
+    const workerEnv: Record<string, string | undefined> = {
+      HOME: process.env.HOME,
+      USERPROFILE: process.env.USERPROFILE,
+      PATH: process.env.PATH,
+      TMPDIR: process.env.TMPDIR,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      NO_PROXY: process.env.NO_PROXY,
+      ANTIGRAVITY_PROXY_URL: process.env.ANTIGRAVITY_PROXY_URL,
+      SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+      SSL_CERT_DIR: process.env.SSL_CERT_DIR,
+    }
+
+    return spawn(this.antigravityGoBinary, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: workerEnv,
+    })
   }
 
   /**
@@ -927,6 +1012,61 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.applyWorkerCloudCodeIdentity(handle, payload)
   }
 
+  private summarizeCloudCodePayload(payload: Record<string, unknown>): string {
+    const request =
+      payload.request && typeof payload.request === "object"
+        ? (payload.request as Record<string, unknown>)
+        : {}
+    const generationConfig =
+      request.generationConfig && typeof request.generationConfig === "object"
+        ? (request.generationConfig as Record<string, unknown>)
+        : {}
+    const contentsCount = Array.isArray(request.contents)
+      ? request.contents.length
+      : 0
+    const toolNames = Array.isArray(request.tools)
+      ? request.tools
+          .flatMap((tool) =>
+            tool && typeof tool === "object"
+              ? (((tool as Record<string, unknown>).functionDeclarations as
+                  | Array<Record<string, unknown>>
+                  | undefined) ?? [])
+              : []
+          )
+          .map((declaration) =>
+            typeof declaration.name === "string" ? declaration.name : ""
+          )
+          .filter(Boolean)
+      : []
+    const thinkingConfig =
+      generationConfig.thinkingConfig &&
+      typeof generationConfig.thinkingConfig === "object"
+        ? JSON.stringify(generationConfig.thinkingConfig)
+        : "none"
+
+    return (
+      `project=${typeof payload.project === "string" ? payload.project : ""} ` +
+      `model=${typeof payload.model === "string" ? payload.model : ""} ` +
+      `requestType=${typeof payload.requestType === "string" ? payload.requestType : ""} ` +
+      `requestId=${typeof payload.requestId === "string" ? payload.requestId : ""} ` +
+      `sessionId=${typeof request.sessionId === "string" || typeof request.sessionId === "number" ? String(request.sessionId) : ""} ` +
+      `contents=${contentsCount} ` +
+      `maxOutputTokens=${typeof generationConfig.maxOutputTokens === "number" ? generationConfig.maxOutputTokens : ""} ` +
+      `thinkingConfig=${thinkingConfig} ` +
+      `tools=${toolNames.join(",") || "none"}`
+    )
+  }
+
+  private logPreparedCloudCodePayload(
+    handle: WorkerHandle,
+    payload: Record<string, unknown>,
+    method: string
+  ): void {
+    this.logger.debug(
+      `[Worker ${handle.account.email}] prepared ${method} payload: ${this.summarizeCloudCodePayload(payload)}`
+    )
+  }
+
   private createOutboundWorkerPayload(
     payload: Record<string, unknown>
   ): Record<string, unknown> {
@@ -1093,6 +1233,23 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.defaultWorkerIndex = index
   }
 
+  private advanceWorkerIndexPastWorker(
+    worker: WorkerHandle,
+    model?: string
+  ): void {
+    const readyWorkers = this.workers.filter((candidate) =>
+      this.shouldWorkerAcceptNewRequests(candidate)
+    )
+    if (readyWorkers.length === 0) return
+
+    const workerIndex = readyWorkers.indexOf(worker)
+    if (workerIndex < 0) return
+
+    // Start the next round-robin scan after the worker that just failed so a
+    // zero/near-zero cooldown does not cause an immediate self-selection loop.
+    this.setWorkerIndex(workerIndex + 1, model)
+  }
+
   /**
    * Get the next available worker (sticky-preferred, then round-robin fallback)
    *
@@ -1105,34 +1262,81 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    * A worker stays preferred until it enters cooldown, at which point the
    * preference is cleared and round-robin takes over.
    */
-  private getNextWorker(model?: string): WorkerHandle {
+  private getNextWorker(
+    model?: string,
+    allowCooldownFallback: boolean = true,
+    options: WorkerSelectionOptions = {}
+  ): WorkerHandle {
     const now = Date.now()
-    const readyWorkers = this.workers.filter((w) =>
-      this.shouldWorkerAcceptNewRequests(w)
-    )
+    const poolModelCooldown = model
+      ? this.getActivePoolModelCooldown(model, now)
+      : undefined
+    if (poolModelCooldown) {
+      throw new WorkerPoolCooldownError(
+        poolModelCooldown.cooldownUntil - now,
+        model,
+        poolModelCooldown.reason
+      )
+    }
+    const readyWorkers = this.workers.filter((worker) => {
+      if (!this.shouldWorkerAcceptNewRequests(worker)) return false
+      const email = worker.account.email?.trim() || ""
+      return !options.excludedWorkerEmails?.has(email)
+    })
     if (readyWorkers.length === 0) {
-      throw new Error("No ready workers in the process pool")
+      throw new WorkerPoolCooldownError(
+        options.requireGenerationCapacity ? this.WORKER_BUSY_RETRY_HINT_MS : 0,
+        model,
+        options.requireGenerationCapacity ? "transient" : undefined
+      )
+    }
+
+    const selectableWorkers = options.requireGenerationCapacity
+      ? readyWorkers.filter(
+          (worker) =>
+            worker.activeGenerationRequests <
+            this.MAX_CONCURRENT_GENERATIONS_PER_WORKER
+        )
+      : readyWorkers
+    if (selectableWorkers.length === 0) {
+      throw new WorkerPoolCooldownError(
+        this.WORKER_BUSY_RETRY_HINT_MS,
+        model,
+        "transient"
+      )
     }
 
     // 1. Try preferred worker for this model (sticky affinity)
     if (model) {
       const preferred = this.preferredWorkerByModel.get(model)
-      if (preferred && preferred.ready) {
+      if (preferred) {
         const globalAvailable = preferred.cooldownUntil <= now
         const modelState = preferred.modelStates.get(model)
         const modelAvailable = !modelState || modelState.cooldownUntil <= now
 
-        if (globalAvailable && modelAvailable) {
+        if (
+          selectableWorkers.includes(preferred) &&
+          globalAvailable &&
+          modelAvailable
+        ) {
           // Update worker index to match so round-robin stays coherent
-          const preferredIdx = readyWorkers.indexOf(preferred)
+          const preferredIdx = selectableWorkers.indexOf(preferred)
           if (preferredIdx >= 0) {
             this.setWorkerIndex(preferredIdx, model)
           }
           return preferred
         }
-        // Preferred worker is in cooldown — clear preference so we don't
-        // keep checking a stale entry on every request
-        this.preferredWorkerByModel.delete(model)
+
+        // Clear sticky preference when the worker has become permanently
+        // unschedulable for the model (disabled/draining/cooldown). Keep the
+        // preference when this request merely excluded the worker or it is busy.
+        if (
+          !this.shouldWorkerAcceptNewRequests(preferred) ||
+          !globalAvailable ||
+          !modelAvailable
+        ) {
+          this.preferredWorkerByModel.delete(model)
+        }
       }
     }
 
@@ -1140,15 +1344,16 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     //    the current index if it is still available, avoiding unnecessary skips)
     const currentIndex = this.getWorkerIndex(model)
     const startIndex = this.normalizeWorkerIndex(
-      readyWorkers.length,
+      selectableWorkers.length,
       currentIndex
     )
     let fallbackIndex = startIndex
     let fallbackCooldown = Number.POSITIVE_INFINITY
+    let fallbackReason: BackendPoolModelCooldownReason | undefined
 
-    for (let offset = 0; offset < readyWorkers.length; offset++) {
-      const index = (startIndex + offset) % readyWorkers.length
-      const worker = readyWorkers[index]
+    for (let offset = 0; offset < selectableWorkers.length; offset++) {
+      const index = (startIndex + offset) % selectableWorkers.length
+      const worker = selectableWorkers[index]
       if (!worker) continue
 
       const globalAvailable = worker.cooldownUntil <= now
@@ -1161,18 +1366,31 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       }
 
       // Track the worker whose effective cooldown expires soonest
-      const effectiveCooldown = Math.max(
-        worker.cooldownUntil,
-        modelState?.cooldownUntil ?? 0
-      )
+      let effectiveCooldown = worker.cooldownUntil
+      let effectiveReason = worker.cooldownReason
+      const modelCooldownUntil = modelState?.cooldownUntil ?? 0
+      if (modelCooldownUntil >= effectiveCooldown) {
+        effectiveCooldown = modelCooldownUntil
+        effectiveReason = modelState?.reason ?? effectiveReason
+      }
       if (effectiveCooldown < fallbackCooldown) {
         fallbackCooldown = effectiveCooldown
         fallbackIndex = index
+        fallbackReason = effectiveReason
       }
     }
 
+    const fallbackWorker = selectableWorkers[fallbackIndex]
+    const remainingMs = Number.isFinite(fallbackCooldown)
+      ? Math.max(0, fallbackCooldown - now)
+      : 0
+
+    if (!allowCooldownFallback && remainingMs > 0) {
+      throw new WorkerPoolCooldownError(remainingMs, model, fallbackReason)
+    }
+
     this.setWorkerIndex(fallbackIndex, model)
-    return readyWorkers[fallbackIndex]!
+    return fallbackWorker!
   }
 
   private findReadyWorkerByProjectId(projectId: string): WorkerHandle | null {
@@ -1181,7 +1399,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
 
     const now = Date.now()
     const readyWorkers = this.workers.filter((worker) => {
-      if (!worker.ready || worker.draining) return false
+      if (!this.shouldWorkerAcceptNewRequests(worker)) return false
       const workerProjectId =
         typeof worker.account.projectId === "string"
           ? worker.account.projectId.trim()
@@ -1197,7 +1415,22 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   }
 
   private shouldWorkerAcceptNewRequests(worker: WorkerHandle): boolean {
-    return worker.ready && !worker.draining
+    return worker.ready && !worker.draining && !this.isWorkerDisabled(worker)
+  }
+
+  private isWorkerDisabled(worker: WorkerHandle): boolean {
+    return (
+      typeof worker.disabledAt === "number" &&
+      Number.isFinite(worker.disabledAt)
+    )
+  }
+
+  private clearWorkerPreference(worker: WorkerHandle): void {
+    for (const [model, preferred] of this.preferredWorkerByModel.entries()) {
+      if (preferred === worker) {
+        this.preferredWorkerByModel.delete(model)
+      }
+    }
   }
 
   private findWorkerByStableKey(stableKey: string): WorkerHandle | null {
@@ -1266,7 +1499,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   switchToNextWorker(): void {
     this.defaultWorkerIndex++
     this.logger.log(
-      `Switched to worker index ${this.defaultWorkerIndex % Math.max(this.workers.length, 1)}`
+      `[pool-rotate] Switched to worker index ${this.defaultWorkerIndex % Math.max(this.workers.length, 1)}`
     )
   }
 
@@ -1278,6 +1511,25 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       return `${Math.floor(delayMs / 60_000)}m ${Math.floor((delayMs % 60_000) / 1000)}s`
     }
     return `${delayMs}ms`
+  }
+
+  private logWorkerStderr(handle: WorkerHandle, chunk: string): void {
+    const combined = `${handle.stderrBuffer || ""}${chunk}`
+    const lines = combined.split(/\r?\n/)
+    handle.stderrBuffer = lines.pop() ?? ""
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim()
+      if (!line) continue
+      this.logger.debug(`[Worker ${handle.account.email}] ${line}`)
+    }
+  }
+
+  private flushWorkerStderr(handle: WorkerHandle): void {
+    const line = handle.stderrBuffer?.trim()
+    handle.stderrBuffer = ""
+    if (!line) return
+    this.logger.debug(`[Worker ${handle.account.email}] ${line}`)
   }
 
   /**
@@ -1319,14 +1571,38 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    */
   setCooldownForLastWorker(
     delayMs: number,
-    reason: string = "rate-limited"
+    reason: BackendPoolModelCooldownReason = "rate_limited"
   ): void {
     const worker = this.resolveContextWorker()
     if (!worker) return
     const now = Date.now()
     worker.cooldownUntil = now + delayMs
+    worker.cooldownReason = reason
+    this.advanceWorkerIndexPastWorker(worker)
     this.logger.warn(
-      `[Worker ${worker.account.email}] ${reason}, cooldown ${this.formatDuration(delayMs)}`
+      `[pool-cooldown] [Worker ${worker.account.email}] ${this.describeModelCooldownReason(
+        reason
+      )}, cooldown ${this.formatDuration(delayMs)}`
+    )
+  }
+
+  disableLastWorker(reason: string = "authentication failed"): void {
+    const worker = this.resolveContextWorker()
+    if (!worker || this.isWorkerDisabled(worker)) return
+
+    const disabledAt = Date.now()
+    worker.disabledAt = disabledAt
+    worker.disabledReason = reason
+    worker.cooldownUntil = 0
+    worker.cooldownReason = undefined
+    worker.modelStates.clear()
+    this.clearWorkerPreference(worker)
+    if (this.lastUsedWorker === worker) {
+      this.lastUsedWorker = null
+    }
+
+    this.logger.warn(
+      `[pool-disable] [Worker ${worker.account.email}] ${reason}, removed from scheduling`
     )
   }
 
@@ -1344,24 +1620,46 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   setModelCooldownForLastWorker(
     model: string,
     delayMs: number,
-    quotaExhausted: boolean = false
+    reason: BackendPoolModelCooldownReason = "rate_limited",
+    advanceIndex: boolean = true
   ): void {
     const worker = this.resolveContextWorker()
     if (!worker || !model) return
     const now = Date.now()
+    const quotaExhausted = reason === "quota_exhausted"
     worker.modelStates.set(model, {
       cooldownUntil: now + delayMs,
       quotaExhausted,
+      reason,
     })
+    if (advanceIndex) {
+      this.advanceWorkerIndexPastWorker(worker, model)
+    }
     // Clear sticky preference — this worker is no longer suitable for this model
     if (this.preferredWorkerByModel.get(model) === worker) {
       this.preferredWorkerByModel.delete(model)
     }
     this.logger.warn(
-      `[Worker ${worker.account.email}] model ${model} ${
-        quotaExhausted ? "quota exhausted" : "rate-limited"
-      }, cooldown ${this.formatDuration(delayMs)}`
+      `[pool-cooldown] [Worker ${worker.account.email}] model ${model} ${this.describeModelCooldownReason(
+        reason
+      )}, cooldown ${this.formatDuration(delayMs)}`
     )
+  }
+
+  private describeModelCooldownReason(
+    reason: BackendPoolModelCooldownReason
+  ): string {
+    switch (reason) {
+      case "quota_exhausted":
+        return "quota exhausted"
+      case "capacity_exhausted":
+        return "capacity exhausted"
+      case "transient":
+        return "temporarily unavailable"
+      case "rate_limited":
+      default:
+        return "rate-limited"
+    }
   }
 
   /**
@@ -1371,6 +1669,46 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     const worker = this.resolveContextWorker()
     if (!worker || !model) return
     worker.modelStates.delete(model)
+  }
+
+  setPoolModelCooldown(
+    model: string,
+    delayMs: number,
+    reason: BackendPoolModelCooldownReason = "capacity_exhausted"
+  ): void {
+    if (!model || delayMs <= 0) return
+    const now = Date.now()
+    const cooldownUntil = now + delayMs
+    const existing = this.poolModelCooldowns.get(model)
+    if (!existing || existing.cooldownUntil < cooldownUntil) {
+      this.poolModelCooldowns.set(model, {
+        cooldownUntil,
+        reason,
+      })
+    }
+    this.logger.warn(
+      `[pool-gate] model ${model} ${this.describeModelCooldownReason(reason)}, gate ${this.formatDuration(delayMs)}`
+    )
+  }
+
+  clearPoolModelCooldown(model: string): void {
+    if (!model) return
+    this.poolModelCooldowns.delete(model)
+  }
+
+  private getActivePoolModelCooldown(
+    model: string,
+    now: number = Date.now()
+  ):
+    | { cooldownUntil: number; reason?: BackendPoolModelCooldownReason }
+    | undefined {
+    const state = this.poolModelCooldowns.get(model)
+    if (!state) return undefined
+    if (state.cooldownUntil <= now) {
+      this.poolModelCooldowns.delete(model)
+      return undefined
+    }
+    return state
   }
 
   /**
@@ -1384,6 +1722,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.preferredWorkerByModel.set(model, worker)
     // Also clear any lingering model cooldown (recovery)
     worker.modelStates.delete(model)
+    this.clearPoolModelCooldown(model)
   }
 
   /**
@@ -1400,15 +1739,57 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    * Returns true if at least one ready worker is available for a specific model.
    * Checks both global cooldown and per-model cooldown.
    */
-  hasAvailableWorkerForModel(model: string): boolean {
+  hasAvailableWorkerForModel(
+    model: string,
+    options: WorkerSelectionOptions = {}
+  ): boolean {
     const now = Date.now()
+    if (this.getActivePoolModelCooldown(model, now)) {
+      return false
+    }
     return this.workers.some((w) => {
-      if (!this.shouldWorkerAcceptNewRequests(w) || w.cooldownUntil > now) {
+      const email = w.account.email?.trim() || ""
+      if (
+        !this.shouldWorkerAcceptNewRequests(w) ||
+        options.excludedWorkerEmails?.has(email) ||
+        w.cooldownUntil > now
+      ) {
+        return false
+      }
+      if (
+        options.requireGenerationCapacity &&
+        w.activeGenerationRequests >= this.MAX_CONCURRENT_GENERATIONS_PER_WORKER
+      ) {
         return false
       }
       const modelState = model ? w.modelStates.get(model) : undefined
       return !modelState || modelState.cooldownUntil <= now
     })
+  }
+
+  hasEligibleWorker(options: WorkerSelectionOptions = {}): boolean {
+    return this.workers.some((worker) => {
+      const email = worker.account.email?.trim() || ""
+      return (
+        this.shouldWorkerAcceptNewRequests(worker) &&
+        !options.excludedWorkerEmails?.has(email)
+      )
+    })
+  }
+
+  hasOnlyDisabledWorkers(): boolean {
+    if (this.workers.length === 0) {
+      return false
+    }
+    let sawDisabledWorker = false
+    for (const worker of this.workers) {
+      if (this.isWorkerDisabled(worker)) {
+        sawDisabledWorker = true
+        continue
+      }
+      return false
+    }
+    return sawDisabledWorker
   }
 
   /**
@@ -1419,7 +1800,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     const now = Date.now()
     let min = Infinity
     for (const w of this.workers) {
-      if (!w.ready) continue
+      if (!this.shouldWorkerAcceptNewRequests(w)) continue
       const remaining = Math.max(0, w.cooldownUntil - now)
       if (remaining < min) min = remaining
     }
@@ -1432,16 +1813,23 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    */
   getMinCooldownMsForModel(model: string): number {
     const now = Date.now()
+    const poolModelCooldown = this.getActivePoolModelCooldown(model, now)
     let min = Infinity
     for (const w of this.workers) {
-      if (!w.ready) continue
+      if (!this.shouldWorkerAcceptNewRequests(w)) continue
       const globalRemaining = Math.max(0, w.cooldownUntil - now)
       const modelState = model ? w.modelStates.get(model) : undefined
       const modelRemaining = modelState
         ? Math.max(0, modelState.cooldownUntil - now)
         : 0
-      const remaining = Math.max(globalRemaining, modelRemaining)
+      const poolRemaining = poolModelCooldown
+        ? Math.max(0, poolModelCooldown.cooldownUntil - now)
+        : 0
+      const remaining = Math.max(globalRemaining, modelRemaining, poolRemaining)
       if (remaining < min) min = remaining
+    }
+    if (min === Infinity && poolModelCooldown) {
+      return Math.max(0, poolModelCooldown.cooldownUntil - now)
     }
     return min === Infinity ? 0 : min
   }
@@ -1479,23 +1867,41 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    */
   async generate(
     payload: Record<string, unknown>,
-    model?: string
+    model?: string,
+    options: WorkerSelectionOptions = {}
   ): Promise<unknown> {
     const requestStartedAt = Date.now()
-    const worker = this.getNextWorker(model)
+    const worker = this.getNextWorker(model, false, {
+      ...options,
+      requireGenerationCapacity: true,
+    })
     this.bindWorkerToContext(worker)
     worker.requestCount++
-    await this.preparePayloadForWorker(worker, payload)
-    const outboundPayload = this.createOutboundWorkerPayload(payload)
-    // Use long timeout for non-streaming generation, especially for deep thinking models
-    const result = await this.sendRequest(
-      worker,
-      "generate",
-      { payload: outboundPayload },
-      this.GENERATE_TIMEOUT_MS
-    )
-    this.recordGoogleUsage(worker, payload, model, result, requestStartedAt)
-    return result
+    worker.activeGenerationRequests++
+    try {
+      await this.preparePayloadForWorker(worker, payload)
+      this.logPreparedCloudCodePayload(worker, payload, "generate")
+      const outboundPayload = this.createOutboundWorkerPayload(payload)
+      // Use long timeout for non-streaming generation, especially for deep thinking models
+      const result = await this.sendRequest(
+        worker,
+        "generate",
+        {
+          payload: outboundPayload,
+          retryPolicy: {
+            preferPoolRotation: true,
+          },
+        },
+        this.GENERATE_TIMEOUT_MS
+      )
+      this.recordGoogleUsage(worker, payload, model, result, requestStartedAt)
+      return result
+    } finally {
+      worker.activeGenerationRequests = Math.max(
+        0,
+        worker.activeGenerationRequests - 1
+      )
+    }
   }
 
   /**
@@ -1506,40 +1912,58 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     payload: Record<string, unknown>,
     onChunk: (chunk: unknown) => void,
     model?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options: WorkerSelectionOptions = {}
   ): Promise<void> {
     const requestStartedAt = Date.now()
-    const worker = this.getNextWorker(model)
+    const worker = this.getNextWorker(model, false, {
+      ...options,
+      requireGenerationCapacity: true,
+    })
     this.bindWorkerToContext(worker)
     worker.requestCount++
-    await this.preparePayloadForWorker(worker, payload)
-    const outboundPayload = this.createOutboundWorkerPayload(payload)
-    let lastUsageMetadata: Record<string, unknown> | null = null
+    worker.activeGenerationRequests++
+    try {
+      await this.preparePayloadForWorker(worker, payload)
+      this.logPreparedCloudCodePayload(worker, payload, "generateStream")
+      const outboundPayload = this.createOutboundWorkerPayload(payload)
+      let lastUsageMetadata: Record<string, unknown> | null = null
 
-    await this.sendStreamRequest(
-      worker,
-      "generateStream",
-      { payload: outboundPayload },
-      (chunk) => {
-        const usageMetadata = this.extractGoogleUsageMetadata(chunk)
-        if (usageMetadata) {
-          lastUsageMetadata = usageMetadata
-        }
-        onChunk(chunk)
-      },
-      300000,
-      abortSignal
-    )
+      await this.sendStreamRequest(
+        worker,
+        "generateStream",
+        {
+          payload: outboundPayload,
+          retryPolicy: {
+            preferPoolRotation: true,
+          },
+        },
+        (chunk) => {
+          const usageMetadata = this.extractGoogleUsageMetadata(chunk)
+          if (usageMetadata) {
+            lastUsageMetadata = usageMetadata
+          }
+          onChunk(chunk)
+        },
+        300000,
+        abortSignal
+      )
 
-    this.recordGoogleUsage(
-      worker,
-      payload,
-      model,
-      {
-        usageMetadata: lastUsageMetadata ?? undefined,
-      },
-      requestStartedAt
-    )
+      this.recordGoogleUsage(
+        worker,
+        payload,
+        model,
+        {
+          usageMetadata: lastUsageMetadata ?? undefined,
+        },
+        requestStartedAt
+      )
+    } finally {
+      worker.activeGenerationRequests = Math.max(
+        0,
+        worker.activeGenerationRequests - 1
+      )
+    }
   }
 
   /**
@@ -1617,7 +2041,95 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     return this.sendRequest(worker, "recordTrajectoryAnalytics", { payload })
   }
 
-  async fetchGoogleQuotaSnapshots(): Promise<GoogleQuotaAccountSnapshot[]> {
+  private parseGoogleQuotaResetAt(resetTime?: string): number | null {
+    if (!resetTime) return null
+    const resetAt = Date.parse(resetTime)
+    if (Number.isNaN(resetAt)) return null
+    return resetAt
+  }
+
+  private syncWorkerQuotaStateFromSnapshot(
+    worker: WorkerHandle,
+    models: GoogleQuotaModelSnapshot[],
+    now: number = Date.now()
+  ): void {
+    const snapshotByModel = new Map(models.map((model) => [model.name, model]))
+
+    for (const [modelName, snapshot] of snapshotByModel.entries()) {
+      const remainingFraction = snapshot.remainingFraction
+      const resetAt = this.parseGoogleQuotaResetAt(snapshot.resetTime)
+      const exhaustedBySnapshot =
+        typeof remainingFraction === "number" &&
+        remainingFraction <= 0 &&
+        resetAt != null &&
+        resetAt > now
+
+      if (exhaustedBySnapshot) {
+        worker.modelStates.set(modelName, {
+          cooldownUntil: resetAt,
+          quotaExhausted: true,
+          reason: "quota_exhausted",
+        })
+        if (this.preferredWorkerByModel.get(modelName) === worker) {
+          this.preferredWorkerByModel.delete(modelName)
+        }
+        continue
+      }
+
+      const existing = worker.modelStates.get(modelName)
+      if (existing?.reason !== "quota_exhausted") {
+        continue
+      }
+
+      const snapshotStillExhaustedWithoutResetBoundary =
+        typeof remainingFraction === "number" &&
+        remainingFraction <= 0 &&
+        resetAt == null &&
+        existing.cooldownUntil > now
+
+      if (!snapshotStillExhaustedWithoutResetBoundary) {
+        worker.modelStates.delete(modelName)
+      }
+    }
+
+    for (const [modelName, state] of Array.from(worker.modelStates.entries())) {
+      if (state.reason !== "quota_exhausted") continue
+      if (snapshotByModel.has(modelName)) continue
+      if (state.cooldownUntil <= now) {
+        worker.modelStates.delete(modelName)
+      }
+    }
+  }
+
+  async fetchGoogleQuotaSnapshots(
+    forceRefresh: boolean = false
+  ): Promise<GoogleQuotaAccountSnapshot[]> {
+    const now = Date.now()
+    if (
+      !forceRefresh &&
+      this.googleQuotaSnapshotCache.length > 0 &&
+      now - this.googleQuotaSnapshotFetchedAt <=
+        this.GOOGLE_QUOTA_SNAPSHOT_CACHE_TTL_MS
+    ) {
+      return this.getCachedGoogleQuotaSnapshots()
+    }
+
+    const snapshots = await this.collectGoogleQuotaSnapshots()
+    this.googleQuotaSnapshotCache = snapshots
+    this.googleQuotaSnapshotFetchedAt = Date.now()
+    return this.getCachedGoogleQuotaSnapshots()
+  }
+
+  getCachedGoogleQuotaSnapshots(): GoogleQuotaAccountSnapshot[] {
+    return this.googleQuotaSnapshotCache.map((snapshot) => ({
+      ...snapshot,
+      models: snapshot.models.map((model) => ({ ...model })),
+    }))
+  }
+
+  private async collectGoogleQuotaSnapshots(): Promise<
+    GoogleQuotaAccountSnapshot[]
+  > {
     const now = Date.now()
     const snapshots = await Promise.all(
       this.workers.map(async (worker) => {
@@ -1628,6 +2140,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
 
         if (!worker.ready || worker.draining) {
           state = "unavailable"
+        } else if (this.isWorkerDisabled(worker)) {
+          state = "disabled"
         } else if (worker.cooldownUntil > now) {
           state = "cooldown"
         } else if (activeModelCooldowns) {
@@ -1636,7 +2150,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
           state = "ready"
         }
 
-        if (!worker.ready || worker.draining) {
+        if (!worker.ready || worker.draining || this.isWorkerDisabled(worker)) {
           return {
             email: worker.account.email,
             ready: worker.ready,
@@ -1756,12 +2270,22 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
               return rightPct - leftPct || left.name.localeCompare(right.name)
             })
 
+          this.syncWorkerQuotaStateFromSnapshot(worker, models, now)
+          const snapshotState =
+            worker.cooldownUntil > now
+              ? "cooldown"
+              : Array.from(worker.modelStates.values()).some(
+                    (modelState) => modelState.cooldownUntil > now
+                  )
+                ? "degraded"
+                : "ready"
+
           return {
             email: worker.account.email,
             ready: worker.ready,
             requestCount: worker.requestCount,
             cooldownUntil: worker.cooldownUntil,
-            state,
+            state: snapshotState,
             projectId: worker.account.projectId,
             tier: tier || undefined,
             models,
@@ -1976,7 +2500,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     const now = Date.now()
     return {
       total: this.workers.length,
-      ready: this.workers.filter((w) => w.ready && !w.draining).length,
+      ready: this.workers.filter((w) => this.shouldWorkerAcceptNewRequests(w))
+        .length,
       available: this.workers.filter(
         (w) => this.shouldWorkerAcceptNewRequests(w) && w.cooldownUntil <= now
       ).length,
@@ -2000,12 +2525,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
           model,
           cooldownUntil: state.cooldownUntil,
           quotaExhausted: state.quotaExhausted,
+          reason: state.reason,
         }))
         .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
 
       let state: BackendPoolEntryState
       if (!worker.ready || worker.draining) {
         state = "unavailable"
+      } else if (this.isWorkerDisabled(worker)) {
+        state = "disabled"
       } else if (worker.cooldownUntil > now) {
         state = "cooldown"
       } else if (modelCooldowns.length > 0) {
@@ -2019,6 +2547,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         label: worker.account.email,
         state,
         cooldownUntil: worker.cooldownUntil,
+        disabledAt: worker.disabledAt,
+        disabledReason: worker.disabledReason,
         email: worker.account.email,
         proxyUrl: worker.account.proxyUrl,
         ready: worker.ready,
@@ -2041,7 +2571,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       modelCooldown: entries.filter((entry) => entry.state === "model_cooldown")
         .length,
       cooling: entries.filter((entry) => entry.state === "cooldown").length,
-      disabled: 0,
+      disabled: entries.filter((entry) => entry.state === "disabled").length,
       unavailable: entries.filter((entry) => entry.state === "unavailable")
         .length,
       entries,

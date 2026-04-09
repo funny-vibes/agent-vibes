@@ -5,8 +5,6 @@ import {
   OnModuleInit,
 } from "@nestjs/common"
 import * as path from "path"
-import { PersistenceService } from "../../persistence"
-import { ParsedCursorRequest } from "./cursor-request-parser"
 import { enforceToolProtocol } from "../../context/message-integrity-guard"
 import type {
   ContextConversationState,
@@ -15,6 +13,9 @@ import type {
   ContextUsageSnapshot,
   LooseMessageContent,
 } from "../../context/types"
+import type { BackendType } from "../../llm/model-router.service"
+import { PersistenceService } from "../../persistence"
+import { ParsedCursorRequest } from "./cursor-request-parser"
 
 /**
  * Content block types for messages
@@ -85,6 +86,39 @@ export interface SessionRestartRecovery {
   }
 }
 
+export interface SessionCompletedToolBatchSummary {
+  batchId: string
+  label: string
+  details: string
+  toolCallIds: string[]
+  toolCount: number
+  readOnly: boolean
+  createdAt: number
+}
+
+export interface SessionActiveToolBatch {
+  batchId: string
+  toolCallIds: string[]
+  assistantText: string
+  readOnly: boolean
+  startedAt: number
+  tools: Array<{
+    toolCallId: string
+    toolName: string
+    input: Record<string, unknown>
+    resultSummary?: string
+  }>
+}
+
+export interface SessionTopLevelAgentTurnState {
+  llmTurnCount: number
+  readOnlyBatchCount: number
+  hasMutatingToolCall: boolean
+  forcedSynthesisAttempted: boolean
+  activeToolBatch?: SessionActiveToolBatch
+  completedBatchSummaries: SessionCompletedToolBatchSummary[]
+}
+
 /**
  * Chat session state for bidirectional streaming
  */
@@ -93,6 +127,12 @@ export interface ChatSession {
   messages: SessionMessage[]
   messageRecords: ContextTranscriptRecord[]
   contextState: ContextConversationState
+  topLevelAgentTurnState: SessionTopLevelAgentTurnState
+  lastEmittedContextSummaryCompactionId?: string
+  pendingContextSummaryUiUpdate?: {
+    compactionId: string
+    summary: string
+  }
   model: string
   thinkingLevel: number
   isAgentic: boolean
@@ -160,6 +200,16 @@ export interface ChatSession {
     promptTokenCount: number
     recordedCompactionId?: string
     attachmentFingerprint?: string
+  }
+
+  // Tracks assistant tool batches that have been emitted but are not yet fully
+  // settled. Used to avoid continuing strict backends before the whole batch is
+  // closed, including inline-completed tools.
+  activeAssistantToolBatch?: {
+    id: string
+    backend: BackendType
+    toolCallIds: string[]
+    unsettledToolCallIds: string[]
   }
 }
 
@@ -358,12 +408,47 @@ interface PersistedSessionRestartRecovery {
   }
 }
 
+interface PersistedCompletedToolBatchSummary {
+  batchId: string
+  label: string
+  details: string
+  toolCallIds: string[]
+  toolCount: number
+  readOnly: boolean
+  createdAt: number
+}
+
+interface PersistedActiveToolBatch {
+  batchId: string
+  toolCallIds: string[]
+  assistantText: string
+  readOnly: boolean
+  startedAt: number
+  tools: Array<{
+    toolCallId: string
+    toolName: string
+    input: Record<string, unknown>
+    resultSummary?: string
+  }>
+}
+
+interface PersistedTopLevelAgentTurnState {
+  llmTurnCount: number
+  readOnlyBatchCount: number
+  hasMutatingToolCall: boolean
+  forcedSynthesisAttempted: boolean
+  activeToolBatch?: PersistedActiveToolBatch
+  completedBatchSummaries: PersistedCompletedToolBatchSummary[]
+}
+
 interface PersistedChatSessionV1 {
-  version: 1 | 2
+  version: 1 | 2 | 3
   conversationId: string
   messages: SessionMessage[]
   messageRecords?: ContextTranscriptRecord[]
   contextState?: ContextConversationState
+  topLevelAgentTurnState?: PersistedTopLevelAgentTurnState
+  lastEmittedContextSummaryCompactionId?: string
   model: string
   thinkingLevel: number
   isAgentic: boolean
@@ -610,6 +695,16 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private createEmptyTopLevelAgentTurnState(): SessionTopLevelAgentTurnState {
+    return {
+      llmTurnCount: 1,
+      readOnlyBatchCount: 0,
+      hasMutatingToolCall: false,
+      forcedSynthesisAttempted: false,
+      completedBatchSummaries: [],
+    }
+  }
+
   private toNonNegativeInt(value: unknown): number {
     return typeof value === "number" && Number.isFinite(value)
       ? Math.max(0, Math.round(value))
@@ -818,11 +913,53 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 2,
+      version: 3,
       conversationId: session.conversationId,
       messages: session.messages,
       messageRecords: session.messageRecords,
       contextState: session.contextState,
+      topLevelAgentTurnState: {
+        llmTurnCount: session.topLevelAgentTurnState.llmTurnCount,
+        readOnlyBatchCount: session.topLevelAgentTurnState.readOnlyBatchCount,
+        hasMutatingToolCall: session.topLevelAgentTurnState.hasMutatingToolCall,
+        forcedSynthesisAttempted:
+          session.topLevelAgentTurnState.forcedSynthesisAttempted,
+        activeToolBatch: session.topLevelAgentTurnState.activeToolBatch
+          ? {
+              batchId: session.topLevelAgentTurnState.activeToolBatch.batchId,
+              toolCallIds: [
+                ...session.topLevelAgentTurnState.activeToolBatch.toolCallIds,
+              ],
+              assistantText:
+                session.topLevelAgentTurnState.activeToolBatch.assistantText,
+              readOnly: session.topLevelAgentTurnState.activeToolBatch.readOnly,
+              startedAt:
+                session.topLevelAgentTurnState.activeToolBatch.startedAt,
+              tools: session.topLevelAgentTurnState.activeToolBatch.tools.map(
+                (tool) => ({
+                  toolCallId: tool.toolCallId,
+                  toolName: tool.toolName,
+                  input: tool.input,
+                  resultSummary: tool.resultSummary,
+                })
+              ),
+            }
+          : undefined,
+        completedBatchSummaries:
+          session.topLevelAgentTurnState.completedBatchSummaries.map(
+            (summary) => ({
+              batchId: summary.batchId,
+              label: summary.label,
+              details: summary.details,
+              toolCallIds: [...summary.toolCallIds],
+              toolCount: summary.toolCount,
+              readOnly: summary.readOnly,
+              createdAt: summary.createdAt,
+            })
+          ),
+      },
+      lastEmittedContextSummaryCompactionId:
+        session.lastEmittedContextSummaryCompactionId,
       model: session.model,
       thinkingLevel: session.thinkingLevel,
       isAgentic: session.isAgentic,
@@ -1035,6 +1172,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       compactionHistory: [],
       activeCompactionId: undefined,
       usageLedger: {},
+      toolResultReplacementState: {
+        seenToolUseIds: [],
+        replacementByToolUseId: {},
+      },
     }
   }
 
@@ -1196,14 +1337,135 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
             )
               ? rawContextState.usageLedger
               : {},
+            toolResultReplacementState:
+              rawContextState.toolResultReplacementState
+                ? {
+                    seenToolUseIds: Array.isArray(
+                      rawContextState.toolResultReplacementState.seenToolUseIds
+                    )
+                      ? [
+                          ...rawContextState.toolResultReplacementState
+                            .seenToolUseIds,
+                        ]
+                      : [],
+                    replacementByToolUseId:
+                      rawContextState.toolResultReplacementState
+                        .replacementByToolUseId &&
+                      typeof rawContextState.toolResultReplacementState
+                        .replacementByToolUseId === "object"
+                        ? {
+                            ...rawContextState.toolResultReplacementState
+                              .replacementByToolUseId,
+                          }
+                        : {},
+                  }
+                : {
+                    seenToolUseIds: [],
+                    replacementByToolUseId: {},
+                  },
           }
         : this.createContextState(messageRecords)
+
+    const topLevelAgentTurnState = persisted.topLevelAgentTurnState
+      ? {
+          llmTurnCount:
+            typeof persisted.topLevelAgentTurnState.llmTurnCount === "number" &&
+            persisted.topLevelAgentTurnState.llmTurnCount > 0
+              ? persisted.topLevelAgentTurnState.llmTurnCount
+              : 1,
+          readOnlyBatchCount:
+            typeof persisted.topLevelAgentTurnState.readOnlyBatchCount ===
+              "number" &&
+            persisted.topLevelAgentTurnState.readOnlyBatchCount >= 0
+              ? persisted.topLevelAgentTurnState.readOnlyBatchCount
+              : 0,
+          hasMutatingToolCall:
+            persisted.topLevelAgentTurnState.hasMutatingToolCall === true,
+          forcedSynthesisAttempted:
+            persisted.topLevelAgentTurnState.forcedSynthesisAttempted === true,
+          activeToolBatch: persisted.topLevelAgentTurnState.activeToolBatch
+            ? {
+                batchId:
+                  persisted.topLevelAgentTurnState.activeToolBatch.batchId,
+                toolCallIds: Array.isArray(
+                  persisted.topLevelAgentTurnState.activeToolBatch.toolCallIds
+                )
+                  ? [
+                      ...persisted.topLevelAgentTurnState.activeToolBatch
+                        .toolCallIds,
+                    ]
+                  : [],
+                assistantText:
+                  persisted.topLevelAgentTurnState.activeToolBatch
+                    .assistantText || "",
+                readOnly:
+                  persisted.topLevelAgentTurnState.activeToolBatch.readOnly ===
+                  true,
+                startedAt:
+                  typeof persisted.topLevelAgentTurnState.activeToolBatch
+                    .startedAt === "number"
+                    ? persisted.topLevelAgentTurnState.activeToolBatch.startedAt
+                    : Date.now(),
+                tools: Array.isArray(
+                  persisted.topLevelAgentTurnState.activeToolBatch.tools
+                )
+                  ? persisted.topLevelAgentTurnState.activeToolBatch.tools.map(
+                      (tool) => ({
+                        toolCallId: tool.toolCallId,
+                        toolName: tool.toolName,
+                        input:
+                          tool.input &&
+                          typeof tool.input === "object" &&
+                          !Array.isArray(tool.input)
+                            ? tool.input
+                            : {},
+                        resultSummary:
+                          typeof tool.resultSummary === "string"
+                            ? tool.resultSummary
+                            : undefined,
+                      })
+                    )
+                  : [],
+              }
+            : undefined,
+          completedBatchSummaries: Array.isArray(
+            persisted.topLevelAgentTurnState.completedBatchSummaries
+          )
+            ? persisted.topLevelAgentTurnState.completedBatchSummaries.map(
+                (summary) => ({
+                  batchId: summary.batchId,
+                  label: summary.label,
+                  details: summary.details,
+                  toolCallIds: Array.isArray(summary.toolCallIds)
+                    ? [...summary.toolCallIds]
+                    : [],
+                  toolCount:
+                    typeof summary.toolCount === "number"
+                      ? summary.toolCount
+                      : 0,
+                  readOnly: summary.readOnly === true,
+                  createdAt:
+                    typeof summary.createdAt === "number"
+                      ? summary.createdAt
+                      : Date.now(),
+                })
+              )
+            : [],
+        }
+      : this.createEmptyTopLevelAgentTurnState()
 
     return {
       conversationId: persisted.conversationId,
       messages: this.syncMessagesFromRecords(messageRecords),
       messageRecords,
       contextState,
+      topLevelAgentTurnState,
+      lastEmittedContextSummaryCompactionId:
+        typeof persisted.lastEmittedContextSummaryCompactionId === "string" &&
+        persisted.lastEmittedContextSummaryCompactionId.trim().length > 0
+          ? persisted.lastEmittedContextSummaryCompactionId.trim()
+          : undefined,
+      pendingContextSummaryUiUpdate: undefined,
       // Note: We do NOT run enforceToolProtocol here.
       // Deserialized sessions may have legitimate interrupted tool calls that
       // should be handled by repairInterruptedToolProtocol() with proper
@@ -1269,6 +1531,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       todos: Array.isArray(persisted.todos) ? persisted.todos : [],
       subAgentContext: undefined,
       restartRecovery: this.buildRestartRecovery(persisted),
+      activeAssistantToolBatch: undefined,
     }
   }
 
@@ -1304,6 +1567,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       messages: initialMessages,
       messageRecords,
       contextState,
+      topLevelAgentTurnState: this.createEmptyTopLevelAgentTurnState(),
+      lastEmittedContextSummaryCompactionId: undefined,
+      pendingContextSummaryUiUpdate: undefined,
       model: initialRequest?.model || "claude-sonnet-4.5",
       thinkingLevel: initialRequest?.thinkingLevel || 0,
       isAgentic: initialRequest?.isAgentic || false,
@@ -1338,6 +1604,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       interactionQueryId: 0,
       todos: [],
       restartRecovery: undefined,
+      activeAssistantToolBatch: undefined,
     }
   }
 
@@ -1348,6 +1615,14 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     const session = this.getSession(conversationId)
     if (!session) return false
     session.lastActivityAt = new Date()
+    return true
+  }
+
+  markSessionDirty(conversationId: string): boolean {
+    const session = this.getSession(conversationId)
+    if (!session) return false
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
     return true
   }
 
@@ -1755,6 +2030,75 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     return Array.from(session.pendingToolCalls.keys())
   }
 
+  startAssistantToolBatch(
+    conversationId: string,
+    backend: BackendType,
+    toolCallIds: string[]
+  ): void {
+    const session = this.getSession(conversationId)
+    if (!session) return
+
+    const normalizedToolCallIds = toolCallIds
+      .map((id) => (typeof id === "string" ? id.trim() : ""))
+      .filter(Boolean)
+
+    if (normalizedToolCallIds.length === 0) {
+      session.activeAssistantToolBatch = undefined
+      return
+    }
+
+    session.activeAssistantToolBatch = {
+      id: `assistant-batch-${Date.now()}`,
+      backend,
+      toolCallIds: [...normalizedToolCallIds],
+      unsettledToolCallIds: [...normalizedToolCallIds],
+    }
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
+  }
+
+  settleAssistantToolBatchTool(
+    conversationId: string,
+    toolCallId: string
+  ): boolean {
+    const session = this.getSession(conversationId)
+    if (!session?.activeAssistantToolBatch) return false
+
+    const normalizedToolCallId =
+      typeof toolCallId === "string" ? toolCallId.trim() : ""
+    if (!normalizedToolCallId) return false
+
+    const batch = session.activeAssistantToolBatch
+    const nextUnsettled = batch.unsettledToolCallIds.filter(
+      (id) => id !== normalizedToolCallId
+    )
+    if (nextUnsettled.length === batch.unsettledToolCallIds.length) {
+      return false
+    }
+
+    batch.unsettledToolCallIds = nextUnsettled
+    if (batch.unsettledToolCallIds.length === 0) {
+      session.activeAssistantToolBatch = undefined
+    }
+
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
+    return true
+  }
+
+  hasUnsettledAssistantToolBatchForBackend(
+    conversationId: string,
+    backend: BackendType
+  ): boolean {
+    const session = this.getSession(conversationId)
+    if (!session?.activeAssistantToolBatch) return false
+
+    return (
+      session.activeAssistantToolBatch.backend === backend &&
+      session.activeAssistantToolBatch.unsettledToolCallIds.length > 0
+    )
+  }
+
   getPendingToolCallIdsByStream(
     conversationId: string,
     streamId: string
@@ -1805,6 +2149,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     if (session) {
       const toolCall = this.detachPendingToolCall(session, toolCallId)
       if (toolCall) {
+        // Settle this tool in the batch barrier so that continuation is only
+        // triggered after ALL tools in the assistant turn have completed.
+        this.settleAssistantToolBatchTool(conversationId, toolCallId)
         this.logger.debug(
           `Consumed tool call: ${toolCallId} for session ${conversationId}`
         )
@@ -1825,6 +2172,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
     const toolCall = this.detachPendingToolCall(session, toolCallId)
     if (!toolCall) return undefined
+
+    // Settle this tool in the batch barrier (same as consumePendingToolCall).
+    this.settleAssistantToolBatchTool(conversationId, toolCallId)
 
     const reasonSuffix = reason ? ` (${reason})` : ""
     this.logger.warn(
@@ -1909,6 +2259,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
     session.pendingToolCalls.clear()
     session.pendingToolCallByExecId.clear()
+    // Also clear the batch barrier — all pending tools are being discarded.
+    session.activeAssistantToolBatch = undefined
     session.lastActivityAt = new Date()
 
     this.logger.warn(

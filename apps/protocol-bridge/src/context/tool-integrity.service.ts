@@ -341,6 +341,55 @@ export class ToolIntegrityService {
   }
 
   /**
+   * Find the earliest truncation point that both preserves tool integrity and
+   * actually fits within the requested token budget.
+   *
+   * `findTruncationPointWithIntegrity()` may intentionally move the boundary
+   * earlier to keep a tool_use/tool_result pair intact, which can leave the
+   * retained suffix slightly over budget. This helper walks the boundary
+   * forward again, but only to other tool-safe cut points.
+   */
+  findBudgetSafeTruncationPointWithIntegrity(
+    messages: UnifiedMessage[],
+    targetTokens: number,
+    options?: {
+      mode?: EnforceToolProtocolOptions["mode"]
+    }
+  ): number {
+    if (messages.length === 0) return 0
+
+    const mode = options?.mode ?? "global"
+    let truncationIndex = this.findTruncationPointWithIntegrity(
+      messages,
+      targetTokens,
+      { mode }
+    )
+
+    while (truncationIndex < messages.length) {
+      const retainedMessages = messages.slice(truncationIndex)
+      if (this.tokenCounter.countMessages(retainedMessages) <= targetTokens) {
+        return truncationIndex
+      }
+
+      const nextIndex = this.findNextValidTruncationIndex(
+        messages,
+        truncationIndex + 1,
+        mode
+      )
+      if (nextIndex <= truncationIndex) {
+        break
+      }
+
+      this.logger.debug(
+        `Advancing truncation point from ${truncationIndex} to ${nextIndex} to satisfy token budget without breaking tool pairs`
+      )
+      truncationIndex = nextIndex
+    }
+
+    return truncationIndex
+  }
+
+  /**
    * Validate that messages have proper tool integrity
    * Returns list of issues found
    */
@@ -396,9 +445,8 @@ export class ToolIntegrityService {
   }
 
   /**
-   * Extract messages with tool integrity preserved
-   * This is a convenience method that combines findTruncationPointWithIntegrity
-   * with message slicing
+   * Extract messages with tool integrity preserved while staying within the
+   * requested token budget.
    */
   extractWithIntegrity(
     messages: UnifiedMessage[],
@@ -407,12 +455,57 @@ export class ToolIntegrityService {
       mode?: EnforceToolProtocolOptions["mode"]
     }
   ): UnifiedMessage[] {
-    const truncationIndex = this.findTruncationPointWithIntegrity(
+    const truncationIndex = this.findBudgetSafeTruncationPointWithIntegrity(
       messages,
       targetTokens,
       options
     )
     return messages.slice(truncationIndex)
+  }
+
+  private retainedMessagesHaveValidToolResults(
+    messages: UnifiedMessage[],
+    mode: EnforceToolProtocolOptions["mode"]
+  ): boolean {
+    if (messages.length === 0) return true
+
+    const retainedToolUseIds = new Set<string>()
+    for (const message of messages) {
+      for (const id of this.extractToolUseIds(message)) {
+        retainedToolUseIds.add(id)
+      }
+    }
+
+    const orphans =
+      mode === "strict-adjacent"
+        ? this.findStrictAdjacentOrphanedToolResults(
+            messages,
+            retainedToolUseIds
+          )
+        : this.findOrphanedToolResults(messages, retainedToolUseIds)
+
+    return orphans.length === 0
+  }
+
+  private findNextValidTruncationIndex(
+    messages: UnifiedMessage[],
+    startIndex: number,
+    mode: EnforceToolProtocolOptions["mode"]
+  ): number {
+    const clampedStart = Math.max(0, Math.min(startIndex, messages.length))
+
+    for (let candidate = clampedStart; candidate <= messages.length; candidate++) {
+      if (
+        this.retainedMessagesHaveValidToolResults(
+          messages.slice(candidate),
+          mode
+        )
+      ) {
+        return candidate
+      }
+    }
+
+    return messages.length
   }
 
   private findStrictAdjacentOrphanedToolResults(

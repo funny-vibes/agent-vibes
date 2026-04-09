@@ -19,7 +19,6 @@ import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
-import { doesModelSupportThinking } from "../../llm/model-registry"
 import { KvStorageService } from "./kv-storage.service"
 
 // GZIP 魔数
@@ -49,6 +48,14 @@ export interface ParsedToolResult {
     message?: string
   }
   inlineProjection?: {
+    taskSuccess?: {
+      conversationSteps?: Array<Record<string, unknown>>
+      agentId?: string
+      isBackground?: boolean
+      durationMs?: bigint | number
+      resultSuffix?: string
+      transcriptPath?: string
+    }
     askQuestionResult?: {
       resultCase: "success" | "async" | "rejected" | "error"
       answers?: Array<{
@@ -336,6 +343,77 @@ export class CursorRequestParser {
     }
 
     return Object.keys(result).length > 0 ? result : undefined
+  }
+
+  private resolveRequestedThinkingLevel(
+    requestedModelParameters?: Record<string, string>
+  ): 0 | 1 | 2 | undefined {
+    if (!requestedModelParameters) {
+      return undefined
+    }
+
+    const exactIds = [
+      "reasoning_effort",
+      "thinking_effort",
+      "effort_mode",
+      "cloud_agent_effort_mode",
+      "prompt_effort_level",
+      "effort",
+    ]
+
+    const candidateValues: string[] = []
+    for (const id of exactIds) {
+      const value = requestedModelParameters[id]
+      if (typeof value === "string" && value.trim().length > 0) {
+        candidateValues.push(value)
+      }
+    }
+
+    for (const [id, rawValue] of Object.entries(requestedModelParameters)) {
+      const looksLikeReasoningControl =
+        id.includes("reason") ||
+        id.includes("think") ||
+        (id.includes("effort") && !id.includes("discovery"))
+      if (!looksLikeReasoningControl) {
+        continue
+      }
+      if (typeof rawValue === "string" && rawValue.trim().length > 0) {
+        candidateValues.push(rawValue)
+      }
+    }
+
+    for (const rawValue of candidateValues) {
+      const normalized = rawValue
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+
+      switch (normalized) {
+        case "none":
+        case "off":
+        case "disabled":
+          return 0
+        case "minimal":
+        case "min":
+        case "low":
+        case "medium":
+        case "med":
+        case "normal":
+        case "standard":
+        case "auto":
+        case "high":
+          return 1
+        case "max":
+        case "xhigh":
+        case "very_high":
+        case "ultra":
+          return 2
+        default:
+          break
+      }
+    }
+
+    return undefined
   }
 
   private extractNumericModelParameter(
@@ -1190,28 +1268,29 @@ export class CursorRequestParser {
     // 推导 thinkingLevel
     // - modelDetails.maxMode 或 requestedModel.maxMode → 最大 thinking (level 2)
     // - modelDetails.thinkingDetails 存在（presence）→ thinking 已启用 (level 1)
-    // - 模型名含 "thinking" → 标准 thinking (level 1)
-    // - model-registry 标记 isThinking → 降级 thinking (level 1)
-    //   确保模型本身支持 thinking 时即使 max 关闭也不完全禁用
+    //
+    // 不再根据 model-registry 自动猜测 thinking：
+    // Cursor 是否显式请求 think 应以协议字段为准，避免 bridge 擅自开启。
     const hasThinkingDetails = !!req.modelDetails?.thinkingDetails
     const modelMaxMode = req.modelDetails?.maxMode === true
     const requestedMaxMode = req.requestedModel?.maxMode === true
-    const registryIsThinking = doesModelSupportThinking(model)
+    const requestedThinkingLevel = this.resolveRequestedThinkingLevel(
+      requestedModelParameters
+    )
     let thinkingLevel = 0
     if (modelMaxMode || requestedMaxMode) {
       thinkingLevel = 2
     } else if (hasThinkingDetails) {
       thinkingLevel = 1
-    } else if (registryIsThinking) {
-      // 模型本身支持 thinking，但 Cursor 没有传 thinkingDetails
-      // （通常因为 max mode 被关闭）→ 降级到 level 1
-      thinkingLevel = 1
+    } else if (requestedThinkingLevel !== undefined) {
+      thinkingLevel = requestedThinkingLevel
     }
 
     if (thinkingLevel > 0) {
       this.logger.log(
         `Thinking enabled: level=${thinkingLevel} (thinkingDetails=${hasThinkingDetails}, ` +
-          `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode}, registryIsThinking=${registryIsThinking})`
+          `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode}, ` +
+          `requestedThinkingLevel=${requestedThinkingLevel ?? 0})`
       )
     }
 

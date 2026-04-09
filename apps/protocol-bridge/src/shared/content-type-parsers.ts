@@ -146,7 +146,10 @@ export function registerContentTypeParsers(
       payload: Readable,
       done: (err: Error | null, body?: Buffer) => void
     ) => {
-      logger.debug("[ContentTypeParser] Handling application/proto")
+      const shouldLogProtoTraffic = process.env.LOG_PROTO_TRAFFIC === "true"
+      if (shouldLogProtoTraffic) {
+        logger.debug("[ContentTypeParser] Handling application/proto")
+      }
 
       // ConnectRPC uses Connect-Content-Encoding for compressed payloads
       const encoding =
@@ -160,10 +163,12 @@ export function registerContentTypeParsers(
       })
       payload.on("end", () => {
         const buffer = Buffer.concat(chunks)
-        logger.debug(
-          `[ContentTypeParser] application/proto: received ${buffer.length} bytes` +
-            (encoding ? `, encoding=${encoding}` : "")
-        )
+        if (shouldLogProtoTraffic) {
+          logger.debug(
+            `[ContentTypeParser] application/proto: received ${buffer.length} bytes` +
+              (encoding ? `, encoding=${encoding}` : "")
+          )
+        }
 
         // Decompress gzip if needed
         if (encoding.toLowerCase() === "gzip" && buffer.length > 0) {
@@ -175,9 +180,11 @@ export function registerContentTypeParsers(
               // Fall back to raw buffer in case encoding header was wrong
               done(null, buffer)
             } else {
-              logger.debug(
-                `[ContentTypeParser] application/proto: decompressed ${buffer.length} -> ${decompressed.length} bytes`
-              )
+              if (shouldLogProtoTraffic) {
+                logger.debug(
+                  `[ContentTypeParser] application/proto: decompressed ${buffer.length} -> ${decompressed.length} bytes`
+                )
+              }
               done(null, decompressed)
             }
           })

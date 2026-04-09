@@ -35,11 +35,18 @@ import {
   AwaitTaskCompleteSchema,
   AwaitToolCallSchema,
   BackgroundShellSpawnArgsSchema,
+  BlameByFilePathArgsSchema,
+  BlameByFilePathErrorSchema,
+  BlameByFilePathResultSchema,
+  BlameByFilePathSuccessSchema,
+  BlameByFilePathToolCallSchema,
   ComputerUseArgsSchema,
   ComputerUseErrorSchema,
   ComputerUseResultSchema,
   ComputerUseSuccessSchema,
   ComputerUseToolCallSchema,
+  type CommandClassifierResult,
+  CommandClassifierResultSchema,
   // ConversationStateStructure
   ConversationStateStructureSchema,
   ConversationTokenDetailsSchema,
@@ -147,6 +154,7 @@ import {
   type McpToolResult,
   McpToolResultContentItemSchema,
   McpToolResultSchema,
+  OutputLocationSchema,
   PartialToolCallUpdateSchema,
   PhaseSchema,
   PositionSchema,
@@ -195,6 +203,11 @@ import {
   ReflectResultSchema,
   ReflectSuccessSchema,
   ReflectToolCallSchema,
+  ReportBugArgsSchema,
+  ReportBugErrorSchema,
+  ReportBugResultSchema,
+  ReportBugSuccessSchema,
+  ReportBugToolCallSchema,
   ReportBugfixResultsArgsSchema,
   ReportBugfixResultsErrorSchema,
   ReportBugfixResultsResultSchema,
@@ -207,11 +220,18 @@ import {
   SemSearchToolErrorSchema,
   SemSearchToolResultSchema,
   SemSearchToolSuccessSchema,
+  SetActiveBranchArgsSchema,
+  SetActiveBranchErrorSchema,
+  SetActiveBranchResultSchema,
+  SetActiveBranchSuccessSchema,
+  SetActiveBranchToolCallSchema,
   SetBlobArgsSchema,
   SetupVmEnvironmentArgsSchema,
   SetupVmEnvironmentResultSchema,
   SetupVmEnvironmentSuccessSchema,
   SetupVmEnvironmentToolCallSchema,
+  ShellAbortReason,
+  ShellBackgroundReason,
   // Shell
   ShellArgsSchema,
   ShellCommandParsingResult_ExecutableCommandArgSchema,
@@ -266,6 +286,7 @@ import {
   TaskSuccessSchema,
   TaskToolCallDeltaSchema,
   TaskToolCallSchema,
+  TimeoutBehavior,
   // InteractionUpdate sub-messages
   TextDeltaUpdateSchema,
   ThinkingCompletedUpdateSchema,
@@ -743,6 +764,9 @@ type ToolFamily =
   | "await"
   | "ai_attribution"
   | "pr_management"
+  | "blame_by_file_path"
+  | "report_bug"
+  | "set_active_branch"
   | "unknown"
 
 type ToolResultProjectionStatus =
@@ -761,6 +785,12 @@ type ToolResultProjectionStatus =
 interface ToolCompletionExtraData {
   beforeContent?: string
   afterContent?: string
+  editSuccess?: {
+    linesAdded?: number
+    linesRemoved?: number
+    diffString?: string
+    message?: string
+  }
   readSuccess?: {
     path?: string
     content?: string
@@ -770,9 +800,32 @@ interface ToolCompletionExtraData {
     truncated?: boolean
   }
   shellResult?: {
-    stdout: string
-    stderr: string
-    exitCode: number
+    stdout?: string
+    stderr?: string
+    exitCode?: number
+    shellId?: number
+    pid?: number
+    interleavedOutput?: string
+    msToWait?: number
+    localExecutionTimeMs?: number
+    executionTime?: number
+    aborted?: boolean
+    abortReason?: number
+    backgroundReason?: number
+    outputLocation?: {
+      filePath?: string
+      lineStart?: number
+      lineEnd?: number
+    }
+    terminalsFolder?: string
+    timeoutBehavior?: number
+    hardTimeout?: number
+    requestedSandboxPolicy?: { type?: unknown } | null
+    isBackground?: boolean
+    description?: string
+    classifierResult?: Record<string, unknown> | CommandClassifierResult
+    closeStdin?: boolean
+    fileOutputThresholdBytes?: bigint | number
   }
   lsDirectoryTreeRoot?: Record<string, unknown>
   grepSuccess?: {
@@ -787,6 +840,14 @@ interface ToolCompletionExtraData {
     deletedFile?: string
     fileSize?: bigint | number
     prevContent?: string
+  }
+  taskSuccess?: {
+    conversationSteps?: Array<Record<string, unknown>>
+    agentId?: string
+    isBackground?: boolean
+    durationMs?: bigint | number
+    resultSuffix?: string
+    transcriptPath?: string
   }
   diagnosticsSuccess?: {
     path?: string
@@ -1283,14 +1344,30 @@ export class CursorGrpcService {
   createShellOutputExitResponse(
     code: number = 0,
     aborted: boolean = false,
-    cwd: string = ""
+    cwd: string = "",
+    options?: {
+      outputLocation?: unknown
+      abortReason?: unknown
+      localExecutionTimeMs?: unknown
+    }
   ): Buffer {
     return this.wrapInteractionUpdate(
       "shellOutputDelta",
       create(ShellOutputDeltaUpdateSchema, {
         event: {
           case: "exit" as const,
-          value: create(ShellStreamExitSchema, { code, aborted, cwd }),
+          value: create(ShellStreamExitSchema, {
+            code,
+            aborted,
+            cwd,
+            outputLocation: this.normalizeOutputLocation(
+              options?.outputLocation
+            ),
+            abortReason: this.normalizeShellAbortReason(options?.abortReason),
+            localExecutionTimeMs: this.parseOptionalNonNegativeInt(
+              options?.localExecutionTimeMs
+            ),
+          }),
         },
       })
     )
@@ -1626,7 +1703,7 @@ export class CursorGrpcService {
               path,
               fileText: newContent,
               toolCallId,
-              returnFileContentAfterWrite: true,
+              returnFileContentAfterWrite: false,
             }),
           },
         }),
@@ -1728,10 +1805,12 @@ export class CursorGrpcService {
           return "write_shell_stdin"
         case "CLIENT_SIDE_TOOL_V2_TASK":
         case "CLIENT_SIDE_TOOL_V2_TASK_V2":
-        case "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP":
-        case "CLIENT_SIDE_TOOL_V2_AWAIT_TASK":
-        case "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT":
           return "task"
+        case "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP":
+        case "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT":
+          return "truncated"
+        case "CLIENT_SIDE_TOOL_V2_AWAIT_TASK":
+          return "await"
         case "CLIENT_SIDE_TOOL_V2_TODO_READ":
           return "read_todos"
         case "CLIENT_SIDE_TOOL_V2_TODO_WRITE":
@@ -1761,14 +1840,14 @@ export class CursorGrpcService {
     if (normalized.includes("reapply")) return "apply_agent_diff"
     if (normalized.includes("fetchrules")) return "read"
     if (normalized.includes("searchsymbols")) return "sem_search"
-    if (normalized.includes("backgroundcomposerfollowup")) return "task"
+    if (normalized.includes("backgroundcomposerfollowup")) return "truncated"
     if (normalized.includes("knowledgebase")) return "web_search"
     if (normalized.includes("fetchpullrequest")) return "web_fetch"
     if (normalized.includes("creatediagram")) return "generate_image"
     if (normalized.includes("gotodefinition")) return "sem_search"
-    if (normalized.includes("awaittask")) return "task"
+    if (normalized.includes("awaittask")) return "await"
     if (normalized.includes("readproject")) return "ls"
-    if (normalized.includes("updateproject")) return "task"
+    if (normalized.includes("updateproject")) return "truncated"
 
     if (
       normalized.includes("readmcpresource") ||
@@ -1841,6 +1920,26 @@ export class CursorGrpcService {
       normalized.includes("create_pr")
     )
       return "pr_management"
+    if (
+      normalized.includes("blamebyfilepath") ||
+      normalized.includes("blame_by_file_path")
+    )
+      return "blame_by_file_path"
+    if (normalized.includes("reportbug") || normalized.includes("report_bug")) {
+      // Distinguish report_bug from report_bugfix_results
+      if (
+        normalized.includes("bugfix") ||
+        normalized.includes("bugfixresults")
+      ) {
+        return "report_bugfix_results"
+      }
+      return "report_bug"
+    }
+    if (
+      normalized.includes("setactivebranch") ||
+      normalized.includes("set_active_branch")
+    )
+      return "set_active_branch"
     if (normalized.includes("askquestion")) return "ask_question"
     if (normalized.includes("switchmode")) return "switch_mode"
     if (normalized.includes("createplan")) return "create_plan"
@@ -1855,8 +1954,7 @@ export class CursorGrpcService {
     if (normalized.includes("executehook") || normalized === "hook") {
       return "execute_hook"
     }
-    if (normalized.includes("task") || normalized.includes("subagent"))
-      return "task"
+    if (normalized.includes("task")) return "task"
     if (
       normalized.includes("grep") ||
       normalized.includes("ripgrep") ||
@@ -2690,6 +2788,175 @@ export class CursorGrpcService {
     return normalized
   }
 
+  private normalizeOptionalBigInt(value: unknown): bigint | undefined {
+    if (value === null || value === undefined) return undefined
+    if (typeof value === "bigint") return value >= 0n ? value : undefined
+    if (typeof value === "number") {
+      if (!Number.isFinite(value) || value < 0) return undefined
+      return BigInt(Math.floor(value))
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim()
+      if (!trimmed) return undefined
+      try {
+        const parsed = BigInt(trimmed)
+        return parsed >= 0n ? parsed : undefined
+      } catch {
+        return undefined
+      }
+    }
+    return undefined
+  }
+
+  private normalizeOutputLocation(value: unknown) {
+    if (!value || typeof value !== "object") return undefined
+    const record = value as Record<string, unknown>
+    const filePath = safeString(record.filePath || record.file_path).trim()
+    const sizeBytes = this.normalizeOptionalBigInt(
+      record.sizeBytes ?? record.size_bytes
+    )
+    const lineCount = this.normalizeOptionalBigInt(
+      record.lineCount ?? record.line_count
+    )
+    if (!filePath && sizeBytes === undefined && lineCount === undefined) {
+      return undefined
+    }
+    return create(OutputLocationSchema, {
+      filePath,
+      sizeBytes: sizeBytes ?? 0n,
+      lineCount: lineCount ?? 0n,
+    })
+  }
+
+  private normalizeShellAbortReason(
+    value: unknown
+  ): ShellAbortReason | undefined {
+    const parsed = this.parseOptionalNonNegativeInt(value)
+    return parsed === undefined ? undefined : (parsed as ShellAbortReason)
+  }
+
+  private normalizeShellBackgroundReason(
+    value: unknown
+  ): ShellBackgroundReason | undefined {
+    const parsed = this.parseOptionalNonNegativeInt(value)
+    return parsed === undefined ? undefined : (parsed as ShellBackgroundReason)
+  }
+
+  private normalizeTimeoutBehavior(
+    value: unknown
+  ): TimeoutBehavior | undefined {
+    const parsed = this.parseOptionalNonNegativeInt(value)
+    return parsed === undefined ? undefined : (parsed as TimeoutBehavior)
+  }
+
+  private normalizeShellClassifierResult(value: unknown) {
+    if (!value || typeof value !== "object") return undefined
+    const record = value as Record<string, unknown>
+    const commands = Array.isArray(record.commands)
+      ? record.commands
+          .map((entry) => {
+            if (!entry || typeof entry !== "object") return undefined
+            const command = entry as Record<string, unknown>
+            return {
+              name: safeString(command.name),
+              arguments: Array.isArray(command.arguments)
+                ? command.arguments.map((arg) => safeString(arg))
+                : [],
+            }
+          })
+          .filter((entry) => !!entry)
+      : []
+    const suggestedSandboxMode = this.parseOptionalNonNegativeInt(
+      record.suggestedSandboxMode ?? record.suggested_sandbox_mode
+    )
+    const classificationFailed = this.parseBooleanFlag(
+      record.classificationFailed ?? record.classification_failed
+    )
+    if (
+      commands.length === 0 &&
+      suggestedSandboxMode === undefined &&
+      !classificationFailed
+    ) {
+      return undefined
+    }
+    return create(CommandClassifierResultSchema, {
+      commands,
+      suggestedSandboxMode: suggestedSandboxMode ?? 0,
+      classificationFailed,
+    })
+  }
+
+  private buildShellArgsMessage(
+    callId: string,
+    args: Record<string, unknown>,
+    shellResult?: ToolCompletionExtraData["shellResult"]
+  ) {
+    const command = safeString(args.command)
+    const workingDirectory = safeString(
+      args.cwd || args.working_directory || args.workingDirectory
+    )
+    const parsed = buildShellParsingMetadata(command)
+    const requestedSandboxPolicyArg =
+      args.requestedSandboxPolicy &&
+      typeof args.requestedSandboxPolicy === "object"
+        ? (args.requestedSandboxPolicy as Record<string, unknown>)
+        : args.requested_sandbox_policy &&
+            typeof args.requested_sandbox_policy === "object"
+          ? (args.requested_sandbox_policy as Record<string, unknown>)
+          : undefined
+    const requestedSandboxType = this.parseOptionalNonNegativeInt(
+      shellResult?.requestedSandboxPolicy?.type ??
+        requestedSandboxPolicyArg?.type
+    )
+    const timeoutBehavior = this.normalizeTimeoutBehavior(
+      shellResult?.timeoutBehavior ??
+        args.timeoutBehavior ??
+        args.timeout_behavior
+    )
+    const hardTimeout = this.parseOptionalNonNegativeInt(
+      shellResult?.hardTimeout ?? args.hardTimeout ?? args.hard_timeout
+    )
+    const fileOutputThresholdBytes = this.normalizeOptionalBigInt(
+      shellResult?.fileOutputThresholdBytes ??
+        args.fileOutputThresholdBytes ??
+        args.file_output_threshold_bytes
+    )
+    return create(ShellArgsSchema, {
+      command,
+      workingDirectory,
+      timeout: normalizeShellTimeoutMs(args.timeout),
+      toolCallId: safeString(args.toolCallId || args.tool_call_id || callId),
+      simpleCommands: parsed.simpleCommands,
+      hasInputRedirect: parsed.hasInputRedirect,
+      hasOutputRedirect: parsed.hasOutputRedirect,
+      parsingResult: parsed.parsingResult,
+      requestedSandboxPolicy:
+        requestedSandboxType !== undefined
+          ? create(SandboxPolicySchema, {
+              type: requestedSandboxType as SandboxPolicy_Type,
+            })
+          : undefined,
+      fileOutputThresholdBytes,
+      isBackground: this.parseBooleanFlag(
+        shellResult?.isBackground ?? args.isBackground ?? args.is_background
+      ),
+      skipApproval: true,
+      timeoutBehavior: timeoutBehavior ?? TimeoutBehavior.UNSPECIFIED,
+      hardTimeout,
+      description:
+        safeString(shellResult?.description || args.description).trim() ||
+        undefined,
+      classifierResult: this.normalizeShellClassifierResult(
+        shellResult?.classifierResult ??
+          args.classifierResult ??
+          args.classifier_result
+      ),
+      closeStdin: this.parseBooleanFlag(
+        shellResult?.closeStdin ?? args.closeStdin ?? args.close_stdin
+      ),
+    })
+  }
+
   private normalizeReadLintsDiagnosticPosition(
     value: unknown
   ): { line: number; column: number } | undefined {
@@ -2984,11 +3251,15 @@ export class CursorGrpcService {
     )
     const model = safeString(args.model).trim()
     const resume = safeString(args.resume).trim()
+    const agentId = safeString(args.agentId || args.agent_id).trim()
+    const attachments = this.toStringArray(args.attachments)
     return create(TaskArgsSchema, {
       description,
       prompt,
       model: model || undefined,
       resume: resume || undefined,
+      agentId: agentId || undefined,
+      attachments,
     })
   }
 
@@ -3184,6 +3455,7 @@ export class CursorGrpcService {
             hasInputRedirect: parsed.hasInputRedirect,
             hasOutputRedirect: parsed.hasOutputRedirect,
             parsingResult: parsed.parsingResult,
+            skipApproval: true,
           }),
         }
       }
@@ -3396,6 +3668,9 @@ export class CursorGrpcService {
       ai_attribution: "aiAttributionToolCall",
       mcp_auth: "mcpAuthToolCall",
       pr_management: "prManagementToolCall",
+      blame_by_file_path: "blameByFilePathToolCall",
+      report_bug: "reportBugToolCall",
+      set_active_branch: "setActiveBranchToolCall",
       unknown: "truncatedToolCall",
     }
     const matchedCase = familyToCase[family] || "truncatedToolCall"
@@ -3443,10 +3718,7 @@ export class CursorGrpcService {
         return {
           case: "shellToolCall" as const,
           value: create(ShellToolCallSchema, {
-            args: create(ShellArgsSchema, {
-              command: safeString(args.command),
-              workingDirectory: safeString(args.cwd || args.working_directory),
-            }),
+            args: this.buildShellArgsMessage(callId, args),
           }),
         }
       case "delete":
@@ -3874,6 +4146,55 @@ export class CursorGrpcService {
           }),
         }
       }
+      case "blame_by_file_path":
+        return {
+          case: "blameByFilePathToolCall" as const,
+          value: create(BlameByFilePathToolCallSchema, {
+            args: create(BlameByFilePathArgsSchema, {
+              filePath: safeString(args.filePath || args.file_path),
+              startLine: this.parseOptionalNonNegativeInt(
+                args.startLine ?? args.start_line
+              ),
+              endLine: this.parseOptionalNonNegativeInt(
+                args.endLine ?? args.end_line
+              ),
+            }),
+          }),
+        }
+      case "report_bug":
+        return {
+          case: "reportBugToolCall" as const,
+          value: create(ReportBugToolCallSchema, {
+            args: create(ReportBugArgsSchema, {
+              title: safeString(args.title),
+              file: safeString(
+                args.file || args.path || args.filePath || args.file_path
+              ),
+              startLine:
+                this.parseOptionalNonNegativeInt(
+                  args.startLine ?? args.start_line
+                ) ?? 0,
+              endLine:
+                this.parseOptionalNonNegativeInt(
+                  args.endLine ?? args.end_line
+                ) ?? 0,
+              description: safeString(args.description),
+              severity: safeString(args.severity),
+              category: safeString(args.category),
+              rationale: safeString(args.rationale),
+            }),
+          }),
+        }
+      case "set_active_branch":
+        return {
+          case: "setActiveBranchToolCall" as const,
+          value: create(SetActiveBranchToolCallSchema, {
+            args: create(SetActiveBranchArgsSchema, {
+              path: safeString(args.path),
+              branchName: safeString(args.branchName || args.branch_name),
+            }),
+          }),
+        }
       case "generate_image": {
         const referenceImagePaths =
           this.toStringArray(args.referenceImagePaths).length > 0
@@ -4206,7 +4527,17 @@ export class CursorGrpcService {
             exitCode: shellResult?.exitCode ?? 1,
             stdout: shellResult?.stdout || "",
             stderr: shellResult?.stderr || statusMessage || result,
-            aborted: status === "aborted",
+            outputLocation: this.normalizeOutputLocation(
+              shellResult?.outputLocation
+            ),
+            interleavedOutput: shellResult?.interleavedOutput || undefined,
+            abortReason: this.normalizeShellAbortReason(
+              shellResult?.abortReason
+            ),
+            aborted: shellResult?.aborted ?? status === "aborted",
+            localExecutionTimeMs: this.parseOptionalNonNegativeInt(
+              shellResult?.localExecutionTimeMs
+            ),
           }),
         }
       } else {
@@ -4218,6 +4549,19 @@ export class CursorGrpcService {
             exitCode: shellResult?.exitCode ?? 0,
             stdout: shellResult?.stdout || result,
             stderr: shellResult?.stderr || "",
+            outputLocation: this.normalizeOutputLocation(
+              shellResult?.outputLocation
+            ),
+            shellId: this.parseOptionalNonNegativeInt(shellResult?.shellId),
+            interleavedOutput: shellResult?.interleavedOutput || undefined,
+            pid: this.parseOptionalNonNegativeInt(shellResult?.pid),
+            msToWait: this.parseOptionalNonNegativeInt(shellResult?.msToWait),
+            localExecutionTimeMs: this.parseOptionalNonNegativeInt(
+              shellResult?.localExecutionTimeMs
+            ),
+            backgroundReason: this.normalizeShellBackgroundReason(
+              shellResult?.backgroundReason
+            ),
           }),
         }
       }
@@ -4225,12 +4569,24 @@ export class CursorGrpcService {
       return {
         case: "shellToolCall" as const,
         value: create(ShellToolCallSchema, {
-          args: create(ShellArgsSchema, {
-            command,
-            workingDirectory,
-          }),
+          args: this.buildShellArgsMessage(callId, args, shellResult),
           result: create(ShellResultSchema, {
             result: resultOneOf,
+            sandboxPolicy:
+              shellResult?.requestedSandboxPolicy &&
+              this.parseOptionalNonNegativeInt(
+                shellResult.requestedSandboxPolicy.type
+              ) !== undefined
+                ? create(SandboxPolicySchema, {
+                    type: this.parseOptionalNonNegativeInt(
+                      shellResult.requestedSandboxPolicy.type
+                    ) as SandboxPolicy_Type,
+                  })
+                : undefined,
+            isBackground: this.parseBooleanFlag(shellResult?.isBackground),
+            terminalsFolder:
+              safeString(shellResult?.terminalsFolder).trim() || undefined,
+            pid: this.parseOptionalNonNegativeInt(shellResult?.pid),
           }),
         }),
       }
@@ -4244,8 +4600,12 @@ export class CursorGrpcService {
           case: "success" as const,
           value: create(EditSuccessSchema, {
             path,
+            linesAdded: extraData?.editSuccess?.linesAdded,
+            linesRemoved: extraData?.editSuccess?.linesRemoved,
+            diffString: extraData?.editSuccess?.diffString,
             beforeFullFileContent: extraData?.beforeContent,
             afterFullFileContent: extraData?.afterContent || result,
+            message: extraData?.editSuccess?.message,
           }),
         }
       } else if (status === "file_not_found") {
@@ -5818,6 +6178,112 @@ export class CursorGrpcService {
       }
     }
 
+    if (family === "blame_by_file_path") {
+      const blameResultOneOf =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(BlameByFilePathSuccessSchema, {
+                content: result,
+              }),
+            }
+          : {
+              case: "error" as const,
+              value: create(BlameByFilePathErrorSchema, {
+                errorMessage: statusMessage || "blame_by_file_path failed",
+              }),
+            }
+
+      return {
+        case: "blameByFilePathToolCall" as const,
+        value: create(BlameByFilePathToolCallSchema, {
+          args: create(BlameByFilePathArgsSchema, {
+            filePath: safeString(args.filePath || args.file_path),
+            startLine: this.parseOptionalNonNegativeInt(
+              args.startLine ?? args.start_line
+            ),
+            endLine: this.parseOptionalNonNegativeInt(
+              args.endLine ?? args.end_line
+            ),
+          }),
+          result: create(BlameByFilePathResultSchema, {
+            result: blameResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "report_bug") {
+      const reportBugResultOneOf =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(ReportBugSuccessSchema, {
+                output: result,
+              }),
+            }
+          : {
+              case: "error" as const,
+              value: create(ReportBugErrorSchema, {
+                errorMessage: statusMessage || "report_bug failed",
+              }),
+            }
+
+      return {
+        case: "reportBugToolCall" as const,
+        value: create(ReportBugToolCallSchema, {
+          args: create(ReportBugArgsSchema, {
+            title: safeString(args.title),
+            file: safeString(
+              args.file || args.path || args.filePath || args.file_path
+            ),
+            startLine:
+              this.parseOptionalNonNegativeInt(
+                args.startLine ?? args.start_line
+              ) ?? 0,
+            endLine:
+              this.parseOptionalNonNegativeInt(args.endLine ?? args.end_line) ??
+              0,
+            description: safeString(args.description),
+            severity: safeString(args.severity),
+            category: safeString(args.category),
+            rationale: safeString(args.rationale),
+          }),
+          result: create(ReportBugResultSchema, {
+            result: reportBugResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "set_active_branch") {
+      const setActiveBranchResultOneOf =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(SetActiveBranchSuccessSchema, {}),
+            }
+          : {
+              case: "error" as const,
+              value: create(SetActiveBranchErrorSchema, {
+                error: statusMessage || "set_active_branch failed",
+              }),
+            }
+
+      return {
+        case: "setActiveBranchToolCall" as const,
+        value: create(SetActiveBranchToolCallSchema, {
+          args: create(SetActiveBranchArgsSchema, {
+            path: safeString(args.path),
+            branchName: safeString(args.branchName || args.branch_name),
+          }),
+          result: create(SetActiveBranchResultSchema, {
+            result: setActiveBranchResultOneOf,
+          }),
+        }),
+      }
+    }
+
     if (family === "report_bugfix_results") {
       const reportItems = this.normalizeBugfixResultItems(args.results)
       const reportBugfixResultOneOf =
@@ -5982,12 +6448,31 @@ export class CursorGrpcService {
     }
 
     if (family === "task") {
-      const conversationSteps = Array.isArray(args.conversation_steps)
-        ? args.conversation_steps
-        : Array.isArray(args.conversationSteps)
-          ? args.conversationSteps
-          : []
-      const isBackground = !!(args.is_background ?? args.isBackground)
+      const taskSuccessExtra = extraData?.taskSuccess
+      const conversationSteps = Array.isArray(
+        taskSuccessExtra?.conversationSteps
+      )
+        ? taskSuccessExtra.conversationSteps
+        : Array.isArray(args.conversation_steps)
+          ? args.conversation_steps
+          : Array.isArray(args.conversationSteps)
+            ? args.conversationSteps
+            : []
+      const isBackground =
+        taskSuccessExtra?.isBackground ??
+        !!(args.is_background ?? args.isBackground)
+      const taskAgentId = safeString(
+        taskSuccessExtra?.agentId || args.agentId || args.agent_id
+      ).trim()
+      const durationMsRaw = taskSuccessExtra?.durationMs
+      const durationMs =
+        typeof durationMsRaw === "bigint"
+          ? durationMsRaw
+          : typeof durationMsRaw === "number" && Number.isFinite(durationMsRaw)
+            ? BigInt(Math.max(0, Math.floor(durationMsRaw)))
+            : undefined
+      const resultSuffix = safeString(taskSuccessExtra?.resultSuffix).trim()
+      const transcriptPath = safeString(taskSuccessExtra?.transcriptPath).trim()
       const taskResultOneOf =
         status === "success"
           ? {
@@ -5995,6 +6480,10 @@ export class CursorGrpcService {
               value: create(TaskSuccessSchema, {
                 conversationSteps: conversationSteps,
                 isBackground,
+                agentId: taskAgentId || undefined,
+                durationMs,
+                resultSuffix: resultSuffix || undefined,
+                transcriptPath: transcriptPath || undefined,
               }),
             }
           : {

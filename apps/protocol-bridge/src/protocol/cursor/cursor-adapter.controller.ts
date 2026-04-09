@@ -220,11 +220,25 @@ export class CursorAdapterController {
             this.connectStreamService.handleBidiStream(inputMessages)
 
           let responseCount = 0
+          let heartbeatResponseCount = 0
+          let lastResponseDebugLogAt = 0
           for await (const responseBuffer of outputGenerator) {
             responseCount++
-            this.logger.debug(
-              `>>> Agent response #${responseCount}: ${responseBuffer.length} bytes`
-            )
+            if (responseBuffer.length <= 9) {
+              heartbeatResponseCount++
+            } else {
+              const now = Date.now()
+              if (now - lastResponseDebugLogAt > 60_000) {
+                this.logger.debug(
+                  `>>> Agent response #${responseCount}: ${responseBuffer.length} bytes` +
+                    (heartbeatResponseCount > 0
+                      ? ` (suppressed ${heartbeatResponseCount} heartbeat responses)`
+                      : "")
+                )
+                heartbeatResponseCount = 0
+                lastResponseDebugLogAt = now
+              }
+            }
             output(responseBuffer)
           }
           this.logger.log(

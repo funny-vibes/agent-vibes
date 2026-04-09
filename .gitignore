@@ -46,5 +46,7 @@ scripts/capture/antigravity_traffic.log
 # Extension build artifacts
 apps/vscode-extension/README.md
 apps/vscode-extension/*.vsix
-apps/vscode-extension/bridge/darwin-arm64/agent-vibes-bridge
+apps/vscode-extension/bridge/**
+!apps/vscode-extension/bridge/
+!apps/vscode-extension/bridge/README.md
 

@@ -303,21 +303,6 @@ export class ModelRouterService {
             isThinking: true,
           })
         }
-      } else if (entry && canPublicClaudeModelUseGoogle(normalized)) {
-        // Non-Opus Claude models (Sonnet, Haiku, etc.) → use Gemini instead
-        // to save Claude quota for important tasks.
-        // Guard: only redirect known, valid Claude model IDs — unknown or
-        // misspelled IDs fall through so they surface an unsupported-model error.
-        // We still use google-claude backend to keep shouldFallbackFromBackend()
-        // claude-api ↔ google-claude pair working correctly.
-        this.logger.log(
-          `[ROUTE] Non-Opus Claude model "${cursorModel}" redirected to Gemini 3.1 Pro High`
-        )
-        candidates.push({
-          backend: "google-claude",
-          model: "gemini-3.1-pro-high",
-          isThinking: false,
-        })
       }
     }
 

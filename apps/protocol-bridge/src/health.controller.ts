@@ -120,7 +120,7 @@ export class HealthController {
       : 10
 
     const normalizedSortBy = this.normalizeGoogleQuotaSortBy(sortBy)
-    const accounts = await this.processPool.fetchGoogleQuotaSnapshots()
+    const accounts = await this.processPool.fetchGoogleQuotaSnapshots(true)
     const filteredAccounts = this.filterGoogleQuotaAccounts(
       accounts,
       normalizedModel,

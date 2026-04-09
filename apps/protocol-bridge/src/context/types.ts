@@ -53,6 +53,7 @@ export interface ImageBlock {
 export interface ThinkingBlock {
   type: "thinking"
   thinking: string
+  signature?: string
 }
 
 /**
@@ -155,11 +156,17 @@ export interface ContextUsageLedgerState {
   attachmentFingerprint?: string
 }
 
+export interface ContextToolResultReplacementState {
+  seenToolUseIds: string[]
+  replacementByToolUseId: Record<string, string>
+}
+
 export interface ContextConversationState {
   records: ContextTranscriptRecord[]
   compactionHistory: ContextCompactionCommit[]
   activeCompactionId?: string
   usageLedger: ContextUsageLedgerState
+  toolResultReplacementState?: ContextToolResultReplacementState
 }
 
 export interface ProjectedContextMessage {

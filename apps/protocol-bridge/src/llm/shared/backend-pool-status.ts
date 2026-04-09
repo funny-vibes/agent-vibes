@@ -6,10 +6,17 @@ export type BackendPoolEntryState =
   | "disabled"
   | "unavailable"
 
+export type BackendPoolModelCooldownReason =
+  | "quota_exhausted"
+  | "rate_limited"
+  | "capacity_exhausted"
+  | "transient"
+
 export interface BackendPoolModelCooldownStatus {
   model: string
   cooldownUntil: number
   quotaExhausted?: boolean
+  reason?: BackendPoolModelCooldownReason
   backoffLevel?: number
 }
 

@@ -104,6 +104,13 @@ class OutputConfigDto {
   effort?: string
 }
 
+export type ThinkingIntentEffort = "low" | "medium" | "high" | "xhigh"
+
+export type ThinkingIntent =
+  | { mode: "disabled" }
+  | { mode: "adaptive"; effort?: ThinkingIntentEffort }
+  | { mode: "explicit_budget"; budgetTokens: number }
+
 export class CreateMessageDto {
   @ApiProperty({ example: "gemini-2.5-flash" })
   @IsString()
@@ -244,4 +251,12 @@ export class CreateMessageDto {
   @IsOptional()
   @IsNumber()
   _protectedContextMessageCount?: number
+
+  /**
+   * Internal backend-agnostic thinking intent.
+   * Cursor-side thinking semantics are captured here first, then each backend
+   * serializes them into its own wire format.
+   */
+  @IsOptional()
+  _thinkingIntent?: ThinkingIntent
 }

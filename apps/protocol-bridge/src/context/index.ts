@@ -10,6 +10,7 @@ export * from "./types"
 // History services
 export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
+export { ToolResultCompactionService } from "./tool-result-compaction.service"
 export { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
 export type {
   ContextAttachmentSnapshot,
