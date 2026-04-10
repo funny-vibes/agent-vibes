@@ -158,40 +158,40 @@ Compatible Cursor version: `3.0.13`.
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-arm64-0.1.4.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.4/agent-vibes-darwin-arm64-0.1.4.vsix
+curl -L -o agent-vibes-darwin-arm64-0.1.5.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.5/agent-vibes-darwin-arm64-0.1.5.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-arm64-0.1.4.vsix --force
+cursor --install-extension agent-vibes-darwin-arm64-0.1.5.vsix --force
 ```
 
 #### macOS Intel
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-x64-0.1.4.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.4/agent-vibes-darwin-x64-0.1.4.vsix
+curl -L -o agent-vibes-darwin-x64-0.1.5.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.5/agent-vibes-darwin-x64-0.1.5.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-x64-0.1.4.vsix --force
+cursor --install-extension agent-vibes-darwin-x64-0.1.5.vsix --force
 ```
 
 #### Linux x64
 
 ```bash
 # Download
-curl -L -o agent-vibes-linux-x64-0.1.4.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.4/agent-vibes-linux-x64-0.1.4.vsix
+curl -L -o agent-vibes-linux-x64-0.1.5.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.5/agent-vibes-linux-x64-0.1.5.vsix
 
 # Install
-cursor --install-extension agent-vibes-linux-x64-0.1.4.vsix --force
+cursor --install-extension agent-vibes-linux-x64-0.1.5.vsix --force
 ```
 
 #### Windows x64
 
 ```powershell
 # Download
-Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.4/agent-vibes-win32-x64-0.1.4.vsix" -OutFile "agent-vibes-win32-x64-0.1.4.vsix"
+Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.5/agent-vibes-win32-x64-0.1.5.vsix" -OutFile "agent-vibes-win32-x64-0.1.5.vsix"
 
 # Install
-cursor --install-extension agent-vibes-win32-x64-0.1.4.vsix --force
+cursor --install-extension agent-vibes-win32-x64-0.1.5.vsix --force
 ```
 
 Restart Cursor after installation.
