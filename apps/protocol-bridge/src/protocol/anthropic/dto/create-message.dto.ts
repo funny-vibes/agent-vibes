@@ -104,7 +104,13 @@ class OutputConfigDto {
   effort?: string
 }
 
-export type ThinkingIntentEffort = "low" | "medium" | "high" | "xhigh"
+export type ThinkingIntentEffort =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
 
 export type ThinkingIntent =
   | { mode: "disabled" }
@@ -259,4 +265,12 @@ export class CreateMessageDto {
    */
   @IsOptional()
   _thinkingIntent?: ThinkingIntent
+
+  /**
+   * Internal original model identifier before backend routing canonicalizes it.
+   * This keeps suffix-style thinking hints attached to the original request.
+   */
+  @IsOptional()
+  @IsString()
+  _requestedModel?: string
 }

@@ -90,6 +90,47 @@ function extractEnterpriseGcpProjectId(encodedValue) {
   return undefined
 }
 
+function extractUserStatus(encodedValue) {
+  let decoded = ""
+  try {
+    decoded = Buffer.from(encodedValue, "base64").toString("utf8")
+  } catch {
+    console.error("❌ Invalid Antigravity IDE user status payload")
+    process.exit(1)
+  }
+
+  const blocks = decoded.match(/[A-Za-z0-9+/=]{20,}/g) || []
+  for (const block of blocks) {
+    try {
+      const candidate = Buffer.from(block, "base64").toString("utf8")
+      const emailMatch = candidate.match(
+        /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
+      )
+      if (!emailMatch || !emailMatch[0]) {
+        continue
+      }
+
+      const email = emailMatch[0].trim().toLowerCase()
+      const prefix = candidate.slice(0, emailMatch.index || 0)
+      const segments = prefix
+        .split(":")
+        .map((value) => value.trim())
+        .filter(Boolean)
+      const rawName = segments.length > 0 ? segments[segments.length - 1] : null
+      const sanitizedName = rawName
+        ? rawName.replace(/[^\p{L}\p{N} ._'’-]/gu, "").trim()
+        : ""
+
+      return { email, name: sanitizedName || null }
+    } catch (_) {
+      // skip invalid block
+    }
+  }
+
+  console.error("❌ Invalid Antigravity IDE user status payload: missing email")
+  process.exit(1)
+}
+
 // ---------------------------------------------------------------------------
 // --ide: Antigravity IDE (state.vscdb)
 // ---------------------------------------------------------------------------
@@ -104,16 +145,18 @@ function fromIDE() {
   }
 
   const db = new DatabaseSync(DB, { open: true, readOnly: true })
-  let authRaw = ""
+  let userStatusB64 = ""
   let oauthB64 = ""
   let enterprisePreferencesB64 = ""
 
   try {
-    const authRow = db
+    const userStatusRow = db
       .prepare("SELECT value FROM ItemTable WHERE key = ?")
-      .get("antigravityAuthStatus")
-    authRaw =
-      authRow && typeof authRow.value === "string" ? authRow.value.trim() : ""
+      .get("antigravityUnifiedStateSync.userStatus")
+    userStatusB64 =
+      userStatusRow && typeof userStatusRow.value === "string"
+        ? userStatusRow.value.trim()
+        : ""
 
     const oauthRow = db
       .prepare("SELECT value FROM ItemTable WHERE key = ?")
@@ -135,16 +178,14 @@ function fromIDE() {
     db.close()
   }
 
-  if (!authRaw) {
-    console.error("❌ Not logged in — no antigravityAuthStatus found")
+  if (!userStatusB64) {
+    console.error(
+      "❌ Not logged in — no antigravityUnifiedStateSync.userStatus found"
+    )
     process.exit(1)
   }
 
-  const auth = JSON.parse(authRaw)
-  if (!auth.email) {
-    console.error("❌ No email in antigravityAuthStatus")
-    process.exit(1)
-  }
+  const userStatus = extractUserStatus(userStatusB64)
 
   if (!oauthB64) {
     console.error("❌ No OAuth token found in state.vscdb")
@@ -182,7 +223,7 @@ function fromIDE() {
 
   const quotaProjectId = extractEnterpriseGcpProjectId(enterprisePreferencesB64)
 
-  console.log(`✅ ${auth.name} <${auth.email}>`)
+  console.log(`✅ ${userStatus.name || "Unknown User"} <${userStatus.email}>`)
   console.log(`   Access Token: ${accessToken.substring(0, 25)}...`)
   console.log(`   Refresh Token: ${refreshToken.substring(0, 15)}...`)
   if (quotaProjectId) {
@@ -191,7 +232,7 @@ function fromIDE() {
 
   return [
     {
-      email: auth.email,
+      email: userStatus.email,
       accessToken,
       refreshToken,
       quotaProjectId,

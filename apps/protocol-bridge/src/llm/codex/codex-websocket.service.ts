@@ -24,13 +24,13 @@ import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import WebSocket from "ws"
+import {
+  buildCodexWebSocketHeaders,
+  type CodexForwardHeaders,
+} from "./codex-header-utils"
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-const CODEX_CLIENT_VERSION = "0.101.0"
-const CODEX_USER_AGENT =
-  "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-const CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
 const WS_IDLE_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
 const WS_HANDSHAKE_TIMEOUT_MS = 30 * 1000 // 30 seconds
 
@@ -40,6 +40,7 @@ export interface WebSocketSession {
   sessionId: string
   conn: WebSocket | null
   wsUrl: string
+  requestTail: Promise<void>
 }
 
 export interface WebSocketMessage {
@@ -103,33 +104,18 @@ export class CodexWebSocketService implements OnModuleDestroy {
     token: string,
     isApiKey: boolean,
     accountId?: string,
-    cacheHeaders?: Record<string, string>
+    cacheHeaders?: Record<string, string>,
+    forwardHeaders?: CodexForwardHeaders,
+    omitAccountId: boolean = false
   ): Record<string, string> {
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${token}`,
-      Version: CODEX_CLIENT_VERSION,
-      "OpenAI-Beta": CODEX_WS_BETA_HEADER,
-      "User-Agent": CODEX_USER_AGENT,
-      "x-codex-turn-state": "",
-      "x-codex-turn-metadata": "",
-      "x-responsesapi-include-timing-metrics": "",
-    }
-
-    if (!isApiKey) {
-      headers["Originator"] = "codex_cli_rs"
-      if (accountId) {
-        headers["Chatgpt-Account-Id"] = accountId
-      }
-    }
-
-    // Merge cache headers
-    if (cacheHeaders) {
-      for (const [key, value] of Object.entries(cacheHeaders)) {
-        headers[key] = value
-      }
-    }
-
-    return headers
+    return buildCodexWebSocketHeaders({
+      token,
+      isApiKey,
+      accountId,
+      cacheHeaders,
+      forwardHeaders,
+      omitAccountId,
+    })
   }
 
   private buildProxyAgent(
@@ -406,9 +392,109 @@ export class CodexWebSocketService implements OnModuleDestroy {
       sessionId,
       conn: null,
       wsUrl: "",
+      requestTail: Promise.resolve(),
     }
     this.sessions.set(sessionId, session)
     return session
+  }
+
+  async acquireSession(
+    sessionId: string
+  ): Promise<{ session: WebSocketSession; release: () => void }> {
+    const session = this.getOrCreateSession(sessionId)
+    const previous = session.requestTail.catch(() => undefined)
+    let resolveCurrent: (() => void) | null = null
+    const current = new Promise<void>((resolve) => {
+      resolveCurrent = resolve
+    })
+    session.requestTail = previous.then(() => current)
+    await previous
+
+    let released = false
+    return {
+      session,
+      release: () => {
+        if (released) {
+          return
+        }
+        released = true
+        resolveCurrent?.()
+        if (session.requestTail === current) {
+          session.requestTail = Promise.resolve()
+        }
+      },
+    }
+  }
+
+  async ensureSessionConnection(
+    sessionId: string,
+    wsUrl: string,
+    headers: Record<string, string>,
+    proxyUrl?: string
+  ): Promise<WebSocket> {
+    const session = this.getOrCreateSession(sessionId)
+    const current = session.conn
+
+    if (
+      current &&
+      current.readyState === WebSocket.OPEN &&
+      session.wsUrl === wsUrl
+    ) {
+      return current
+    }
+
+    this.invalidateSessionConnection(sessionId, current)
+
+    const ws = await this.connect(wsUrl, headers, proxyUrl)
+    session.conn = ws
+    session.wsUrl = wsUrl
+    this.attachSessionLifecycle(session, ws)
+    return ws
+  }
+
+  invalidateSessionConnection(
+    sessionId: string,
+    conn?: WebSocket | null
+  ): void {
+    const session = this.sessions.get(sessionId)
+    if (!session) {
+      return
+    }
+
+    const current = session.conn
+    if (!current) {
+      session.wsUrl = ""
+      return
+    }
+
+    if (conn && current !== conn) {
+      return
+    }
+
+    session.conn = null
+    session.wsUrl = ""
+    try {
+      current.close()
+    } catch (e) {
+      this.logger.warn(
+        `Error closing WebSocket session ${sessionId}: ${(e as Error).message}`
+      )
+    }
+  }
+
+  private attachSessionLifecycle(
+    session: WebSocketSession,
+    conn: WebSocket
+  ): void {
+    const clearIfCurrent = () => {
+      if (session.conn === conn) {
+        session.conn = null
+        session.wsUrl = ""
+      }
+    }
+
+    conn.on("close", clearIfCurrent)
+    conn.on("error", clearIfCurrent)
   }
 
   /**
@@ -418,17 +504,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
-    if (session.conn) {
-      try {
-        session.conn.close()
-      } catch (e) {
-        this.logger.warn(
-          `Error closing WebSocket session ${sessionId}: ${(e as Error).message}`
-        )
-      }
-      session.conn = null
-    }
-
+    this.invalidateSessionConnection(sessionId, session.conn)
     this.sessions.delete(sessionId)
     this.logger.log(`WebSocket session closed: ${sessionId}`)
   }

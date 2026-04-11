@@ -29,23 +29,11 @@ import { MessagesService } from "./messages.service"
 export class MessagesController {
   constructor(private readonly messagesService: MessagesService) {}
 
-  private pickForwardHeaders(
+  private pickHeaders(
+    allowedHeaders: string[],
     headers?: Record<string, string | string[] | undefined>
   ): Record<string, string> {
     if (!headers) return {}
-
-    const allowedHeaders = [
-      "anthropic-version",
-      "anthropic-beta",
-      "anthropic-dangerous-direct-browser-access",
-      "x-app",
-      "x-stainless-retry-count",
-      "x-stainless-runtime",
-      "x-stainless-lang",
-      "x-stainless-timeout",
-      "x-cpa-claude-1m",
-      "user-agent",
-    ]
 
     const out: Record<string, string> = {}
     for (const key of allowedHeaders) {
@@ -64,6 +52,47 @@ export class MessagesController {
     }
 
     return out
+  }
+
+  private pickAnthropicForwardHeaders(
+    headers?: Record<string, string | string[] | undefined>
+  ): Record<string, string> {
+    return this.pickHeaders(
+      [
+        "anthropic-version",
+        "anthropic-beta",
+        "anthropic-dangerous-direct-browser-access",
+        "x-app",
+        "x-stainless-retry-count",
+        "x-stainless-runtime",
+        "x-stainless-lang",
+        "x-stainless-timeout",
+        "x-cpa-claude-1m",
+        "user-agent",
+      ],
+      headers
+    )
+  }
+
+  private pickCodexForwardHeaders(
+    headers?: Record<string, string | string[] | undefined>
+  ): Record<string, string> {
+    return this.pickHeaders(
+      [
+        "originator",
+        "version",
+        "user-agent",
+        "openai-beta",
+        "x-codex-beta-features",
+        "x-codex-turn-state",
+        "x-codex-turn-metadata",
+        "x-client-request-id",
+        "x-responsesapi-include-timing-metrics",
+        "session_id",
+        "session-id",
+      ],
+      headers
+    )
   }
 
   private getRetryAfterSeconds(error: unknown): number | null {
@@ -133,13 +162,15 @@ export class MessagesController {
   ) {
     void apiKey
     void version
-    const forwardHeaders = this.pickForwardHeaders(headers)
+    const forwardHeaders = this.pickAnthropicForwardHeaders(headers)
+    const codexForwardHeaders = this.pickCodexForwardHeaders(headers)
 
     // Handle streaming mode
     if (createMessageDto.stream && res) {
       const stream = this.messagesService.createMessageStream(
         createMessageDto,
-        forwardHeaders
+        forwardHeaders,
+        codexForwardHeaders
       )
       let headersWritten = false
       const ensureHeaders = () => {
@@ -176,7 +207,8 @@ export class MessagesController {
     try {
       return await this.messagesService.createMessage(
         createMessageDto,
-        forwardHeaders
+        forwardHeaders,
+        codexForwardHeaders
       )
     } catch (error) {
       const retryAfterSeconds = this.getRetryAfterSeconds(error)

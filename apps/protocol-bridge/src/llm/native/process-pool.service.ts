@@ -423,7 +423,16 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     try {
       await this.spawnAsync(goCommand, ["build", "-o", outputBinary, "."], {
         cwd: GO_WORKER_DIR,
-        env: process.env,
+        env: {
+          ...process.env,
+          // Use BoringCrypto (BoringSSL) for TLS to match the official LS
+          // binary's TLS fingerprint (JA3/JA4).  The LS is compiled with
+          // go1.27+boringcrypto which produces a distinct cipher suite list
+          // and TLS extension order.  Without this, Google's frontend (GFE)
+          // can distinguish our worker from the official IDE client.
+          GOEXPERIMENT: "boringcrypto",
+          CGO_ENABLED: "1",
+        },
       })
     } catch (err) {
       this.logger.error(

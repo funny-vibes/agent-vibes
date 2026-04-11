@@ -8,7 +8,7 @@
  * - Codex SSE → Claude SSE response translation
  * - Non-streaming mode
  * - Proxy support (HTTP/HTTPS/SOCKS5)
- * - Request header emulation (codex_cli_rs client)
+ * - Request header emulation matching CLIProxyAPI Codex behavior
  * - OAuth token management with auto-refresh
  * - Prompt caching via Conversation_id/Session_id headers
  * - Retry-after handling for rate limits
@@ -28,6 +28,7 @@ import * as path from "path"
 import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
+import type WebSocket from "ws"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import {
@@ -38,6 +39,7 @@ import {
   CodexModelTier,
   isChatGptCodexModelSupported,
   normalizeCodexModelTier,
+  supportsCodexModelForTier,
 } from "../model-registry"
 import {
   type CooldownableAccount,
@@ -61,6 +63,10 @@ import {
 } from "../shared/abort-signal"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
+import {
+  buildCodexHttpHeaders,
+  type CodexForwardHeaders,
+} from "./codex-header-utils"
 import { translateClaudeToCodex } from "./codex-request-translator"
 import {
   createStreamState,
@@ -74,11 +80,8 @@ import {
 } from "./codex-websocket.service"
 import { UsageStatsService } from "../../usage/usage-stats.service"
 
-// ── Constants (matching codex_cli_rs) ──────────────────────────────────
+// ── Constants ───────────────────────────────────────────────────────────
 
-const CODEX_CLIENT_VERSION = "0.101.0"
-const CODEX_USER_AGENT =
-  "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 const CODEX_ACCOUNTS_CONFIG_PATHS = getAccountConfigPathCandidates(
   "codex-accounts.json"
@@ -186,8 +189,6 @@ export class CodexService implements OnModuleInit {
 
   /** Whether to prefer WebSocket transport over HTTP */
   private useWebSocket: boolean = false
-  /** Whether WebSocket was rejected by upstream (fallback to HTTP) */
-  private webSocketRejected: boolean = false
 
   private readonly CONVERSATION_SLOT_TTL_MS = 60 * 60 * 1000
 
@@ -755,6 +756,25 @@ export class CodexService implements OnModuleInit {
       : ""
   }
 
+  private getExecutionSessionId(dto: CreateMessageDto): string {
+    return this.getConversationId(dto)
+  }
+
+  private shouldRetrySessionWebSocketError(error: unknown): boolean {
+    if (error instanceof CodexWebSocketUpgradeError) {
+      return false
+    }
+
+    const message =
+      error instanceof Error ? error.message.toLowerCase() : String(error)
+
+    return (
+      message.includes("websocket is not open") ||
+      message.includes("readystate") ||
+      message.includes("socket has been closed")
+    )
+  }
+
   private hashIdentityPart(value: string): string {
     return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)
   }
@@ -871,7 +891,11 @@ export class CodexService implements OnModuleInit {
       return true
     }
 
-    return isChatGptCodexModelSupported(modelName)
+    const tier = this.getSlotPlanType(slot) || this.getModelTier() || "pro"
+    return (
+      isChatGptCodexModelSupported(modelName) &&
+      supportsCodexModelForTier(modelName, tier)
+    )
   }
 
   private hasSupportingAccount(modelName: string): boolean {
@@ -1168,8 +1192,7 @@ export class CodexService implements OnModuleInit {
   }
 
   /**
-   * Build request headers matching codex_cli_rs behavior.
-   * Ported from: codex_executor.go applyCodexHeaders()
+   * Build request headers matching CLIProxyAPI Codex behavior.
    */
   private buildHeaders(
     slot: CodexAccountSlot,
@@ -1178,39 +1201,18 @@ export class CodexService implements OnModuleInit {
     cacheHeaders?: Record<string, string>,
     options?: {
       omitAccountId?: boolean
+      forwardHeaders?: CodexForwardHeaders
     }
   ): Record<string, string> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      Version: CODEX_CLIENT_VERSION,
-      Session_id: crypto.randomUUID(),
-      "User-Agent": CODEX_USER_AGENT,
-      Connection: "Keep-Alive",
-      Accept: stream ? "text/event-stream" : "application/json",
-    }
-
-    // Non-API-key mode: add Originator header (OAuth/access token mode)
-    if (!this.isApiKeyMode(slot)) {
-      headers["Originator"] = "codex_cli_rs"
-
-      // Add account ID if available
-      const accountId = options?.omitAccountId
-        ? ""
-        : this.getSlotAccountId(slot)
-      if (accountId) {
-        headers["Chatgpt-Account-Id"] = accountId
-      }
-    }
-
-    // Merge cache headers
-    if (cacheHeaders) {
-      for (const [key, value] of Object.entries(cacheHeaders)) {
-        headers[key] = value
-      }
-    }
-
-    return headers
+    return buildCodexHttpHeaders({
+      token,
+      isApiKey: this.isApiKeyMode(slot),
+      accountId: this.getSlotAccountId(slot),
+      stream,
+      cacheHeaders,
+      forwardHeaders: options?.forwardHeaders,
+      omitAccountId: options?.omitAccountId,
+    })
   }
 
   /**
@@ -1516,8 +1518,11 @@ export class CodexService implements OnModuleInit {
   /**
    * Send a non-streaming message through Codex.
    */
-  async sendClaudeMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
-    return this.executeWithCooldownRetry(dto, 1)
+  async sendClaudeMessage(
+    dto: CreateMessageDto,
+    forwardHeaders?: CodexForwardHeaders
+  ): Promise<AnthropicResponse> {
+    return this.executeWithCooldownRetry(dto, forwardHeaders, 1)
   }
 
   /**
@@ -1526,6 +1531,7 @@ export class CodexService implements OnModuleInit {
    */
   private async executeWithCooldownRetry(
     dto: CreateMessageDto,
+    forwardHeaders?: CodexForwardHeaders,
     attempt: number = 1,
     slot: CodexAccountSlot = this.selectRequestSlot(
       dto.model,
@@ -1555,12 +1561,8 @@ export class CodexService implements OnModuleInit {
     try {
       let result: AnthropicResponse
 
-      // Try WebSocket transport first (if enabled and not rejected)
-      if (
-        this.useWebSocket &&
-        !this.webSocketRejected &&
-        this.wsService.isWebSocketAvailable()
-      ) {
+      // Try WebSocket transport first when enabled.
+      if (this.useWebSocket && this.wsService.isWebSocketAvailable()) {
         try {
           result = await this.sendViaWebSocket(
             slot,
@@ -1568,7 +1570,9 @@ export class CodexService implements OnModuleInit {
             codexRequest,
             modelName,
             reverseToolMap,
-            cacheId
+            cacheId,
+            dto,
+            forwardHeaders
           )
         } catch (e) {
           if (e instanceof CodexWebSocketUpgradeError) {
@@ -1586,20 +1590,22 @@ export class CodexService implements OnModuleInit {
                 modelName,
                 reverseToolMap,
                 cacheId,
-                true
+                true,
+                forwardHeaders
               )
             } else if (e.shouldFallbackToHttp()) {
               this.logger.warn(
                 "WebSocket upgrade rejected, falling back to HTTP"
               )
-              this.webSocketRejected = true
               result = await this.sendViaHttp(
                 slot,
                 token,
                 codexRequest,
                 modelName,
                 reverseToolMap,
-                cacheId
+                cacheId,
+                false,
+                forwardHeaders
               )
             } else {
               throw this.createCodexApiError(
@@ -1618,7 +1624,9 @@ export class CodexService implements OnModuleInit {
           codexRequest,
           modelName,
           reverseToolMap,
-          cacheId
+          cacheId,
+          false,
+          forwardHeaders
         )
       }
 
@@ -1645,7 +1653,12 @@ export class CodexService implements OnModuleInit {
             this.logger.log(
               `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying with ${this.getAccountLabel(nextSlot)} (attempt ${attempt + 1}/${this.accounts.length})`
             )
-            return this.executeWithCooldownRetry(dto, attempt + 1, nextSlot)
+            return this.executeWithCooldownRetry(
+              dto,
+              forwardHeaders,
+              attempt + 1,
+              nextSlot
+            )
           }
         }
       }
@@ -1663,7 +1676,8 @@ export class CodexService implements OnModuleInit {
     modelName: string,
     reverseToolMap: Map<string, string>,
     cacheId: string,
-    omitAccountId: boolean = false
+    omitAccountId: boolean = false,
+    forwardHeaders?: CodexForwardHeaders
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
     const requestBody = JSON.stringify(codexRequest)
@@ -1671,10 +1685,11 @@ export class CodexService implements OnModuleInit {
     const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
     const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
       omitAccountId,
+      forwardHeaders,
     })
 
     this.logger.log(
-      `[Codex] Non-stream request: model=${modelName}, url=${url}`
+      `[Codex] Non-stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify((codexRequest as { reasoning?: unknown }).reasoning ?? null)}, service_tier=${JSON.stringify((codexRequest as { service_tier?: unknown }).service_tier ?? null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -1712,7 +1727,8 @@ export class CodexService implements OnModuleInit {
           modelName,
           reverseToolMap,
           cacheId,
-          true
+          true,
+          forwardHeaders
         )
       }
 
@@ -1767,7 +1783,9 @@ export class CodexService implements OnModuleInit {
     codexRequest: Record<string, unknown>,
     modelName: string,
     reverseToolMap: Map<string, string>,
-    cacheId: string
+    cacheId: string,
+    dto: CreateMessageDto,
+    forwardHeaders?: CodexForwardHeaders
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
     const httpUrl = this.buildUrl(slot, "responses")
@@ -1777,21 +1795,19 @@ export class CodexService implements OnModuleInit {
       token,
       this.isApiKeyMode(slot),
       this.getSlotAccountId(slot),
-      cacheHeaders
+      cacheHeaders,
+      forwardHeaders
     )
+    const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
+    const sessionId = this.getExecutionSessionId(dto)
 
     this.logger.log(
       `[Codex] WebSocket non-stream request: model=${modelName}, url=${wsUrl}`
     )
 
-    const ws = await this.wsService.connect(
-      wsUrl,
-      wsHeaders,
-      slot.proxyUrl || undefined
-    )
-
-    try {
-      const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
+    const executeRequest = async (
+      ws: WebSocket
+    ): Promise<AnthropicResponse> => {
       const completedEvent = await this.wsService.sendViaWebSocket(ws, wsBody)
       this.logCodexUsage(
         "websocket",
@@ -1806,16 +1822,59 @@ export class CodexService implements OnModuleInit {
         completedEvent as Record<string, unknown>,
         reverseToolMap
       )
-      if (result) {
-        this.logger.log(
-          `[Codex] WebSocket non-stream response: model=${result.model}, stop=${result.stop_reason}`
-        )
-        return result
+      if (!result) {
+        throw new Error("WebSocket response did not contain valid completion")
       }
 
-      throw new Error("WebSocket response did not contain valid completion")
+      this.logger.log(
+        `[Codex] WebSocket non-stream response: model=${result.model}, stop=${result.stop_reason}`
+      )
+      return result
+    }
+
+    if (!sessionId) {
+      const ws = await this.wsService.connect(
+        wsUrl,
+        wsHeaders,
+        slot.proxyUrl || undefined
+      )
+      try {
+        return await executeRequest(ws)
+      } finally {
+        ws.close()
+      }
+    }
+
+    const { release } = await this.wsService.acquireSession(sessionId)
+    try {
+      let ws = await this.wsService.ensureSessionConnection(
+        sessionId,
+        wsUrl,
+        wsHeaders,
+        slot.proxyUrl || undefined
+      )
+
+      try {
+        return await executeRequest(ws)
+      } catch (error) {
+        if (!this.shouldRetrySessionWebSocketError(error)) {
+          throw error
+        }
+
+        this.logger.warn(
+          `[Codex] Reconnecting stale WebSocket session ${sessionId} before retry`
+        )
+        this.wsService.invalidateSessionConnection(sessionId, ws)
+        ws = await this.wsService.ensureSessionConnection(
+          sessionId,
+          wsUrl,
+          wsHeaders,
+          slot.proxyUrl || undefined
+        )
+        return executeRequest(ws)
+      }
     } finally {
-      ws.close()
+      release()
     }
   }
 
@@ -1827,13 +1886,29 @@ export class CodexService implements OnModuleInit {
    */
   async *sendClaudeMessageStream(
     dto: CreateMessageDto,
+    forwardHeadersOrAbortSignal?: CodexForwardHeaders | AbortSignal,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
-    yield* this.executeStreamWithCooldownRetry(dto, abortSignal, 1)
+    const forwardHeaders =
+      forwardHeadersOrAbortSignal instanceof AbortSignal
+        ? undefined
+        : forwardHeadersOrAbortSignal
+    const resolvedAbortSignal =
+      forwardHeadersOrAbortSignal instanceof AbortSignal
+        ? forwardHeadersOrAbortSignal
+        : abortSignal
+
+    yield* this.executeStreamWithCooldownRetry(
+      dto,
+      forwardHeaders,
+      resolvedAbortSignal,
+      1
+    )
   }
 
   private async *executeStreamWithCooldownRetry(
     dto: CreateMessageDto,
+    forwardHeaders?: CodexForwardHeaders,
     abortSignal?: AbortSignal,
     attempt: number = 1,
     slot: CodexAccountSlot = this.selectRequestSlot(
@@ -1864,12 +1939,8 @@ export class CodexService implements OnModuleInit {
     let emittedEvents = false
 
     try {
-      // Try WebSocket transport first (if enabled and not rejected)
-      if (
-        this.useWebSocket &&
-        !this.webSocketRejected &&
-        this.wsService.isWebSocketAvailable()
-      ) {
+      // Try WebSocket transport first when enabled.
+      if (this.useWebSocket && this.wsService.isWebSocketAvailable()) {
         try {
           for await (const event of this.streamViaWebSocket(
             slot,
@@ -1878,6 +1949,8 @@ export class CodexService implements OnModuleInit {
             modelName,
             reverseToolMap,
             cacheId,
+            dto,
+            forwardHeaders,
             abortSignal
           )) {
             emittedEvents = true
@@ -1911,6 +1984,7 @@ export class CodexService implements OnModuleInit {
                 reverseToolMap,
                 cacheId,
                 true,
+                forwardHeaders,
                 abortSignal
               )) {
                 emittedEvents = true
@@ -1924,7 +1998,6 @@ export class CodexService implements OnModuleInit {
               this.logger.warn(
                 "WebSocket upgrade rejected, falling back to HTTP for streaming"
               )
-              this.webSocketRejected = true
             } else {
               throw this.createCodexApiError(
                 e.statusCode || 502,
@@ -1945,6 +2018,7 @@ export class CodexService implements OnModuleInit {
         reverseToolMap,
         cacheId,
         false,
+        forwardHeaders,
         abortSignal
       )) {
         emittedEvents = true
@@ -1984,6 +2058,7 @@ export class CodexService implements OnModuleInit {
             )
             yield* this.executeStreamWithCooldownRetry(
               dto,
+              forwardHeaders,
               abortSignal,
               attempt + 1,
               nextSlot
@@ -2007,6 +2082,7 @@ export class CodexService implements OnModuleInit {
     reverseToolMap: Map<string, string>,
     cacheId: string,
     omitAccountId: boolean = false,
+    forwardHeaders?: CodexForwardHeaders,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
@@ -2015,9 +2091,12 @@ export class CodexService implements OnModuleInit {
     const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
     const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
       omitAccountId,
+      forwardHeaders,
     })
 
-    this.logger.log(`[Codex] Stream request: model=${modelName}, url=${url}`)
+    this.logger.log(
+      `[Codex] Stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify((codexRequest as { reasoning?: unknown }).reasoning ?? null)}, service_tier=${JSON.stringify((codexRequest as { service_tier?: unknown }).service_tier ?? null)}`
+    )
 
     const requestSignal = createAbortSignalWithTimeout(600_000, abortSignal)
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -2059,6 +2138,7 @@ export class CodexService implements OnModuleInit {
             reverseToolMap,
             cacheId,
             true,
+            forwardHeaders,
             abortSignal
           )
           return
@@ -2182,6 +2262,8 @@ export class CodexService implements OnModuleInit {
     modelName: string,
     reverseToolMap: Map<string, string>,
     cacheId: string,
+    dto: CreateMessageDto,
+    forwardHeaders?: CodexForwardHeaders,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
@@ -2192,22 +2274,107 @@ export class CodexService implements OnModuleInit {
       token,
       this.isApiKeyMode(slot),
       this.getSlotAccountId(slot),
-      cacheHeaders
+      cacheHeaders,
+      forwardHeaders
     )
+    const sessionId = this.getExecutionSessionId(dto)
 
     this.logger.log(
       `[Codex] WebSocket stream request: model=${modelName}, url=${wsUrl}`
     )
 
-    const ws = await this.wsService.connect(
-      wsUrl,
-      wsHeaders,
-      slot.proxyUrl || undefined
-    )
+    if (!sessionId) {
+      const ws = await this.wsService.connect(
+        wsUrl,
+        wsHeaders,
+        slot.proxyUrl || undefined
+      )
+      yield* this.streamViaWebSocketConnection(
+        ws,
+        slot,
+        modelName,
+        reverseToolMap,
+        cacheId,
+        codexRequest,
+        requestStartedAt,
+        "",
+        abortSignal
+      )
+      return
+    }
 
+    const { release } = await this.wsService.acquireSession(sessionId)
+    try {
+      let ws = await this.wsService.ensureSessionConnection(
+        sessionId,
+        wsUrl,
+        wsHeaders,
+        slot.proxyUrl || undefined
+      )
+
+      try {
+        yield* this.streamViaWebSocketConnection(
+          ws,
+          slot,
+          modelName,
+          reverseToolMap,
+          cacheId,
+          codexRequest,
+          requestStartedAt,
+          sessionId,
+          abortSignal
+        )
+        return
+      } catch (error) {
+        if (!this.shouldRetrySessionWebSocketError(error)) {
+          throw error
+        }
+
+        this.logger.warn(
+          `[Codex] Reconnecting stale WebSocket session ${sessionId} before streamed retry`
+        )
+        this.wsService.invalidateSessionConnection(sessionId, ws)
+        ws = await this.wsService.ensureSessionConnection(
+          sessionId,
+          wsUrl,
+          wsHeaders,
+          slot.proxyUrl || undefined
+        )
+        yield* this.streamViaWebSocketConnection(
+          ws,
+          slot,
+          modelName,
+          reverseToolMap,
+          cacheId,
+          codexRequest,
+          requestStartedAt,
+          sessionId,
+          abortSignal
+        )
+      }
+    } finally {
+      release()
+    }
+  }
+
+  private async *streamViaWebSocketConnection(
+    ws: WebSocket,
+    slot: CodexAccountSlot,
+    modelName: string,
+    reverseToolMap: Map<string, string>,
+    cacheId: string,
+    codexRequest: Record<string, unknown>,
+    requestStartedAt: number,
+    sessionId: string,
+    abortSignal?: AbortSignal
+  ): AsyncGenerator<string, void, unknown> {
     const state = createStreamState()
     const onAbort = () => {
-      ws.close()
+      if (sessionId) {
+        this.wsService.invalidateSessionConnection(sessionId, ws)
+      } else {
+        ws.close()
+      }
     }
 
     try {
@@ -2253,7 +2420,9 @@ export class CodexService implements OnModuleInit {
       }
     } finally {
       abortSignal?.removeEventListener("abort", onAbort)
-      ws.close()
+      if (!sessionId) {
+        ws.close()
+      }
     }
 
     this.logger.log(

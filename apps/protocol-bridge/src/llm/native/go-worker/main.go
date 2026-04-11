@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"time"
 	"unicode"
 
+	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
@@ -318,15 +320,15 @@ func sanitizeProxyURLForLog(proxyURL string) string {
 
 func selectEndpoint(account *accountConfig) string {
 	if account == nil {
-		return endpoints.Daily
+		return endpoints.Production
 	}
 	if trimmed := strings.TrimSpace(account.CloudCodeURLOverride); trimmed != "" {
 		return trimmed
 	}
-	if account.IsGCPTOS {
-		return endpoints.Production
-	}
-	return endpoints.Daily
+	// The official LS defaults to the production endpoint
+	// (cloudcode-pa.googleapis.com) as observed in traffic capture.
+	// The daily/sandbox endpoints are only used when explicitly overridden.
+	return endpoints.Production
 }
 
 func (w *workerState) buildHTTPClient(proxyURL string) (*http.Client, error) {
@@ -337,6 +339,9 @@ func (w *workerState) buildHTTPClient(proxyURL string) (*http.Client, error) {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
+		TLSClientConfig: &tls.Config{
+			NextProtos: []string{"h2", "http/1.1"},
+		},
 	}
 
 	if proxyURL != "" {
@@ -360,6 +365,16 @@ func (w *workerState) buildHTTPClient(proxyURL string) (*http.Client, error) {
 		default:
 			return nil, fmt.Errorf("Unsupported proxy protocol: %s", parsed.Scheme)
 		}
+	}
+
+	// Explicitly register HTTP/2 on the transport so that connections always
+	// negotiate h2 via TLS ALPN, even when a custom DialContext is set
+	// (e.g. SOCKS5 proxy).  Without this, Go silently falls back to HTTP/1.1
+	// and Google's frontend (GFE) identifies the request as a "direct HTTP"
+	// client rather than the IDE.  This mirrors the LS binary's use of
+	// google_api/transport/http/configureHTTP2.
+	if _, err := http2.ConfigureTransports(transport); err != nil {
+		return nil, fmt.Errorf("failed to configure HTTP/2 transport: %w", err)
 	}
 
 	return &http.Client{Transport: transport}, nil
@@ -706,6 +721,7 @@ func (w *workerState) handleWebSearch(params map[string]any) (any, bool, error) 
 		"project":     w.currentProjectID(),
 		"model":       "gemini-2.5-flash",
 		"requestType": "web_search",
+		"userAgent":   w.getIDEName(),
 		"request": map[string]any{
 			"contents": []any{
 				map[string]any{
@@ -866,6 +882,17 @@ func (w *workerState) getUserAgent() string {
 
 func (w *workerState) getCloudCodeUserAgent() string {
 	return w.getUserAgent()
+}
+
+// getIDEName returns the IDE name for the userAgent payload field.
+// Matches the LS traffic: "userAgent": "antigravity" or "jetski".
+func (w *workerState) getIDEName() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.config != nil && w.config.IsGCPTOS {
+		return "jetski"
+	}
+	return "antigravity"
 }
 
 func (w *workerState) oauthCredentials() oauthCredentials {
@@ -1740,7 +1767,7 @@ func (w *workerState) currentEndpoint() string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if strings.TrimSpace(w.endpoint) == "" {
-		return endpoints.Daily
+		return endpoints.Production
 	}
 	return w.endpoint
 }
@@ -1767,20 +1794,33 @@ func (w *workerState) buildStreamPayload(incomingPayload map[string]any) map[str
 		if strings.TrimSpace(stringValue(payload["requestId"])) == "" {
 			payload["requestId"] = fmt.Sprintf("agent/%d/%s", time.Now().UnixMilli(), randomID())
 		}
+		// Inject LS-matching fields if not already present (verified via traffic capture)
+		if payload["userAgent"] == nil {
+			payload["userAgent"] = w.getIDEName()
+		}
+		if payload["requestType"] == nil {
+			payload["requestType"] = "agent"
+		}
+		if payload["enabledCreditTypes"] == nil {
+			payload["enabledCreditTypes"] = []string{"GOOGLE_ONE_AI"}
+		}
 		return payload
 	}
 
 	payload := map[string]any{
-		"project":   firstNonEmptyString(w.currentProjectID(), stringValue(incomingPayload["project"])),
-		"requestId": fmt.Sprintf("agent/%d/%s", time.Now().UnixMilli(), randomID()),
-		"request":   map[string]any{},
+		"project":            firstNonEmptyString(w.currentProjectID(), stringValue(incomingPayload["project"])),
+		"requestId":          fmt.Sprintf("agent/%d/%s", time.Now().UnixMilli(), randomID()),
+		"userAgent":          w.getIDEName(),
+		"requestType":        "agent",
+		"enabledCreditTypes": []string{"GOOGLE_ONE_AI"},
+		"request":            map[string]any{},
 	}
 	if model := incomingPayload["model"]; model != nil {
 		payload["model"] = model
 	}
 
 	inner := map[string]any{}
-	for _, key := range []string{"contents", "systemInstruction", "tools", "generationConfig", "toolConfig"} {
+	for _, key := range []string{"contents", "systemInstruction", "tools", "generationConfig", "toolConfig", "sessionId"} {
 		if value, ok := incomingPayload[key]; ok {
 			inner[key] = value
 		}

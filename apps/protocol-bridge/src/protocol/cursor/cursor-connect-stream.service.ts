@@ -37,6 +37,8 @@ import { GoogleService } from "../../llm/google/google.service"
 import {
   applyThinkingIntentToDto,
   buildThinkingIntentFromCursorRequest,
+  normalizeRequestedThinkingEffort,
+  type RequestedThinkingEffort,
 } from "../../llm/thinking-intent"
 import {
   BackendType,
@@ -1418,6 +1420,13 @@ export class CursorConnectStreamService {
         requestedReasoningEffort
       )
       applyThinkingIntentToDto(dto, thinkingIntent)
+    }
+
+    const requestedServiceTier = this.resolveRequestedCodexServiceTier(
+      options.session?.requestedModelParameters
+    )
+    if (route.backend === "codex" && requestedServiceTier) {
+      dto.service_tier = requestedServiceTier
     }
 
     this.logger.debug(
@@ -14354,6 +14363,7 @@ ${raw}
     }
 
     const exactIds = [
+      "reasoning",
       "reasoning_effort",
       "thinking_effort",
       "effort_mode",
@@ -14389,43 +14399,65 @@ ${raw}
     return undefined
   }
 
-  private normalizeRequestedReasoningEffort(
-    rawValue?: string
-  ): "none" | "low" | "medium" | "high" | "xhigh" | undefined {
-    if (!rawValue) {
+  private resolveRequestedCodexServiceTier(
+    requestedModelParameters?: Record<string, string>
+  ): string | undefined {
+    if (!requestedModelParameters) {
       return undefined
     }
 
-    const normalized = rawValue
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-
-    switch (normalized) {
-      case "none":
-      case "off":
-      case "disabled":
-        return "none"
-      case "minimal":
-      case "min":
-      case "low":
-        return "low"
-      case "medium":
-      case "med":
-      case "normal":
-      case "standard":
-      case "auto":
-        return "medium"
-      case "high":
-        return "high"
-      case "max":
-      case "xhigh":
-      case "very_high":
-      case "ultra":
-        return "xhigh"
-      default:
+    const normalizeValue = (rawValue?: string): string | undefined => {
+      if (!rawValue) {
         return undefined
+      }
+
+      const normalized = rawValue
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+
+      switch (normalized) {
+        case "priority":
+        case "fast":
+        case "true":
+        case "on":
+        case "enabled":
+        case "1":
+          return "priority"
+        default:
+          return undefined
+      }
     }
+
+    const exactIds = ["service_tier", "fast_mode", "fast"]
+    for (const id of exactIds) {
+      const resolved = normalizeValue(requestedModelParameters[id])
+      if (resolved) {
+        return resolved
+      }
+    }
+
+    for (const [id, rawValue] of Object.entries(requestedModelParameters)) {
+      if (
+        !id.includes("fast") &&
+        !id.includes("tier") &&
+        !id.includes("speed")
+      ) {
+        continue
+      }
+      const resolved = normalizeValue(rawValue)
+      if (resolved) {
+        return resolved
+      }
+    }
+
+    return undefined
+  }
+
+  private normalizeRequestedReasoningEffort(
+    rawValue?: string
+  ): RequestedThinkingEffort | undefined {
+    return normalizeRequestedThinkingEffort(rawValue)
   }
 
   // buildToolDefinitions removed — now using buildToolsForApi from cursor-tool-mapper.ts

@@ -11,16 +11,6 @@ import {
   BackendApiError,
 } from "./shared/backend-errors"
 
-function isGptThinkingModel(model: string): boolean {
-  const normalized = model.toLowerCase().trim()
-  return (
-    normalized.startsWith("o3") ||
-    normalized.startsWith("o4") ||
-    normalized.startsWith("gpt-5") ||
-    normalized.startsWith("codex")
-  )
-}
-
 /**
  * Backend types for routing.
  * - google: Gemini-family models via Google Cloud Code
@@ -60,6 +50,8 @@ export class ModelRouterService {
   private claudeApiAvailable = false
   private codexAvailabilityProvider?: () => boolean
   private openaiCompatAvailabilityProvider?: () => boolean
+  private codexModelSupportProvider?: (model: string) => boolean
+  private openaiCompatModelSupportProvider?: (model: string) => boolean
   private claudeApiAvailabilityProvider?: (model: string) => boolean
 
   /**
@@ -168,9 +160,13 @@ export class ModelRouterService {
   setGptAvailabilityProviders(providers: {
     codex?: () => boolean
     openaiCompat?: () => boolean
+    codexSupportsModel?: (model: string) => boolean
+    openaiCompatSupportsModel?: (model: string) => boolean
   }): void {
     this.codexAvailabilityProvider = providers.codex
     this.openaiCompatAvailabilityProvider = providers.openaiCompat
+    this.codexModelSupportProvider = providers.codexSupportsModel
+    this.openaiCompatModelSupportProvider = providers.openaiCompatSupportsModel
   }
 
   setClaudeAvailabilityProvider(provider?: (model: string) => boolean): void {
@@ -189,6 +185,18 @@ export class ModelRouterService {
       : this.openaiCompatAvailable
   }
 
+  private doesCodexSupportModel(model: string): boolean {
+    return this.codexModelSupportProvider
+      ? this.codexModelSupportProvider(model)
+      : this.getCodexAvailability()
+  }
+
+  private doesOpenaiCompatSupportModel(model: string): boolean {
+    return this.openaiCompatModelSupportProvider
+      ? this.openaiCompatModelSupportProvider(model)
+      : this.getOpenaiCompatAvailability()
+  }
+
   private getClaudeApiAvailability(model: string): boolean {
     return this.claudeApiAvailabilityProvider
       ? this.claudeApiAvailabilityProvider(model)
@@ -204,7 +212,7 @@ export class ModelRouterService {
     const codexAvailable = this.getCodexAvailability()
 
     // Codex first, openai-compat as fallback
-    if (codexAvailable) {
+    if (codexAvailable && this.doesCodexSupportModel(target.model)) {
       candidates.push({
         backend: "codex",
         model: target.model,
@@ -212,7 +220,10 @@ export class ModelRouterService {
       })
     }
 
-    if (openaiCompatAvailable) {
+    if (
+      openaiCompatAvailable &&
+      this.doesOpenaiCompatSupportModel(target.model)
+    ) {
       candidates.push({
         backend: "openai-compat",
         model: target.model,
@@ -250,7 +261,7 @@ export class ModelRouterService {
 
     return {
       model: normalized,
-      isThinking: isGptThinkingModel(normalized),
+      isThinking: doesModelSupportThinking(normalized),
     }
   }
 
@@ -456,6 +467,16 @@ export class ModelRouterService {
           return route
         }
 
+        if (
+          this.getCodexAvailability() &&
+          !this.doesCodexSupportModel(entry.cloudCodeId) &&
+          !this.getOpenaiCompatAvailability()
+        ) {
+          throw new Error(
+            `Model ${cursorModel} is not supported by the configured Codex account or plan, and no OpenAI-compatible fallback is available.`
+          )
+        }
+
         throw new Error(
           `No GPT backend available for model ${cursorModel}. ` +
             `Configure OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY or CODEX_API_KEY.`
@@ -518,6 +539,16 @@ export class ModelRouterService {
           `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
         )
         return route
+      }
+
+      if (
+        this.getCodexAvailability() &&
+        !this.doesCodexSupportModel(normalized) &&
+        !this.getOpenaiCompatAvailability()
+      ) {
+        throw new Error(
+          `Model ${cursorModel} is not supported by the configured Codex account or plan, and no OpenAI-compatible fallback is available.`
+        )
       }
 
       throw new Error(

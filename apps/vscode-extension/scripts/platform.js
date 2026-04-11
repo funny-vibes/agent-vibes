@@ -122,40 +122,89 @@ function cursorBinaryPath() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Returns candidate state.vscdb paths for Antigravity IDE.
+ */
+function antigravityIdeStateDbCandidates() {
+  const explicitStateDbPath = expandHomeDir(
+    process.env.AGENT_VIBES_ANTIGRAVITY_IDE_STATE_DB_PATH
+  )
+  if (explicitStateDbPath) return [explicitStateDbPath]
+
+  const explicitDataDir = expandHomeDir(
+    process.env.AGENT_VIBES_ANTIGRAVITY_IDE_DATA_DIR
+  )
+  if (explicitDataDir) {
+    return [path.join(explicitDataDir, "state.vscdb")]
+  }
+
+  const candidates = []
+
+  if (PLATFORM === "darwin") {
+    candidates.push(
+      path.join(
+        os.homedir(),
+        "Library",
+        "Application Support",
+        "Antigravity",
+        "User",
+        "globalStorage",
+        "state.vscdb"
+      )
+    )
+  } else if (PLATFORM === "linux") {
+    const xdgConfigHome = expandHomeDir(process.env.XDG_CONFIG_HOME)
+    if (xdgConfigHome) {
+      candidates.push(
+        path.join(
+          xdgConfigHome,
+          "Antigravity",
+          "User",
+          "globalStorage",
+          "state.vscdb"
+        )
+      )
+    }
+    candidates.push(
+      path.join(
+        os.homedir(),
+        ".config",
+        "Antigravity",
+        "User",
+        "globalStorage",
+        "state.vscdb"
+      )
+    )
+  } else if (PLATFORM === "win32") {
+    const appData =
+      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+    candidates.push(
+      path.join(appData, "Antigravity", "User", "globalStorage", "state.vscdb")
+    )
+  } else {
+    candidates.push(
+      path.join(
+        os.homedir(),
+        ".config",
+        "Antigravity",
+        "User",
+        "globalStorage",
+        "state.vscdb"
+      )
+    )
+  }
+
+  return [...new Set(candidates)]
+}
+
+/**
  * Returns the base user data directory for Antigravity IDE (contains state.vscdb).
  */
 function ideDataDir() {
-  if (PLATFORM === "darwin") {
-    return path.join(
-      os.homedir(),
-      "Library",
-      "Application Support",
-      "Antigravity",
-      "User",
-      "globalStorage"
-    )
+  const stateDbPath = firstExistingPath(antigravityIdeStateDbCandidates())
+  if (stateDbPath) {
+    return path.dirname(stateDbPath)
   }
-  if (PLATFORM === "linux") {
-    return path.join(
-      os.homedir(),
-      ".config",
-      "Antigravity",
-      "User",
-      "globalStorage"
-    )
-  }
-  if (PLATFORM === "win32") {
-    const appData =
-      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
-    return path.join(appData, "Antigravity", "User", "globalStorage")
-  }
-  return path.join(
-    os.homedir(),
-    ".config",
-    "Antigravity",
-    "User",
-    "globalStorage"
-  )
+  return path.dirname(antigravityIdeStateDbCandidates()[0])
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +305,7 @@ module.exports = {
   PLATFORM,
   cursorWorkbenchPath,
   cursorBinaryPath,
+  antigravityIdeStateDbCandidates,
   ideDataDir,
   clashConfigDir,
   forwardingBackend,

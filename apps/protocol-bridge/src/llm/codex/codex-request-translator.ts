@@ -10,7 +10,7 @@
 import { normalizeToolProtocolMessages } from "../../context/tool-protocol-normalizer"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
-import { resolveThinkingIntentFromDto } from "../thinking-intent"
+import { resolveCodexReasoningEffort } from "./codex-thinking"
 import { buildShortNameMap, shortenNameIfNeeded } from "./tool-name-shortener"
 
 // ── Types for Codex Responses API ──────────────────────────────────────
@@ -61,50 +61,6 @@ interface CodexRequest {
   [key: string]: unknown
 }
 
-// ── Thinking normalization ─────────────────────────────────────────────
-// Ported from CLIProxyAPI thinking semantics, with direct-upstream clamping
-// because agent-vibes does not run a second provider-specific thinking pass.
-
-function supportsCodexNoneEffort(modelName: string): boolean {
-  const normalized = modelName.toLowerCase().trim()
-  return normalized.startsWith("gpt-5.1") || normalized.startsWith("gpt-5.2")
-}
-
-function normalizeDirectCodexEffort(effort: string, modelName: string): string {
-  const normalized = effort.toLowerCase().trim()
-
-  switch (normalized) {
-    case "none":
-      return supportsCodexNoneEffort(modelName) ? "none" : "low"
-    case "minimal":
-      return "low"
-    case "low":
-    case "medium":
-    case "high":
-    case "xhigh":
-      return normalized
-    case "max":
-    case "auto":
-      return "xhigh"
-    default:
-      return "medium"
-  }
-}
-
-function convertBudgetToEffort(
-  budgetTokens: number,
-  modelName: string
-): string {
-  if (budgetTokens < 0) return normalizeDirectCodexEffort("auto", modelName)
-  if (budgetTokens === 0) return normalizeDirectCodexEffort("none", modelName)
-  if (budgetTokens <= 512)
-    return normalizeDirectCodexEffort("minimal", modelName)
-  if (budgetTokens <= 1024) return "low"
-  if (budgetTokens <= 8192) return "medium"
-  if (budgetTokens <= 24576) return "high"
-  return "xhigh"
-}
-
 function resolveParallelToolCalls(toolChoice: unknown): boolean {
   if (!toolChoice || typeof toolChoice !== "object") {
     return true
@@ -121,30 +77,11 @@ function resolveParallelToolCalls(toolChoice: unknown): boolean {
   return !disableParallelToolUse
 }
 
-function resolveReasoningEffort(
-  dto: CreateMessageDto,
-  modelName: string
-): string {
-  const intent = resolveThinkingIntentFromDto(dto)
-  if (!intent) {
-    return "medium"
-  }
-
-  switch (intent.mode) {
-    case "explicit_budget":
-      return convertBudgetToEffort(intent.budgetTokens, modelName)
-    case "disabled":
-      return normalizeDirectCodexEffort("none", modelName)
-    case "adaptive": {
-      const effort = intent.effort
-      if (typeof effort === "string" && effort.trim()) {
-        return normalizeDirectCodexEffort(effort, modelName)
-      }
-      return "xhigh"
-    }
-    default:
-      return "medium"
-  }
+function normalizeCodexServiceTier(
+  serviceTier?: string
+): "priority" | undefined {
+  const normalized = serviceTier?.trim().toLowerCase()
+  return normalized === "priority" ? "priority" : undefined
 }
 
 // ── Tool parameter normalization ───────────────────────────────────────
@@ -428,7 +365,7 @@ export function translateClaudeToCodex(
   }
 
   // ── Convert thinking → reasoning.effort ──────────────────────────
-  const reasoningEffort = resolveReasoningEffort(dto, modelName)
+  const reasoningEffort = resolveCodexReasoningEffort(dto, modelName)
   const parallelToolCalls = resolveParallelToolCalls(dto.tool_choice)
 
   // ── Build final request ──────────────────────────────────────────
@@ -444,6 +381,11 @@ export function translateClaudeToCodex(
       summary: "auto",
     },
     include: ["reasoning.encrypted_content"],
+  }
+
+  const serviceTier = normalizeCodexServiceTier(dto.service_tier)
+  if (serviceTier) {
+    request.service_tier = serviceTier
   }
 
   if (codexTools && codexTools.length > 0) {

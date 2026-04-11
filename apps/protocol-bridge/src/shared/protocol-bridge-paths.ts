@@ -112,3 +112,95 @@ export function getAntigravityAccountsConfigPathCandidates(): string[] {
     resolveProtocolBridgePath("data", "accounts.json"),
   ])
 }
+
+export function getAntigravityIdeStateDbPathCandidates(): string[] {
+  const explicitStateDbPath =
+    process.env.AGENT_VIBES_ANTIGRAVITY_IDE_STATE_DB_PATH?.trim()
+  if (explicitStateDbPath) {
+    return [path.resolve(explicitStateDbPath)]
+  }
+
+  const explicitDataDir =
+    process.env.AGENT_VIBES_ANTIGRAVITY_IDE_DATA_DIR?.trim()
+  if (explicitDataDir) {
+    return [path.resolve(explicitDataDir, "state.vscdb")]
+  }
+
+  const home = os.homedir()
+  const candidates: string[] = []
+
+  switch (process.platform) {
+    case "darwin":
+      candidates.push(
+        path.join(
+          home,
+          "Library",
+          "Application Support",
+          "Antigravity",
+          "User",
+          "globalStorage",
+          "state.vscdb"
+        )
+      )
+      break
+    case "linux": {
+      const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim()
+      if (xdgConfigHome) {
+        candidates.push(
+          path.join(
+            xdgConfigHome,
+            "Antigravity",
+            "User",
+            "globalStorage",
+            "state.vscdb"
+          )
+        )
+      }
+      candidates.push(
+        path.join(
+          home,
+          ".config",
+          "Antigravity",
+          "User",
+          "globalStorage",
+          "state.vscdb"
+        )
+      )
+      break
+    }
+    case "win32": {
+      const appData =
+        process.env.APPDATA || path.join(home, "AppData", "Roaming")
+      candidates.push(
+        path.join(
+          appData,
+          "Antigravity",
+          "User",
+          "globalStorage",
+          "state.vscdb"
+        )
+      )
+      break
+    }
+    default:
+      candidates.push(
+        path.join(
+          home,
+          ".config",
+          "Antigravity",
+          "User",
+          "globalStorage",
+          "state.vscdb"
+        )
+      )
+      break
+  }
+
+  return uniquePaths(candidates)
+}
+
+export function resolveAntigravityIdeStateDbPath(): string {
+  const candidates = getAntigravityIdeStateDbPathCandidates()
+  const existing = candidates.find((candidate) => fs.existsSync(candidate))
+  return existing || candidates[0]!
+}

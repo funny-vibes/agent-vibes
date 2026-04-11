@@ -1756,7 +1756,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         session.requestedMaxOutputTokens =
           initialRequest.requestedMaxOutputTokens
       }
-      if (initialRequest?.requestedModelParameters) {
+      if (initialRequest) {
         session.requestedModelParameters =
           initialRequest.requestedModelParameters
       }

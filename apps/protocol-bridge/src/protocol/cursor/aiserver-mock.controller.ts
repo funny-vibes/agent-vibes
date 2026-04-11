@@ -9,15 +9,17 @@ import { Controller, Get, Logger, Post, Req, Res } from "@nestjs/common"
 import { FastifyReply, FastifyRequest } from "fastify"
 import {
   AvailableCppModelsResponseSchema,
+  AvailableModelsScope,
   AvailableModelsRequestSchema,
   AvailableModelsResponseSchema,
-  AvailableModelsResponse_AvailableModelSchema,
+  BootstrapStatsigRequestSchema,
+  BootstrapStatsigResponseSchema,
   AvailableModelsResponse_FeatureModelConfigSchema,
   AvailableModelsResponse_ModelPickerDisplayConfigurationSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfigSchema,
-  AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfig_NamedViewToRoutedModelViewButtonSchema,
+  AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfig_NamedViewToRoutedModelViewToggleSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
-  AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewButtonSchema,
+  AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
   CheckQueuePositionResponseSchema,
   CheckFeatureStatusRequestSchema,
   CheckFeatureStatusResponseSchema,
@@ -30,8 +32,8 @@ import {
   GetServerConfigResponseSchema,
   GetEmailResponseSchema,
   GetEmailResponse_SignUpType,
+  GetLastDefaultModelNudgeResponseSchema,
   GetModelLabelsResponseSchema,
-  GetModelLabelsResponse_ModelLabelSchema,
   GetUsageLimitPolicyStatusResponseSchema,
   HasSeenAdResponseSchema,
   IsAllowedFreeTrialUsageResponseSchema,
@@ -51,6 +53,13 @@ import {
   KnowledgeBaseRemoveRequestSchema,
   KnowledgeBaseRemoveResponseSchema,
 } from "../../gen/aiserver/v1_pb"
+import {
+  GetDefaultModelForCliResponseSchema,
+  GetNewChatNudgeLegacyModelPickerResponseSchema,
+  GetNewChatNudgeParameterizedModelPickerResponseSchema,
+  GetUsableModelsRequestSchema,
+  GetUsableModelsResponseSchema,
+} from "../../gen/agent/v1_pb"
 import { CodexService } from "../../llm/codex/codex.service"
 import { ClaudeApiService } from "../../llm/claude-api/claude-api.service"
 import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
@@ -64,12 +73,64 @@ import {
   getCursorDisplayModels,
   resolveCloudCodeModel,
 } from "../../llm/model-registry"
+import {
+  appendRequestedCursorModels,
+  buildCursorAvailableModel,
+  buildLegacyCursorAvailableModels,
+  buildCursorModelLabel,
+  buildCursorUsableModel,
+  doesCursorModelUseParameters,
+  resolveCursorDefaultSelection,
+  selectPreferredCursorModelName,
+} from "./cursor-model-protocol"
 
 const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
   "compact_terminal",
   "long_running_jobs",
+  "use_model_parameters",
+  "use_react_model_picker",
 ])
+
+function buildStatsigBootstrapConfig(featureGates: Iterable<string>): string {
+  const now = Date.now()
+  const featureGateEntries = Array.from(
+    featureGates,
+    (name) =>
+      [
+        name,
+        {
+          value: true,
+          rule_id: "protocol-bridge",
+          id_type: "userID",
+        },
+      ] as const
+  )
+  const statsigFeatureGates: Record<
+    string,
+    {
+      value: boolean
+      rule_id: string
+      id_type: string
+    }
+  > = Object.fromEntries(featureGateEntries)
+
+  return JSON.stringify({
+    time: now,
+    has_updates: true,
+    feature_gates: statsigFeatureGates,
+    dynamic_configs: {},
+    layer_configs: {},
+    exposures: {},
+    sdkInfo: {
+      sdkType: "js-client",
+      sdkVersion: "protocol-bridge",
+    },
+    user: {
+      userID: MOCK_DEFAULTS.email,
+    },
+  })
+}
 
 /**
  * Centralised mock response defaults.
@@ -100,11 +161,17 @@ const MOCK_DEFAULTS = {
 } as const
 
 interface ParsedAvailableModelsRequest {
+  isNightly: boolean
+  includeLongContextModels: boolean
   excludeMaxNamedModels: boolean
   useModelParameters: boolean
   useReactModelPicker: boolean
   variantsWillBeShownInExplodedList: boolean
   additionalModelNames: string[]
+  includeHiddenModels: boolean
+  doNotUseMarkdown: boolean
+  forAutomations: boolean
+  scope?: AvailableModelsScope
 }
 /**
  * Aiserver v1 Mock Controller
@@ -135,6 +202,8 @@ export class AiserverMockController {
   }
 
   private getCursorGptModelTier(): string | null {
+    // Cursor account display can be independent, but model discovery should
+    // still follow the real Codex backend entitlement when we know it.
     if (this.openaiCompatService.isAvailable()) {
       return null
     }
@@ -204,11 +273,17 @@ export class AiserverMockController {
     req?: FastifyRequest
   ): ParsedAvailableModelsRequest {
     const parsed: ParsedAvailableModelsRequest = {
+      isNightly: false,
+      includeLongContextModels: false,
       excludeMaxNamedModels: false,
       useModelParameters: false,
       useReactModelPicker: false,
       variantsWillBeShownInExplodedList: false,
       additionalModelNames: [],
+      includeHiddenModels: false,
+      doNotUseMarkdown: false,
+      forAutomations: false,
+      scope: undefined,
     }
     const body = req?.body
     if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
@@ -217,12 +292,18 @@ export class AiserverMockController {
           AvailableModelsRequestSchema,
           new Uint8Array(body)
         )
+        parsed.isNightly = request.isNightly
+        parsed.includeLongContextModels = request.includeLongContextModels
         parsed.excludeMaxNamedModels = !!request.excludeMaxNamedModels
         parsed.useModelParameters = !!request.useModelParameters
         parsed.useReactModelPicker = !!request.useReactModelPicker
         parsed.variantsWillBeShownInExplodedList =
           !!request.variantsWillBeShownInExplodedList
         parsed.additionalModelNames = request.additionalModelNames
+        parsed.includeHiddenModels = !!request.includeHiddenModels
+        parsed.doNotUseMarkdown = !!request.doNotUseMarkdown
+        parsed.forAutomations = !!request.forAutomations
+        parsed.scope = request.scope
       } catch (error) {
         this.logger.debug(
           `AvailableModels request parse failed, using defaults: ${error instanceof Error ? error.message : String(error)}`
@@ -232,13 +313,70 @@ export class AiserverMockController {
     return parsed
   }
 
-  private buildCursorModels(options?: { excludeMaxNamedModels?: boolean }) {
-    return getCursorDisplayModels({
-      includeCodex: this.isGptBackendAvailable(),
-      codexModelTier: this.getCursorGptModelTier(),
-      excludeMaxNamedModels: options?.excludeMaxNamedModels ?? false,
-      extraModels: this.claudeApiService.getCursorDisplayModels(),
-    }).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
+  private buildCursorModels(options?: {
+    excludeMaxNamedModels?: boolean
+    additionalModelNames?: string[]
+    filterRoutable?: boolean
+    includeHiddenModels?: boolean
+    includeLongContextModels?: boolean
+    forAutomations?: boolean
+  }) {
+    let models = appendRequestedCursorModels(
+      getCursorDisplayModels({
+        includeCodex: this.isGptBackendAvailable(),
+        codexModelTier: this.getCursorGptModelTier(),
+        excludeMaxNamedModels: options?.excludeMaxNamedModels ?? false,
+        extraModels: this.claudeApiService.getCursorDisplayModels(),
+      }),
+      options?.additionalModelNames
+    )
+
+    if (!options?.includeHiddenModels) {
+      models = models.filter((model) => !model.isHidden || model.isUserAdded)
+    }
+
+    if (!options?.includeLongContextModels) {
+      models = models.filter((model) => !model.isLongContextOnly)
+    }
+
+    if (options?.forAutomations) {
+      models = models.filter((model) => model.supportsAgent !== false)
+    }
+
+    if (options?.filterRoutable === false) {
+      return models
+    }
+
+    return models.filter((model) =>
+      this.isCursorModelCurrentlyRoutable(model.name)
+    )
+  }
+
+  private shouldFilterRoutableModels(
+    request?: Pick<ParsedAvailableModelsRequest, "scope">
+  ): boolean {
+    void request
+    return true
+  }
+
+  private parseGetUsableModelsRequest(req?: FastifyRequest): string[] {
+    const body = req?.body
+    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
+      return []
+    }
+
+    try {
+      const request = fromBinary(
+        GetUsableModelsRequestSchema,
+        new Uint8Array(body)
+      )
+      return request.customModelIds
+    } catch (error) {
+      this.logger.debug(
+        `GetUsableModels request parse failed, using defaults: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return []
+    }
   }
 
   private logModelNames(label: string, modelNames: string[]): void {
@@ -250,28 +388,13 @@ export class AiserverMockController {
   private getPreferredDefaultModelName(
     models: Array<{ name: string; family: string; isThinking: boolean }>
   ): string {
-    const normalizedNames = new Set(models.map((model) => model.name))
-    const preferredOrder = [
+    return selectPreferredCursorModelName(models, [
       MOCK_DEFAULTS.defaultModel,
       "gpt-5",
       "claude-sonnet-4-6",
       "claude-sonnet-4-5",
       "gemini-2.5-pro",
-    ]
-    for (const candidate of preferredOrder) {
-      if (normalizedNames.has(candidate)) {
-        return candidate
-      }
-    }
-
-    return (
-      models.find((model) => model.family === "gpt")?.name ||
-      models.find((model) => model.family === "claude")?.name ||
-      models.find((model) => model.family === "gemini")?.name ||
-      models.find((model) => model.isThinking)?.name ||
-      models[0]?.name ||
-      MOCK_DEFAULTS.defaultModel
-    )
+    ])
   }
 
   private getNamedModelSectionIndex(family: string): number {
@@ -308,10 +431,10 @@ export class AiserverMockController {
         namedModelsViewConfig: create(
           AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfigSchema,
           {
-            namedViewToRoutedModelViewButton: create(
-              AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfig_NamedViewToRoutedModelViewButtonSchema,
+            namedViewToRoutedModelViewToggle: create(
+              AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfig_NamedViewToRoutedModelViewToggleSchema,
               {
-                markdown: "Add Models",
+                markdown: "Auto",
               }
             ),
           }
@@ -319,12 +442,14 @@ export class AiserverMockController {
         routedModelViewConfig: create(
           AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
           {
-            title: "Models",
             hideSearchBar: false,
-            routedModelViewToNamedViewButton: create(
-              AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewButtonSchema,
+            routedModelViewToNamedViewToggle: create(
+              AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
               {
-                markdown: "Back",
+                titleMarkdown: "Auto",
+                subtitle:
+                  "Balanced quality and speed, recommended for most tasks",
+                setToLastNamedModel: true,
               }
             ),
           }
@@ -481,45 +606,57 @@ export class AiserverMockController {
       const request = this.parseAvailableModelsRequest(req)
       const allModels = this.buildCursorModels({
         excludeMaxNamedModels: request.excludeMaxNamedModels,
+        additionalModelNames: request.additionalModelNames,
+        filterRoutable: this.shouldFilterRoutableModels(request),
+        includeHiddenModels: request.includeHiddenModels,
+        includeLongContextModels: request.includeLongContextModels,
+        forAutomations: request.forAutomations,
       })
-      const defaultModel = this.getPreferredDefaultModelName(allModels)
-      const thinkingModel =
-        allModels.find((model) => model.isThinking)?.name || defaultModel
+      const defaultSelection = resolveCursorDefaultSelection(allModels, [
+        MOCK_DEFAULTS.defaultModel,
+        "gpt-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "gemini-2.5-pro",
+      ])
+      const parameterizedMode = request.useModelParameters
 
       this.logger.debug(
-        `AvailableModels request flags: reactPicker=${request.useReactModelPicker}, useModelParameters=${request.useModelParameters}, variantsExploded=${request.variantsWillBeShownInExplodedList}, excludeMaxNamedModels=${request.excludeMaxNamedModels}, additionalModelNames=${request.additionalModelNames.join(",") || "(none)"}`
+        `AvailableModels request flags: nightly=${request.isNightly}, reactPicker=${request.useReactModelPicker}, useModelParameters=${request.useModelParameters}, variantsExploded=${request.variantsWillBeShownInExplodedList}, includeLongContext=${request.includeLongContextModels}, excludeMaxNamedModels=${request.excludeMaxNamedModels}, includeHidden=${request.includeHiddenModels}, doNotUseMarkdown=${request.doNotUseMarkdown}, forAutomations=${request.forAutomations}, scope=${request.scope ?? "unspecified"}, additionalModelNames=${request.additionalModelNames.join(",") || "(none)"}`
       )
 
-      const protoModels = allModels.map((m) =>
-        create(AvailableModelsResponse_AvailableModelSchema, {
-          name: m.name,
-          defaultOn: true,
-          supportsAgent: true,
-          supportsThinking: m.isThinking,
-          supportsImages: true,
-          supportsMaxMode: true,
-          supportsNonMaxMode: true,
-          contextTokenLimit: m.family === "gemini" ? 1000000 : 200000,
-          contextTokenLimitForMaxMode: m.family === "gemini" ? 1000000 : 200000,
-          clientDisplayName: m.displayName,
-          serverModelName: m.name,
-          supportsPlanMode: true,
-          supportsSandboxing: true,
-          supportsCmdK: true,
-          inputboxShortModelName: m.shortName,
-          degradationStatus: 0,
-          isRecommendedForBackgroundComposer: false,
-          namedModelSectionIndex: this.getNamedModelSectionIndex(m.family),
-          tagline: m.displayName,
-          visibleInRoutedModelView: true,
-        })
+      const protoModels = allModels.flatMap((model) =>
+        parameterizedMode
+          ? [
+              buildCursorAvailableModel(
+                model,
+                this.getNamedModelSectionIndex(model.family),
+                {
+                  parameterized: true,
+                  defaultOn: true,
+                  includeEffortInDisplayName:
+                    request.variantsWillBeShownInExplodedList,
+                }
+              ),
+            ]
+          : buildLegacyCursorAvailableModels(
+              model,
+              this.getNamedModelSectionIndex(model.family),
+              {
+                defaultOn: false,
+                preferredDefaultModelName: defaultSelection.model,
+              }
+            )
       )
       const featureModelConfig = this.buildFeatureModelConfig(
-        defaultModel,
+        defaultSelection.model,
         allModels
       )
+      const useModelParameters =
+        parameterizedMode &&
+        allModels.some((model) => doesCursorModelUseParameters(model))
       const response = create(AvailableModelsResponseSchema, {
-        modelNames: allModels.map((m) => m.name),
+        modelNames: protoModels.map((m) => m.name),
         models: protoModels,
         composerModelConfig: featureModelConfig,
         cmdKModelConfig: featureModelConfig,
@@ -528,12 +665,12 @@ export class AiserverMockController {
         specModelConfig: featureModelConfig,
         deepSearchModelConfig: featureModelConfig,
         quickAgentModelConfig: featureModelConfig,
-        useModelParameters: false,
+        useModelParameters,
         displayConfiguration: this.buildModelPickerDisplayConfiguration(),
       })
       const buf = Buffer.from(toBinary(AvailableModelsResponseSchema, response))
       this.logger.log(
-        `AvailableModels: ${allModels.length} models (${buf.length} bytes, default=${defaultModel}, thinking=${thinkingModel})`
+        `AvailableModels: ${allModels.length} models (${buf.length} bytes, default=${defaultSelection.model}, thinking=${defaultSelection.thinkingModel})`
       )
       this.logModelNames(
         "AiService.AvailableModels response",
@@ -671,16 +808,59 @@ export class AiserverMockController {
   @Post("aiserver.v1.AiService/GetDefaultModel")
   handleGetDefaultModel(@Res() res: FastifyReply): void {
     const models = this.buildCursorModels()
-    const model = this.getPreferredDefaultModelName(models)
-    const thinkingModel =
-      models.find((candidate) => candidate.isThinking)?.name || model
+    const selection = resolveCursorDefaultSelection(models, [
+      MOCK_DEFAULTS.defaultModel,
+      "gpt-5",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5",
+      "gemini-2.5-pro",
+    ])
     const response = create(GetDefaultModelResponseSchema, {
-      model,
-      thinkingModel,
-      maxMode: false,
+      model: selection.model,
+      thinkingModel: selection.thinkingModel,
+      maxMode: selection.maxMode,
       nextDefaultSetDate: "",
     })
     this.sendProto(res, GetDefaultModelResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/GetLastDefaultModelNudge")
+  handleGetLastDefaultModelNudge(@Res() res: FastifyReply): void {
+    const response = create(GetLastDefaultModelNudgeResponseSchema, {
+      nudgeDate: "",
+    })
+    this.sendProto(res, GetLastDefaultModelNudgeResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/GetUsableModels")
+  handleAiGetUsableModels(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    const customModelIds = this.parseGetUsableModelsRequest(req)
+    const models = this.buildCursorModels({
+      additionalModelNames: customModelIds,
+    }).map((model) => buildCursorUsableModel(model))
+    const response = create(GetUsableModelsResponseSchema, { models })
+    this.sendProto(res, GetUsableModelsResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/GetDefaultModelForCli")
+  handleGetDefaultModelForCli(@Res() res: FastifyReply): void {
+    const models = this.buildCursorModels()
+    const selection = resolveCursorDefaultSelection(models, [
+      MOCK_DEFAULTS.defaultModel,
+      "gpt-5",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5",
+      "gemini-2.5-pro",
+    ])
+    const selectedModel =
+      models.find((model) => model.name === selection.model) || models[0]
+    const response = create(GetDefaultModelForCliResponseSchema, {
+      model: selectedModel ? buildCursorUsableModel(selectedModel) : undefined,
+    })
+    this.sendProto(res, GetDefaultModelForCliResponseSchema, response)
   }
 
   @Post("aiserver.v1.AiService/ServerTime")
@@ -770,13 +950,8 @@ export class AiserverMockController {
   @Post("aiserver.v1.AiService/GetModelLabels")
   handleGetModelLabels(@Res() res: FastifyReply): void {
     const response = create(GetModelLabelsResponseSchema, {
-      modelLabels: this.buildCursorModels().map((model) =>
-        create(GetModelLabelsResponse_ModelLabelSchema, {
-          name: model.name,
-          label: model.displayName,
-          shortLabel: model.shortName,
-          supportsAgent: true,
-        })
+      modelLabels: this.buildCursorModels({ filterRoutable: false }).map(
+        (model) => buildCursorModelLabel(model)
       ),
     })
     this.sendProto(res, GetModelLabelsResponseSchema, response)
@@ -979,8 +1154,41 @@ export class AiserverMockController {
   }
 
   @Post("aiserver.v1.AnalyticsService/BootstrapStatsig")
-  handleBootstrapStatsig(@Res() res: FastifyReply): void {
-    this.sendEmpty(res)
+  handleBootstrapStatsig(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    let ignoreDevStatus = false
+    let operatingSystem = "unknown"
+    const body = req.body
+    if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
+      try {
+        const request = fromBinary(
+          BootstrapStatsigRequestSchema,
+          new Uint8Array(body)
+        )
+        ignoreDevStatus = request.ignoreDevStatus === true
+        operatingSystem =
+          request.operatingSystem === undefined
+            ? "unknown"
+            : String(request.operatingSystem)
+      } catch (error) {
+        this.logger.debug(
+          `BootstrapStatsig request parse failed: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
+
+    const config = buildStatsigBootstrapConfig(ENABLED_CURSOR_FEATURES)
+    const response = create(BootstrapStatsigResponseSchema, {
+      config,
+      generatedAtMs: BigInt(Date.now()),
+    })
+
+    this.logger.debug(
+      `BootstrapStatsig: ignoreDevStatus=${ignoreDevStatus}, operatingSystem=${operatingSystem}, enabledGates=${Array.from(ENABLED_CURSOR_FEATURES).join(",")}`
+    )
+    this.sendProto(res, BootstrapStatsigResponseSchema, response)
   }
 
   @Post("aiserver.v1.ToolCallEventService/SubmitToolCallEvents")
@@ -1065,7 +1273,27 @@ export class AiserverMockController {
 
   @Post("agent.v1.AgentService/GetNewChatNudgeLegacyModelPicker")
   handleGetNewChatNudgeLegacyModelPicker(@Res() res: FastifyReply): void {
-    this.sendEmpty(res)
+    const response = create(GetNewChatNudgeLegacyModelPickerResponseSchema, {})
+    this.sendProto(
+      res,
+      GetNewChatNudgeLegacyModelPickerResponseSchema,
+      response
+    )
+  }
+
+  @Post("agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker")
+  handleGetNewChatNudgeParameterizedModelPicker(
+    @Res() res: FastifyReply
+  ): void {
+    const response = create(
+      GetNewChatNudgeParameterizedModelPickerResponseSchema,
+      {}
+    )
+    this.sendProto(
+      res,
+      GetNewChatNudgeParameterizedModelPickerResponseSchema,
+      response
+    )
   }
 
   @Get("auth/full_stripe_profile")

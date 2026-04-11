@@ -1,14 +1,16 @@
 import { BadRequestException, Injectable, Logger } from "@nestjs/common"
 import { DatabaseSync } from "node:sqlite"
 import * as fs from "fs"
-import * as os from "os"
 import * as path from "path"
 import type { NativeAccount } from "../../llm/native/process-pool.service"
-import { resolveDefaultAccountConfigPath } from "../../shared/protocol-bridge-paths"
+import {
+  resolveAntigravityIdeStateDbPath,
+  resolveDefaultAccountConfigPath,
+} from "../../shared/protocol-bridge-paths"
 
-type AntigravityAuthStatus = {
-  email?: string
-  name?: string
+type AntigravityUserStatus = {
+  email: string
+  name: string | null
 }
 
 type AntigravityAccountFile = {
@@ -34,18 +36,20 @@ export class AntigravityIdeSyncService {
     }
 
     const db = new DatabaseSync(dbPath, { readOnly: true })
-    let authRaw = ""
+    let userStatusB64 = ""
     let oauthB64 = ""
     let enterprisePreferencesB64 = ""
 
     try {
-      const authRow = db
+      const userStatusRow = db
         .prepare("SELECT value FROM ItemTable WHERE key = ?")
-        .get("antigravityAuthStatus") as unknown as
+        .get("antigravityUnifiedStateSync.userStatus") as unknown as
         | { value?: string }
         | undefined
-      authRaw =
-        authRow && typeof authRow.value === "string" ? authRow.value.trim() : ""
+      userStatusB64 =
+        userStatusRow && typeof userStatusRow.value === "string"
+          ? userStatusRow.value.trim()
+          : ""
 
       const oauthRow = db
         .prepare("SELECT value FROM ItemTable WHERE key = ?")
@@ -71,26 +75,13 @@ export class AntigravityIdeSyncService {
       db.close()
     }
 
-    if (!authRaw) {
+    if (!userStatusB64) {
       throw new BadRequestException(
-        "Not logged in to Antigravity IDE: missing antigravityAuthStatus"
+        "Not logged in to Antigravity IDE: missing antigravityUnifiedStateSync.userStatus"
       )
     }
 
-    let auth: AntigravityAuthStatus
-    try {
-      auth = JSON.parse(authRaw) as AntigravityAuthStatus
-    } catch {
-      throw new BadRequestException(
-        "Invalid Antigravity IDE auth payload: antigravityAuthStatus is not valid JSON"
-      )
-    }
-
-    if (!auth.email || !auth.email.trim()) {
-      throw new BadRequestException(
-        "Invalid Antigravity IDE auth payload: missing email"
-      )
-    }
+    const userStatus = this.extractUserStatus(userStatusB64)
 
     if (!oauthB64) {
       throw new BadRequestException(
@@ -114,13 +105,13 @@ export class AntigravityIdeSyncService {
     const existing = this.readExistingAccountFile(destinationPath)
     const preserved = this.findMatchingAccount(
       existing?.accounts,
-      auth.email.trim(),
+      userStatus.email,
       tokens.refreshToken
     )
     const payload: AntigravityAccountFile = {
       accounts: [
         {
-          email: auth.email.trim(),
+          email: userStatus.email,
           accessToken: tokens.accessToken,
           refreshToken: tokens.refreshToken,
           quotaProjectId,
@@ -142,15 +133,12 @@ export class AntigravityIdeSyncService {
     fs.writeFileSync(destinationPath, JSON.stringify(payload, null, 2), "utf8")
 
     this.logger.log(
-      `Synced Antigravity IDE account for ${auth.email.trim()} -> ${destinationPath}`
+      `Synced Antigravity IDE account for ${userStatus.email} -> ${destinationPath}`
     )
 
     return {
-      email: auth.email.trim(),
-      name:
-        typeof auth.name === "string" && auth.name.trim()
-          ? auth.name.trim()
-          : null,
+      email: userStatus.email,
+      name: userStatus.name,
       path: destinationPath,
       accountCount: payload.accounts?.length || 0,
     }
@@ -202,6 +190,54 @@ export class AntigravityIdeSyncService {
           accountRefreshToken === normalizedRefreshToken)
       )
     })
+  }
+
+  private extractUserStatus(encodedValue: string): AntigravityUserStatus {
+    let decoded = ""
+    try {
+      decoded = Buffer.from(encodedValue, "base64").toString("utf8")
+    } catch {
+      throw new BadRequestException(
+        "Invalid Antigravity IDE user status payload"
+      )
+    }
+
+    const blocks = decoded.match(/[A-Za-z0-9+/=]{20,}/g) || []
+    for (const block of blocks) {
+      let candidate = ""
+      try {
+        candidate = Buffer.from(block, "base64").toString("utf8")
+      } catch {
+        continue
+      }
+
+      const emailMatch = candidate.match(
+        /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
+      )
+      if (!emailMatch?.[0]) {
+        continue
+      }
+
+      const email = emailMatch[0].trim().toLowerCase()
+      const prefix = candidate.slice(0, emailMatch.index ?? 0)
+      const rawName = prefix
+        .split(":")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .at(-1)
+      const sanitizedName = rawName
+        ? rawName.replace(/[^\p{L}\p{N} ._'’-]/gu, "").trim()
+        : ""
+
+      return {
+        email,
+        name: sanitizedName || null,
+      }
+    }
+
+    throw new BadRequestException(
+      "Invalid Antigravity IDE user status payload: missing email"
+    )
   }
 
   private extractTokens(oauthB64: string): {
@@ -283,45 +319,6 @@ export class AntigravityIdeSyncService {
   }
 
   private resolveStateDbPath(): string {
-    const home = os.homedir()
-
-    switch (process.platform) {
-      case "darwin":
-        return path.join(
-          home,
-          "Library",
-          "Application Support",
-          "Antigravity",
-          "User",
-          "globalStorage",
-          "state.vscdb"
-        )
-      case "linux":
-        return path.join(
-          home,
-          ".config",
-          "Antigravity",
-          "User",
-          "globalStorage",
-          "state.vscdb"
-        )
-      case "win32":
-        return path.join(
-          process.env.APPDATA || path.join(home, "AppData", "Roaming"),
-          "Antigravity",
-          "User",
-          "globalStorage",
-          "state.vscdb"
-        )
-      default:
-        return path.join(
-          home,
-          ".config",
-          "Antigravity",
-          "User",
-          "globalStorage",
-          "state.vscdb"
-        )
-    }
+    return resolveAntigravityIdeStateDbPath()
   }
 }

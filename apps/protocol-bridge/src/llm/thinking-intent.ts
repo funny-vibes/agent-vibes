@@ -3,15 +3,18 @@ import type {
   ThinkingIntent,
   ThinkingIntentEffort,
 } from "../protocol/anthropic/dto/create-message.dto"
+import { parseModelRequest } from "./model-request"
 
-export type RequestedThinkingEffort = "none" | ThinkingIntentEffort
+export type RequestedThinkingEffort = "none" | "auto" | ThinkingIntentEffort
 
 function isThinkingIntentEffort(value: unknown): value is ThinkingIntentEffort {
   return (
+    value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh"
+    value === "xhigh" ||
+    value === "max"
   )
 }
 
@@ -34,20 +37,23 @@ export function normalizeRequestedThinkingEffort(
       return "none"
     case "minimal":
     case "min":
-    case "low":
-      return "low"
+      return "minimal"
     case "medium":
     case "med":
     case "normal":
     case "standard":
     case "auto":
-      return "medium"
+      return normalized === "auto" ? "auto" : "medium"
+    case "low":
+      return "low"
     case "high":
       return "high"
     case "max":
-    case "xhigh":
     case "very_high":
     case "ultra":
+      return normalized === "max" ? "max" : "xhigh"
+    case "xhigh":
+    case "extra_high":
       return "xhigh"
     default:
       return undefined
@@ -79,6 +85,8 @@ function convertLegacyEffortToBudget(
   thinkingLevel: number
 ): number {
   switch (effort) {
+    case "minimal":
+      return 512
     case "low":
       return 8192
     case "medium":
@@ -86,6 +94,7 @@ function convertLegacyEffortToBudget(
     case "high":
       return 24576
     case "xhigh":
+    case "max":
       return Math.max(32768, thinkingLevel >= 2 ? 32768 : 24576)
     default:
       return thinkingLevel >= 2 ? 32768 : 16384
@@ -110,12 +119,13 @@ export function buildThinkingIntentFromCursorRequest(params: {
   }
 
   if (modelPrefersAdaptiveThinking(params.model)) {
-    return normalizedEffort
-      ? { mode: "adaptive", effort: normalizedEffort }
-      : { mode: "adaptive" }
+    if (!normalizedEffort || normalizedEffort === "auto") {
+      return { mode: "adaptive" }
+    }
+    return { mode: "adaptive", effort: normalizedEffort }
   }
 
-  if (normalizedEffort) {
+  if (normalizedEffort && normalizedEffort !== "auto") {
     return {
       mode: "explicit_budget",
       budgetTokens: convertLegacyEffortToBudget(
@@ -196,8 +206,37 @@ function normalizeInternalThinkingIntent(
 }
 
 export function resolveThinkingIntentFromDto(
-  dto: Pick<CreateMessageDto, "thinking" | "output_config" | "_thinkingIntent">
+  dto: Pick<
+    CreateMessageDto,
+    | "model"
+    | "thinking"
+    | "output_config"
+    | "_thinkingIntent"
+    | "_requestedModel"
+  >
 ): ThinkingIntent | null {
+  const requestedModel = dto._requestedModel || dto.model
+  const requestModel = parseModelRequest(requestedModel || "")
+  if (requestModel.suffix) {
+    switch (requestModel.suffix.kind) {
+      case "none":
+        return { mode: "disabled" }
+      case "auto":
+        return { mode: "adaptive" }
+      case "level":
+        return { mode: "adaptive", effort: requestModel.suffix.level }
+      case "budget":
+        return requestModel.suffix.budgetTokens <= 0
+          ? { mode: "disabled" }
+          : {
+              mode: "explicit_budget",
+              budgetTokens: requestModel.suffix.budgetTokens,
+            }
+      default:
+        break
+    }
+  }
+
   const internal = normalizeInternalThinkingIntent(dto._thinkingIntent)
   if (internal) {
     return internal
@@ -222,7 +261,7 @@ export function resolveThinkingIntentFromDto(
     case "adaptive":
     case "auto": {
       const effort = normalizeRequestedThinkingEffort(dto.output_config?.effort)
-      return effort && effort !== "none"
+      return effort && effort !== "none" && effort !== "auto"
         ? { mode: "adaptive", effort }
         : { mode: "adaptive" }
     }

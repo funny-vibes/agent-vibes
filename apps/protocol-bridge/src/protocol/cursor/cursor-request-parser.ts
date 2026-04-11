@@ -20,6 +20,9 @@ import {
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
 import { KvStorageService } from "./kv-storage.service"
+import { normalizeRequestedThinkingEffort } from "../../llm/thinking-intent"
+import { parseModelRequest } from "../../llm/model-request"
+import { parseCursorVariantString } from "./cursor-model-protocol"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
@@ -345,6 +348,20 @@ export class CursorRequestParser {
     return Object.keys(result).length > 0 ? result : undefined
   }
 
+  private mergeRequestedModelParameters(
+    variantParameters?: Record<string, string>,
+    explicitParameters?: Record<string, string>
+  ): Record<string, string> | undefined {
+    if (!variantParameters && !explicitParameters) {
+      return undefined
+    }
+
+    return {
+      ...(variantParameters || {}),
+      ...(explicitParameters || {}),
+    }
+  }
+
   private resolveRequestedThinkingLevel(
     requestedModelParameters?: Record<string, string>
   ): 0 | 1 | 2 | undefined {
@@ -353,6 +370,7 @@ export class CursorRequestParser {
     }
 
     const exactIds = [
+      "reasoning",
       "reasoning_effort",
       "thinking_effort",
       "effort_mode",
@@ -383,30 +401,18 @@ export class CursorRequestParser {
     }
 
     for (const rawValue of candidateValues) {
-      const normalized = rawValue
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "_")
-
+      const normalized = normalizeRequestedThinkingEffort(rawValue)
       switch (normalized) {
         case "none":
-        case "off":
-        case "disabled":
           return 0
         case "minimal":
-        case "min":
         case "low":
         case "medium":
-        case "med":
-        case "normal":
-        case "standard":
         case "auto":
         case "high":
           return 1
         case "max":
         case "xhigh":
-        case "very_high":
-        case "ultra":
           return 2
         default:
           break
@@ -907,8 +913,29 @@ export class CursorRequestParser {
       requestContext = action.action.value.requestContext
     }
 
+    const requestedModelId = req.requestedModel?.modelId?.trim() || undefined
+    const requestedVariantSelection = requestedModelId
+      ? parseCursorVariantString(requestedModelId)
+      : null
+    const requestedBaseModel = requestedModelId
+      ? parseModelRequest(requestedModelId).baseModel
+      : undefined
+    const modelDetailsModelId = req.modelDetails?.modelId?.trim() || undefined
+    const modelDetailsVariantSelection = modelDetailsModelId
+      ? parseCursorVariantString(modelDetailsModelId)
+      : null
+    const modelDetailsBaseModel = modelDetailsModelId
+      ? parseModelRequest(modelDetailsModelId).baseModel
+      : undefined
+
     // 提取 model
-    const model = req.modelDetails?.modelId || "claude-sonnet-4-20250514"
+    const model =
+      requestedVariantSelection?.baseModel ||
+      requestedBaseModel ||
+      modelDetailsVariantSelection?.baseModel ||
+      modelDetailsBaseModel ||
+      req.modelDetails?.modelId ||
+      "claude-sonnet-4-20250514"
 
     // 提取 conversationId
     const conversationId = req.conversationId || undefined
@@ -1102,8 +1129,15 @@ export class CursorRequestParser {
     const customSystemPrompt = req.customSystemPrompt || ""
 
     // 提取协议里的 token 参数（优先使用 Cursor 传值）
-    const requestedModelParameters = this.extractRequestedModelParameters(
-      req.requestedModel?.parameters || []
+    const explicitRequestedModelParameters =
+      this.extractRequestedModelParameters(req.requestedModel?.parameters || [])
+    const variantRequestedModelParameters = this.mergeRequestedModelParameters(
+      modelDetailsVariantSelection?.parameterValues,
+      requestedVariantSelection?.parameterValues
+    )
+    const requestedModelParameters = this.mergeRequestedModelParameters(
+      variantRequestedModelParameters,
+      explicitRequestedModelParameters
     )
     const requestedMaxOutputTokens = this.extractRequestedMaxOutputTokens(
       req.requestedModel?.parameters || []
@@ -1128,6 +1162,26 @@ export class CursorRequestParser {
       this.logger.log(
         `Token budget from protocol: contextLimit=${contextTokenLimit || "(none)"}, ` +
           `usedContext=${usedContextTokens || "(none)"}, maxOutput=${requestedMaxOutputTokens || "(none)"}`
+      )
+    }
+
+    if (req.requestedModel) {
+      this.logger.debug(
+        `RequestedModel: modelId=${req.requestedModel.modelId || "(empty)"}, ` +
+          `isVariant=${req.requestedModel.isVariantStringRepresentation}, ` +
+          `parameterCount=${req.requestedModel.parameters.length}, ` +
+          `baseModel=${requestedVariantSelection?.baseModel || requestedBaseModel || "(none)"}, ` +
+          `derivedParameters=${requestedModelParameters ? JSON.stringify(requestedModelParameters) : "(none)"}, ` +
+          `requestedMaxMode=${req.requestedModel.maxMode}`
+      )
+    }
+
+    if (modelDetailsModelId) {
+      this.logger.debug(
+        `ModelDetails: modelId=${modelDetailsModelId}, ` +
+          `baseModel=${modelDetailsVariantSelection?.baseModel || modelDetailsBaseModel || "(none)"}, ` +
+          `derivedParameters=${modelDetailsVariantSelection?.parameterValues ? JSON.stringify(modelDetailsVariantSelection.parameterValues) : "(none)"}, ` +
+          `modelMaxMode=${req.modelDetails?.maxMode === true}`
       )
     }
 
@@ -1274,11 +1328,19 @@ export class CursorRequestParser {
     const hasThinkingDetails = !!req.modelDetails?.thinkingDetails
     const modelMaxMode = req.modelDetails?.maxMode === true
     const requestedMaxMode = req.requestedModel?.maxMode === true
+    const requestedVariantMaxMode = requestedVariantSelection?.maxMode === true
+    const modelDetailsVariantMaxMode =
+      modelDetailsVariantSelection?.maxMode === true
     const requestedThinkingLevel = this.resolveRequestedThinkingLevel(
       requestedModelParameters
     )
     let thinkingLevel = 0
-    if (modelMaxMode || requestedMaxMode) {
+    if (
+      modelMaxMode ||
+      requestedMaxMode ||
+      requestedVariantMaxMode ||
+      modelDetailsVariantMaxMode
+    ) {
       thinkingLevel = 2
     } else if (hasThinkingDetails) {
       thinkingLevel = 1
@@ -1289,7 +1351,7 @@ export class CursorRequestParser {
     if (thinkingLevel > 0) {
       this.logger.log(
         `Thinking enabled: level=${thinkingLevel} (thinkingDetails=${hasThinkingDetails}, ` +
-          `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode}, ` +
+          `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode}, requestedVariantMaxMode=${requestedVariantMaxMode}, modelDetailsVariantMaxMode=${modelDetailsVariantMaxMode}, ` +
           `requestedThinkingLevel=${requestedThinkingLevel ?? 0})`
       )
     }

@@ -283,7 +283,7 @@ agent-vibes sync --codex
 行为：
 
 - Codex 和 OpenAI 兼容后端都支持多账号轮转。
-- 同时配置 OpenAI 兼容后端和 Codex 后端时，GPT 请求优先走 OpenAI 兼容后端。
+- 同时配置 OpenAI 兼容后端和 Codex 后端时，GPT 请求优先走 Codex 后端，OpenAI 兼容后端作为回退。
 - 额度耗尽时自动切换到下一个可用账号。
 - `proxyUrl` 可为该账号指定 HTTP/SOCKS 代理地址。
 - `preferResponsesApi=true` 时使用 OpenAI Responses API（`/v1/responses`）代替 Chat Completions。

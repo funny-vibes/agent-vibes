@@ -6,11 +6,22 @@
  * and google-model-cache.service.ts.
  */
 
+import { parseModelRequest } from "./model-request"
+
 // ---------------------------------------------------------------------------
 // Model Families
 // ---------------------------------------------------------------------------
 
 export type ModelFamily = "gemini" | "claude" | "gpt" | "unknown"
+
+export interface ThinkingCapability {
+  levels?: readonly string[]
+  minBudget?: number
+  maxBudget?: number
+  zeroAllowed?: boolean
+  dynamicAllowed?: boolean
+  defaultLevel?: string
+}
 
 export interface ModelEntry {
   /** Canonical Cloud Code model ID */
@@ -21,6 +32,8 @@ export interface ModelEntry {
   family: ModelFamily
   /** Whether this model supports thinking/extended thinking */
   isThinking: boolean
+  /** Richer model reasoning/thinking capability metadata */
+  thinking?: ThinkingCapability
   /** Whether this is a Claude model routed through Google Cloud Code */
   isClaudeThroughGoogle: boolean
 }
@@ -32,6 +45,41 @@ export interface PublicModelMetadata {
 }
 
 export type CodexModelTier = "free" | "team" | "plus" | "pro"
+
+function createLevelThinkingCapability(
+  levels: readonly string[],
+  defaultLevel?: string
+): ThinkingCapability {
+  return {
+    levels,
+    zeroAllowed: levels.includes("none"),
+    dynamicAllowed: levels.includes("auto"),
+    defaultLevel:
+      defaultLevel ||
+      (levels.includes("high")
+        ? "high"
+        : levels[levels.length - 1] || undefined),
+  }
+}
+
+function inferPassthroughGptThinkingCapability(
+  normalizedModel: string
+): ThinkingCapability | undefined {
+  if (
+    normalizedModel.startsWith("o1") ||
+    normalizedModel.startsWith("o3") ||
+    normalizedModel.startsWith("o4") ||
+    normalizedModel.startsWith("codex")
+  ) {
+    return createLevelThinkingCapability(["low", "medium", "high", "xhigh"])
+  }
+
+  if (normalizedModel.startsWith("gpt-5")) {
+    return createLevelThinkingCapability(["low", "medium", "high", "xhigh"])
+  }
+
+  return undefined
+}
 // ---------------------------------------------------------------------------
 // Gemini Models: Cursor alias -> Cloud Code canonical ID
 // ---------------------------------------------------------------------------
@@ -298,61 +346,90 @@ const CODEX_MODELS: Record<
     cloudCodeId: "gpt-5",
     displayName: "GPT-5",
     isThinking: true,
+    thinking: createLevelThinkingCapability([
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]),
   },
   "gpt-5-codex": {
     cloudCodeId: "gpt-5-codex",
     displayName: "GPT-5 Codex",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
   },
   "gpt-5-codex-mini": {
     cloudCodeId: "gpt-5-codex-mini",
     displayName: "GPT-5 Codex Mini",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
   },
   "gpt-5.1": {
     cloudCodeId: "gpt-5.1",
     displayName: "GPT-5.1",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["none", "low", "medium", "high"]),
   },
   "gpt-5.1-codex": {
     cloudCodeId: "gpt-5.1-codex",
     displayName: "GPT-5.1 Codex",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
   },
   "gpt-5.1-codex-mini": {
     cloudCodeId: "gpt-5.1-codex-mini",
     displayName: "GPT-5.1 Codex Mini",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
   },
   "gpt-5.1-codex-max": {
     cloudCodeId: "gpt-5.1-codex-max",
     displayName: "GPT-5.1 Codex Max",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "gpt-5.2": {
     cloudCodeId: "gpt-5.2",
     displayName: "GPT-5.2",
     isThinking: true,
+    thinking: createLevelThinkingCapability([
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]),
   },
   "gpt-5.2-codex": {
     cloudCodeId: "gpt-5.2-codex",
     displayName: "GPT-5.2 Codex",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "gpt-5.3-codex": {
     cloudCodeId: "gpt-5.3-codex",
     displayName: "GPT-5.3 Codex",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "gpt-5.3-codex-spark": {
     cloudCodeId: "gpt-5.3-codex-spark",
     displayName: "GPT-5.3 Codex Spark",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "gpt-5.4": {
     cloudCodeId: "gpt-5.4",
     displayName: "GPT-5.4",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+  },
+  "gpt-5.4-mini": {
+    cloudCodeId: "gpt-5.4-mini",
+    displayName: "GPT-5.4 Mini",
+    isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
 
   // --- GPT-4.1 ---
@@ -389,16 +466,19 @@ const CODEX_MODELS: Record<
     cloudCodeId: "o3",
     displayName: "O3",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "o3-mini": {
     cloudCodeId: "o3-mini",
     displayName: "O3 Mini",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "o4-mini": {
     cloudCodeId: "o4-mini",
     displayName: "O4 Mini",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
 
   // --- Codex-specific models ---
@@ -406,11 +486,13 @@ const CODEX_MODELS: Record<
     cloudCodeId: "codex-mini-latest",
     displayName: "Codex Mini",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
   "codex-mini-latest": {
     cloudCodeId: "codex-mini-latest",
     displayName: "Codex Mini Latest",
     isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
 }
 
@@ -426,6 +508,9 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.1-codex-max",
       "gpt-5.2",
       "gpt-5.2-codex",
+      "gpt-5.3-codex",
+      "gpt-5.4",
+      "gpt-5.4-mini",
     ],
     team: [
       "gpt-5",
@@ -439,6 +524,7 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2-codex",
       "gpt-5.3-codex",
       "gpt-5.4",
+      "gpt-5.4-mini",
     ],
     plus: [
       "gpt-5",
@@ -453,6 +539,7 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.3-codex",
       "gpt-5.3-codex-spark",
       "gpt-5.4",
+      "gpt-5.4-mini",
     ],
     pro: [
       "gpt-5",
@@ -467,30 +554,15 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.3-codex",
       "gpt-5.3-codex-spark",
       "gpt-5.4",
+      "gpt-5.4-mini",
     ],
   }
 
-const CODEX_SHARED_MODEL_IDS = [
-  "gpt-4.1",
-  "gpt-4.1-mini",
-  "gpt-4.1-nano",
-  "gpt-4o",
-  "gpt-4o-mini",
-  "o3",
-  "o3-mini",
-  "o4-mini",
-  "codex-mini",
-] as const
+const CODEX_OFFICIAL_MODEL_IDS = Array.from(
+  new Set(Object.values(CODEX_GPT5_MODEL_IDS_BY_TIER).flat())
+)
 
-const CHATGPT_CODEX_MODEL_PATTERNS: RegExp[] = [
-  /^gpt-5$/,
-  /^gpt-5-codex$/,
-  /^gpt-5-codex-mini$/,
-  /^gpt-5\.\d+$/,
-  /^gpt-5\.\d+-codex$/,
-  /^gpt-5\.\d+-codex-mini$/,
-  /^gpt-5\.\d+-codex-max$/,
-]
+const CHATGPT_CODEX_MODEL_IDS = new Set(CODEX_OFFICIAL_MODEL_IDS)
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -503,7 +575,7 @@ export const DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-high"
 export const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5"
 
 /** Default Codex model when no mapping found */
-export const DEFAULT_CODEX_MODEL = "o4-mini"
+export const DEFAULT_CODEX_MODEL = "gpt-5-codex-mini"
 
 const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
   "claude-haiku-4-5-20251001": {
@@ -641,6 +713,11 @@ const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
     ownedBy: "openai",
     displayName: "GPT 5.4",
   },
+  "gpt-5.4-mini": {
+    createdAt: 1773705600,
+    ownedBy: "openai",
+    displayName: "GPT 5.4 Mini",
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +729,8 @@ const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
  * Returns null if the model is completely unknown.
  */
 export function resolveCloudCodeModel(alias: string): ModelEntry | null {
-  const normalized = alias.toLowerCase().trim()
+  const request = parseModelRequest(alias)
+  const normalized = request.normalizedBaseModel
 
   // Check Gemini models first
   const gemini = GEMINI_MODELS[normalized]
@@ -670,6 +748,7 @@ export function resolveCloudCodeModel(alias: string): ModelEntry | null {
       displayName: normalized,
       family: "gemini",
       isThinking: false,
+      thinking: undefined,
       isClaudeThroughGoogle: false,
     }
   }
@@ -701,16 +780,30 @@ export function resolveCloudCodeModel(alias: string): ModelEntry | null {
     normalized.startsWith("o4") ||
     normalized.startsWith("codex")
   ) {
+    const thinking = inferPassthroughGptThinkingCapability(normalized)
     return {
       cloudCodeId: normalized,
       displayName: normalized,
       family: "gpt",
-      isThinking:
-        normalized.startsWith("o3") ||
-        normalized.startsWith("o4") ||
-        normalized.startsWith("codex"),
+      isThinking: !!thinking,
+      thinking,
       isClaudeThroughGoogle: false,
     }
+  }
+
+  return null
+}
+
+export function resolveModelThinkingCapability(
+  modelId: string
+): ThinkingCapability | null {
+  const resolved = resolveCloudCodeModel(modelId)
+  if (resolved?.thinking) {
+    return resolved.thinking
+  }
+
+  if (resolved?.isThinking) {
+    return createLevelThinkingCapability(["low", "medium", "high"])
   }
 
   return null
@@ -719,7 +812,7 @@ export function resolveCloudCodeModel(alias: string): ModelEntry | null {
 export function getPublicModelMetadata(
   modelId: string
 ): PublicModelMetadata | null {
-  const normalized = modelId.toLowerCase().trim()
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
   return PUBLIC_MODEL_METADATA[normalized] || null
 }
 
@@ -731,13 +824,22 @@ export function getPublicModelMetadata(
  * provider-specific aliases ending in "thinking".
  */
 export function doesModelSupportThinking(modelId: string): boolean {
-  const normalized = modelId.toLowerCase().trim()
+  const request = parseModelRequest(modelId)
+  const normalized = request.normalizedBaseModel
   if (!normalized) {
     return false
   }
 
-  const resolved = resolveCloudCodeModel(normalized)
-  if (resolved?.isThinking === true) {
+  if (
+    request.suffix?.kind === "none" ||
+    request.suffix?.kind === "auto" ||
+    request.suffix?.kind === "budget" ||
+    request.suffix?.kind === "level"
+  ) {
+    return true
+  }
+
+  if (resolveModelThinkingCapability(normalized)) {
     return true
   }
 
@@ -748,7 +850,7 @@ export function doesModelSupportThinking(modelId: string): boolean {
  * Detect model family from name.
  */
 export function detectModelFamily(name: string): ModelFamily {
-  const n = name.toLowerCase()
+  const n = parseModelRequest(name).normalizedBaseModel
   if (n.startsWith("gemini")) return "gemini"
   if (
     n.includes("claude") ||
@@ -772,7 +874,7 @@ export function detectModelFamily(name: string): ModelFamily {
  * Check if a model is a Claude Opus variant (eligible for google-claude backend).
  */
 export function isOpusModel(name: string): boolean {
-  const n = name.toLowerCase()
+  const n = parseModelRequest(name).normalizedBaseModel
   return n.includes("opus")
 }
 
@@ -811,6 +913,25 @@ export interface CursorDisplayModel {
   shortName: string
   family: ModelFamily
   isThinking: boolean
+  aliases?: string[]
+  isUserAdded?: boolean
+  isHidden?: boolean
+  isLongContextOnly?: boolean
+  isChatOnly?: boolean
+  supportsAgent?: boolean
+  supportsCmdK?: boolean
+  onlySupportsCmdK?: boolean
+  supportsPlanMode?: boolean
+  supportsSandboxing?: boolean
+  supportsImages?: boolean
+  isRecommendedForBackgroundComposer?: boolean
+  visibleInRoutedModelView?: boolean
+  contextTokenLimit?: number
+  contextTokenLimitForMaxMode?: number
+  legacySlugs?: string[]
+  idAliases?: string[]
+  cloudMigrateToModel?: string
+  upgradeModelId?: string
 }
 
 export interface CursorDisplayModelOptions {
@@ -938,7 +1059,42 @@ export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   },
 ]
 
-export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.3-codex",
+  "gpt-5.2",
+])
+
+const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  {
+    name: "gpt-5.4",
+    displayName: "GPT-5.4",
+    shortName: "GPT-5.4",
+    family: "gpt",
+    isThinking: true,
+  },
+  {
+    name: "gpt-5.4-mini",
+    displayName: "GPT-5.4 Mini",
+    shortName: "GPT-5.4 Mini",
+    family: "gpt",
+    isThinking: true,
+  },
+  {
+    name: "gpt-5.3-codex",
+    displayName: "GPT-5.3 Codex",
+    shortName: "GPT-5.3 Codex",
+    family: "gpt",
+    isThinking: true,
+  },
+  {
+    name: "gpt-5.2",
+    displayName: "GPT-5.2",
+    shortName: "GPT-5.2",
+    family: "gpt",
+    isThinking: true,
+  },
   {
     name: "gpt-5",
     displayName: "GPT-5",
@@ -989,23 +1145,9 @@ export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
     isThinking: true,
   },
   {
-    name: "gpt-5.2",
-    displayName: "GPT-5.2",
-    shortName: "GPT-5.2",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
     name: "gpt-5.2-codex",
     displayName: "GPT-5.2 Codex",
     shortName: "GPT-5.2 Codex",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.3-codex",
-    displayName: "GPT-5.3 Codex",
-    shortName: "GPT-5.3 Codex",
     family: "gpt",
     isThinking: true,
   },
@@ -1016,77 +1158,18 @@ export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
     family: "gpt",
     isThinking: true,
   },
-  {
-    name: "gpt-5.4",
-    displayName: "GPT-5.4",
-    shortName: "GPT-5.4",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-4.1",
-    displayName: "GPT-4.1",
-    shortName: "GPT-4.1",
-    family: "gpt",
-    isThinking: false,
-  },
-  {
-    name: "gpt-4.1-mini",
-    displayName: "GPT-4.1 Mini",
-    shortName: "GPT-4.1 Mini",
-    family: "gpt",
-    isThinking: false,
-  },
-  {
-    name: "gpt-4.1-nano",
-    displayName: "GPT-4.1 Nano",
-    shortName: "GPT-4.1 Nano",
-    family: "gpt",
-    isThinking: false,
-  },
-  {
-    name: "gpt-4o",
-    displayName: "GPT-4o",
-    shortName: "GPT-4o",
-    family: "gpt",
-    isThinking: false,
-  },
-  {
-    name: "gpt-4o-mini",
-    displayName: "GPT-4o Mini",
-    shortName: "GPT-4o Mini",
-    family: "gpt",
-    isThinking: false,
-  },
-  {
-    name: "o3",
-    displayName: "O3",
-    shortName: "O3",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "o3-mini",
-    displayName: "O3 Mini",
-    shortName: "O3 Mini",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "o4-mini",
-    displayName: "O4 Mini",
-    shortName: "O4 Mini",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "codex-mini",
-    displayName: "Codex Mini",
-    shortName: "Codex Mini",
-    family: "gpt",
-    isThinking: true,
-  },
 ]
+
+export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
+  BASE_CODEX_CURSOR_DISPLAY_MODELS.map(
+    (model): CursorDisplayModel =>
+      DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS.has(model.name)
+        ? model
+        : {
+            ...model,
+            isHidden: true,
+          }
+  )
 
 const ALL_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   ...CLAUDE_CURSOR_DISPLAY_MODELS,
@@ -1103,7 +1186,11 @@ const CURSOR_DISPLAY_MODEL_BY_NAME = new Map(
 export function getCursorDisplayModel(
   modelId: string
 ): CursorDisplayModel | null {
-  return CURSOR_DISPLAY_MODEL_BY_NAME.get(modelId.toLowerCase().trim()) || null
+  return (
+    CURSOR_DISPLAY_MODEL_BY_NAME.get(
+      parseModelRequest(modelId).normalizedBaseModel
+    ) || null
+  )
 }
 
 /**
@@ -1115,7 +1202,7 @@ export function getCursorDisplayModel(
 export function doesModelIdRequireExplicitThinkingSupport(
   modelId: string
 ): boolean {
-  const normalized = modelId.toLowerCase().trim()
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
   if (!normalized) {
     return false
   }
@@ -1125,7 +1212,10 @@ export function doesModelIdRequireExplicitThinkingSupport(
   }
 
   const resolved = resolveCloudCodeModel(normalized)
-  return resolved?.family === "claude" && resolved.isThinking
+  return (
+    resolved?.family === "claude" &&
+    !!resolveModelThinkingCapability(normalized)
+  )
 }
 
 export function canPublicClaudeModelUseGoogle(modelId: string): boolean {
@@ -1139,7 +1229,10 @@ export function canPublicClaudeModelUseGoogle(modelId: string): boolean {
     return true
   }
 
-  return resolved.isThinking || !resolved.cloudCodeId.includes("thinking")
+  return (
+    !!resolveModelThinkingCapability(modelId) ||
+    !resolved.cloudCodeId.includes("thinking")
+  )
 }
 
 export function normalizeCodexModelTier(
@@ -1180,15 +1273,14 @@ export function getCodexCursorDisplayModels(
   const excludeMaxNamedModels = options.excludeMaxNamedModels ?? false
   const normalizedTier = normalizeCodexModelTier(options.codexModelTier)
 
-  let models = CODEX_CURSOR_DISPLAY_MODELS
-
-  if (normalizedTier) {
-    const allowedModelIds = new Set<string>([
-      ...CODEX_SHARED_MODEL_IDS,
-      ...CODEX_GPT5_MODEL_IDS_BY_TIER[normalizedTier],
-    ])
-    models = models.filter((model) => allowedModelIds.has(model.name))
-  }
+  const allowedModelIds = new Set<string>(
+    normalizedTier
+      ? CODEX_GPT5_MODEL_IDS_BY_TIER[normalizedTier]
+      : CODEX_OFFICIAL_MODEL_IDS
+  )
+  let models = CODEX_CURSOR_DISPLAY_MODELS.filter((model) =>
+    allowedModelIds.has(model.name)
+  )
 
   if (excludeMaxNamedModels) {
     models = models.filter((model) => !model.name.includes("max"))
@@ -1197,26 +1289,39 @@ export function getCodexCursorDisplayModels(
   return models
 }
 
+export function getCodexModelIdsForTier(
+  tier?: string | null
+): readonly string[] {
+  const normalizedTier = normalizeCodexModelTier(tier)
+  return normalizedTier
+    ? CODEX_GPT5_MODEL_IDS_BY_TIER[normalizedTier]
+    : CODEX_OFFICIAL_MODEL_IDS
+}
+
+export function supportsCodexModelForTier(
+  modelId: string,
+  tier?: string | null
+): boolean {
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
+  if (!normalized) {
+    return false
+  }
+  return new Set(getCodexModelIdsForTier(tier)).has(normalized)
+}
+
 export function getCodexPublicModelIds(
   options: Omit<CursorDisplayModelOptions, "includeCodex"> = {}
 ): string[] {
-  return Array.from(
-    new Set([
-      ...getCodexCursorDisplayModels(options).map((model) => model.name),
-      "codex-mini-latest",
-    ])
-  )
+  return getCodexCursorDisplayModels(options).map((model) => model.name)
 }
 
 export function isChatGptCodexModelSupported(modelId: string): boolean {
-  const normalized = modelId.toLowerCase().trim()
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
   if (!normalized) {
     return false
   }
 
-  return CHATGPT_CODEX_MODEL_PATTERNS.some((pattern) =>
-    pattern.test(normalized)
-  )
+  return CHATGPT_CODEX_MODEL_IDS.has(normalized)
 }
 
 export function getCursorDisplayModels(

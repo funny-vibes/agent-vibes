@@ -7,6 +7,7 @@ import {
 } from "../../context"
 import { TokenizerService } from "../../context/tokenizer.service"
 import { CodexService } from "../../llm/codex/codex.service"
+import type { CodexForwardHeaders } from "../../llm/codex/codex-header-utils"
 import {
   ClaudeApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
@@ -93,6 +94,8 @@ export class MessagesService implements OnModuleInit {
     this.modelRouter.setGptAvailabilityProviders({
       codex: () => this.codexService.isAvailable(),
       openaiCompat: () => this.openaiCompatService.isAvailable(),
+      codexSupportsModel: (model) => this.codexService.supportsModel(model),
+      openaiCompatSupportsModel: () => this.openaiCompatService.isAvailable(),
     })
     this.modelRouter.setClaudeAvailabilityProvider((model) =>
       this.claudeApiService.supportsModel(model)
@@ -333,7 +336,11 @@ export class MessagesService implements OnModuleInit {
     dto: CreateMessageDto,
     route: ModelRouteResult
   ): CreateMessageDto {
-    const routedDto = { ...dto, model: route.model }
+    const routedDto = {
+      ...dto,
+      model: route.model,
+      _requestedModel: dto._requestedModel || dto.model,
+    }
     const compactedDto = this.applyContextCompaction(routedDto, route)
 
     return this.isGoogleBackend(route)
@@ -393,6 +400,7 @@ export class MessagesService implements OnModuleInit {
     dto: CreateMessageDto,
     route: ModelRouteResult,
     forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders,
     attemptedBackends: Set<string> = new Set()
   ): Promise<AnthropicResponse> {
     attemptedBackends.add(route.backend)
@@ -429,7 +437,10 @@ export class MessagesService implements OnModuleInit {
 
       if (route.backend === "codex") {
         this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
-        return await this.codexService.sendClaudeMessage(routedDto)
+        return await this.codexService.sendClaudeMessage(
+          routedDto,
+          codexForwardHeaders
+        )
       }
 
       this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
@@ -458,6 +469,7 @@ export class MessagesService implements OnModuleInit {
           dto,
           fallback,
           forwardHeaders,
+          codexForwardHeaders,
           attemptedBackends
         )
       }
@@ -470,6 +482,7 @@ export class MessagesService implements OnModuleInit {
     dto: CreateMessageDto,
     route: ModelRouteResult,
     forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders,
     attemptedBackends: Set<string> = new Set()
   ): AsyncGenerator<string, void, unknown> {
     attemptedBackends.add(route.backend)
@@ -549,7 +562,8 @@ export class MessagesService implements OnModuleInit {
           `[ROUTE] Codex backend | model: ${route.model} | stream: true`
         )
         for await (const event of this.codexService.sendClaudeMessageStream(
-          routedDto
+          routedDto,
+          codexForwardHeaders
         )) {
           yield* handleEvent(event)
         }
@@ -595,6 +609,7 @@ export class MessagesService implements OnModuleInit {
           dto,
           fallback,
           forwardHeaders,
+          codexForwardHeaders,
           attemptedBackends
         )
         return
@@ -606,7 +621,8 @@ export class MessagesService implements OnModuleInit {
 
   async createMessage(
     dto: CreateMessageDto,
-    forwardHeaders?: Record<string, string>
+    forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders
   ): Promise<AnthropicResponse> {
     this.logger.log(
       `Request for model: ${dto.model}, stream: ${dto.stream || false}`
@@ -618,7 +634,12 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
-    return this.executeRoutedMessage(dto, route, forwardHeaders)
+    return this.executeRoutedMessage(
+      dto,
+      route,
+      forwardHeaders,
+      codexForwardHeaders
+    )
   }
 
   /**
@@ -626,7 +647,8 @@ export class MessagesService implements OnModuleInit {
    */
   async *createMessageStream(
     dto: CreateMessageDto,
-    forwardHeaders?: Record<string, string>
+    forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders
   ): AsyncGenerator<string, void, unknown> {
     this.logger.log(`Streaming request for model: ${dto.model}`)
 
@@ -636,7 +658,12 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
-    yield* this.executeRoutedMessageStream(dto, route, forwardHeaders)
+    yield* this.executeRoutedMessageStream(
+      dto,
+      route,
+      forwardHeaders,
+      codexForwardHeaders
+    )
   }
 
   /**

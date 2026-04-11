@@ -18,8 +18,8 @@ import { connectRPCHandler } from "./connect-rpc-handler"
 import { CursorConnectStreamService } from "./cursor-connect-stream.service"
 import {
   GetAllowedModelIntentsResponseSchema,
+  GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
-  ModelDetailsSchema,
   NameAgentResponseSchema,
   UploadConversationBlobsRequestSchema,
   UploadConversationBlobsResponseSchema,
@@ -43,6 +43,10 @@ import {
   type StreamBugBotRequest,
 } from "../../gen/aiserver/v1_pb"
 import { KvStorageService } from "./kv-storage.service"
+import {
+  appendRequestedCursorModels,
+  buildCursorUsableModel,
+} from "./cursor-model-protocol"
 
 /**
  * Cursor ConnectRPC Adapter Controller
@@ -76,8 +80,8 @@ export class CursorAdapterController {
   }
 
   private getCursorGptModelTier(): string | null {
-    // OpenAI-compatible providers don't expose a plan tier, so when they are
-    // available we keep the full public GPT catalog visible in Cursor.
+    // Cursor account display can be independent, but model discovery should
+    // still follow the real Codex backend entitlement when we know it.
     if (this.openaiCompatService.isAvailable()) {
       return null
     }
@@ -114,12 +118,35 @@ export class CursorAdapterController {
     )
   }
 
-  private buildCursorModels() {
-    return getCursorDisplayModels({
-      includeCodex: this.isGptBackendAvailable(),
-      codexModelTier: this.getCursorGptModelTier(),
-      extraModels: this.claudeApiService.getCursorDisplayModels(),
-    }).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
+  private buildCursorModels(customModelIds?: string[]) {
+    return appendRequestedCursorModels(
+      getCursorDisplayModels({
+        includeCodex: this.isGptBackendAvailable(),
+        codexModelTier: this.getCursorGptModelTier(),
+        extraModels: this.claudeApiService.getCursorDisplayModels(),
+      }),
+      customModelIds
+    ).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
+  }
+
+  private parseGetUsableModelsRequest(req: FastifyRequest): string[] {
+    const body = req.body
+    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
+      return []
+    }
+
+    try {
+      const request = fromBinary(
+        GetUsableModelsRequestSchema,
+        new Uint8Array(body)
+      )
+      return request.customModelIds
+    } catch (error) {
+      this.logger.debug(
+        `GetUsableModels request parse failed, using defaults: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return []
+    }
   }
 
   private logModelNames(label: string, modelNames: string[]): void {
@@ -272,21 +299,16 @@ export class CursorAdapterController {
    * agent.v1.AgentService/GetUsableModels - Return available models for Agent
    */
   @Post("agent.v1.AgentService/GetUsableModels")
-  handleAgentGetUsableModels(@Res() res: FastifyReply): void {
+  handleAgentGetUsableModels(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
     this.logger.log(">>> AgentService/GetUsableModels request received")
     res.header("Content-Type", "application/proto")
     res.header("Connect-Protocol-Version", "1")
-    const cursorModels = this.buildCursorModels()
-    const models = cursorModels.map((model) =>
-      create(ModelDetailsSchema, {
-        modelId: model.name,
-        displayModelId: model.name,
-        displayName: model.displayName,
-        displayNameShort: model.shortName,
-        aliases: [],
-        maxMode: model.name.includes("max"),
-      })
-    )
+    const customModelIds = this.parseGetUsableModelsRequest(req)
+    const cursorModels = this.buildCursorModels(customModelIds)
+    const models = cursorModels.map((model) => buildCursorUsableModel(model))
     this.logModelNames(
       "AgentService.GetUsableModels response",
       cursorModels.map((model) => model.name)
