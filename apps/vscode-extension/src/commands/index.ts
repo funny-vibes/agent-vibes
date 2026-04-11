@@ -1,21 +1,21 @@
+import * as path from "path"
 import * as vscode from "vscode"
-import { BridgeManager } from "../services/bridge-manager"
-import { ConfigManager } from "../services/config-manager"
-import { CertManager } from "../services/cert-manager"
-import { NetworkManager } from "../services/network-manager"
+import { CMD } from "../constants"
 import { AccountSyncService } from "../services/account-sync"
-import { CursorPatchService } from "../services/cursor-patch"
-import { CertTrustService } from "../services/cert-trust"
-import { ExtensionUpdateService } from "../services/extension-update"
 import {
   syncClaudeAccount,
   syncCodexAccount,
 } from "../services/backend-account-sync"
-import { DashboardPanel } from "../views/dashboard-panel"
-import { executePrivileged } from "../utils/terminal"
+import { BridgeManager } from "../services/bridge-manager"
+import { CertManager } from "../services/cert-manager"
+import { CertTrustService } from "../services/cert-trust"
+import { ConfigManager } from "../services/config-manager"
+import { CursorPatchService } from "../services/cursor-patch"
+import { ExtensionUpdateService } from "../services/extension-update"
+import { NetworkManager } from "../services/network-manager"
 import { logger } from "../utils/logger"
-import { CMD } from "../constants"
-import * as path from "path"
+import { executePrivileged } from "../utils/terminal"
+import { DashboardPanel } from "../views/dashboard-panel"
 
 function pickFirstNonEmptyString(...values: unknown[]): string | undefined {
   for (const value of values) {
@@ -414,11 +414,13 @@ export function registerCommands(
 
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.FORWARDING_STATUS, () => {
-      const active = network.isForwardingActive()
-      const hosts = network.hasHostEntries()
-      const relay = network.isRelayRunning()
+      const forwarding = network.getForwardingStatus()
+      const loopbackSummary =
+        forwarding.hasLoopbackAlias === null
+          ? ""
+          : ` | Loopback: ${forwarding.hasLoopbackAlias ? "✓" : "✗"}`
       vscode.window.showInformationMessage(
-        `Forwarding: ${active ? "✅ Active" : "❌ Inactive"} | Hosts: ${hosts ? "✓" : "✗"} | Relay: ${relay ? "✓" : "✗"}`
+        `Forwarding: ${forwarding.active ? "✅ Active" : "❌ Inactive"} | Hosts: ${forwarding.hasHosts ? "✓" : "✗"}${loopbackSummary} | ${forwarding.backendLabel}: ${forwarding.backendConfigured ? "✓" : "✗"}`
       )
     })
   )

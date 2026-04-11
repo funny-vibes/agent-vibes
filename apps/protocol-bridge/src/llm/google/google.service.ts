@@ -50,7 +50,11 @@ export class GoogleService {
   private readonly ANTIGRAVITY_IDE_VERSION = "1.22.2"
 
   // Official Antigravity system prompt baked into source.
-  private readonly officialSystemPrompt = ANTIGRAVITY_SYSTEM_PROMPT
+  // Can be disabled via ANTIGRAVITY_SYSTEM_PROMPT=false env var.
+  private readonly officialSystemPrompt =
+    process.env.ANTIGRAVITY_SYSTEM_PROMPT === "false"
+      ? ""
+      : ANTIGRAVITY_SYSTEM_PROMPT
 
   // Per-conversation source request ID tracking.
   // ProcessPoolService rewrites these into per-worker lineages before send so
@@ -1623,9 +1627,13 @@ export class GoogleService {
     private readonly signatureStore: ToolThoughtSignatureService,
     private readonly tokenCounter: TokenCounterService
   ) {
-    this.logger.log(
-      `Loaded built-in Antigravity system prompt (${this.officialSystemPrompt.length} chars)`
-    )
+    if (this.officialSystemPrompt) {
+      this.logger.log(
+        `Loaded built-in Antigravity system prompt (${this.officialSystemPrompt.length} chars)`
+      )
+    } else {
+      this.logger.warn("Built-in Antigravity system prompt is DISABLED")
+    }
   }
 
   /**
@@ -2243,12 +2251,7 @@ export class GoogleService {
 
     // Determine stop_reason
     const finishReason = candidates?.[0]?.finishReason
-    let stopReason = "end_turn"
-    if (hasToolCall) {
-      stopReason = "tool_use"
-    } else if (finishReason === "MAX_TOKENS") {
-      stopReason = "max_tokens"
-    }
+    const stopReason = this.mapGeminiFinishReason(finishReason, hasToolCall)
 
     // Extract usage metadata
     const usageMetadata = responseData.usageMetadata as
@@ -2277,6 +2280,26 @@ export class GoogleService {
   /**
    * Format SSE event in Anthropic format
    */
+  private mapGeminiFinishReason(
+    finishReason: string | undefined,
+    sawToolUse: boolean
+  ): string {
+    switch (finishReason) {
+      case "MAX_TOKENS":
+        return "max_tokens"
+      case "STOP":
+      case "FINISH_REASON_UNSPECIFIED":
+      case "SAFETY":
+      case "RECITATION":
+      case "BLOCKLIST":
+      case "PROHIBITED_CONTENT":
+      case "SPII":
+      case "MALFORMED_FUNCTION_CALL":
+      default:
+        return sawToolUse ? "tool_use" : "end_turn"
+    }
+  }
+
   private formatSseEvent(
     eventType: string,
     data: Record<string, unknown>
@@ -2524,15 +2547,24 @@ export class GoogleService {
     //   Vertex AI migration guide: LOW ≤1,024; MEDIUM 1,024–8,192; HIGH >8,192
     //   Anthropic legacy guidance: simple 1–2k; moderate 4–8k; complex 20–50k+
     //   Cloud Code official: gpt-oss-120b-medium=8,192; gemini-3.1-pro-high=10,001
-    if (normalizedEffort === "max" || normalizedEffort === "xhigh") {
+    // Budget tiers: low=1,024  medium=4,096  high=8,192  xhigh=10,240  max=32,768
+    if (normalizedEffort === "max") {
       return 32768
+    }
+
+    if (normalizedEffort === "xhigh") {
+      return 10240
     }
 
     if (normalizedEffort === "high") {
       return 8192
     }
 
-    if (normalizedEffort === "medium" || normalizedEffort === "auto") {
+    if (normalizedEffort === "medium") {
+      return 4096
+    }
+
+    if (normalizedEffort === "auto") {
       return defaultBudget || minBudget || 1024
     }
 
@@ -2555,23 +2587,25 @@ export class GoogleService {
 
     let score = 0
 
-    // Signal 1: Conversation depth
+    // Signal 1: Conversation depth (max +3)
     const messageCount = dto.messages?.length || 0
-    if (messageCount >= 10) {
+    if (messageCount >= 30) {
+      score += 3
+    } else if (messageCount >= 20) {
       score += 2
-    } else if (messageCount >= 4) {
+    } else if (messageCount >= 10) {
       score += 1
     }
 
-    // Signal 2: Tool availability (agentic scenario)
+    // Signal 2: Tool availability (max +2)
     const toolCount = dto.tools?.length || 0
-    if (toolCount >= 5) {
+    if (toolCount >= 20) {
       score += 2
-    } else if (toolCount >= 1) {
+    } else if (toolCount >= 10) {
       score += 1
     }
 
-    // Signal 3: Last user message length
+    // Signal 3: Last user message length (max +3)
     const lastUserMsg = [...(dto.messages || [])]
       .reverse()
       .find((m) => m.role === "user")
@@ -2583,40 +2617,39 @@ export class GoogleService {
               .map((c) => (typeof c === "object" && c.text ? c.text : ""))
               .join("")
           : ""
-    if (lastMsgText.length > 2000) {
+    if (lastMsgText.length > 8000) {
+      score += 3
+    } else if (lastMsgText.length > 4000) {
       score += 2
-    } else if (lastMsgText.length > 500) {
+    } else if (lastMsgText.length > 1500) {
       score += 1
     }
 
-    // Signal 4: Complexity keywords in last user message
+    // Signal 4: Complexity keywords in last user message (max +2)
     const complexityKeywords =
       /\b(refactor|architect|review|debug|fix|migration|redesign|optimize|complex|multi.?file|重构|架构|审查|调试|优化|迁移)\b/i
     if (complexityKeywords.test(lastMsgText)) {
       score += 2
     }
 
-    // Signal 5: Tool results present (multi-step agentic workflow)
-    const hasToolResults = dto.messages?.some((m) => {
-      if (typeof m.content === "string") return false
-      return Array.isArray(m.content)
-        ? m.content.some(
-            (c) =>
-              typeof c === "object" &&
-              (c.type === "tool_result" || c.type === "tool_use")
-          )
-        : false
-    })
-    if (hasToolResults) {
-      score += 1
-    }
-
-    // Score → effort mapping (capped at "high", max is MAX-Mode-only)
-    if (score >= 3) {
+    // Score → effort mapping (capped at "xhigh"; max is MAX-Mode-only)
+    // Max possible score = 3+2+3+2 = 10
+    // Budget tiers: low=1,024  medium=4,096  high=8,192  xhigh=10,240  max=32,768
+    const effortLabel =
+      score >= 8
+        ? "xhigh"
+        : score >= 6
+          ? "high"
+          : score >= 4
+            ? "medium"
+            : score >= 2
+              ? "low"
+              : undefined
+    if (effortLabel) {
       this.logger.debug(
-        `Claude task complexity auto-estimate: score=${score} → high (messages=${messageCount}, tools=${toolCount}, msgLen=${lastMsgText.length})`
+        `Claude task complexity auto-estimate: score=${score} → ${effortLabel} (messages=${messageCount}, tools=${toolCount}, msgLen=${lastMsgText.length})`
       )
-      return "high"
+      return effortLabel
     }
 
     return undefined
@@ -2875,15 +2908,16 @@ export class GoogleService {
     )
 
     // Build system instruction.
-    // Cloud Code requires the official Antigravity prompt as the base
-    // systemInstruction. Protocol-level system additions from the bridge are
-    // appended as extra parts so Cursor request metadata survives routing.
-    const systemParts: Array<{ text: string }> = [
-      { text: this.officialSystemPrompt },
-    ]
+    // Bridge-level system prompt (language rules, tool usage, etc.) comes first
+    // so it takes highest priority. The official Antigravity prompt follows as the
+    // base systemInstruction for Cloud Code routing.
+    const systemParts: Array<{ text: string }> = []
     const bridgeSystemPrompt = this.extractSystemPromptText(dto.system)
     if (bridgeSystemPrompt) {
       systemParts.push({ text: bridgeSystemPrompt })
+    }
+    if (this.officialSystemPrompt) {
+      systemParts.push({ text: this.officialSystemPrompt })
     }
     const resolvedMaxOutputTokens = this.resolveCloudCodeMaxOutputTokens(
       dto.max_tokens
@@ -2967,7 +3001,7 @@ export class GoogleService {
       )
     ) {
       systemParts.push({
-        text: "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.",
+        text: "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.\n\nLanguage usage rules:\n- Always respond in the same language the user is writing in.\n- Your internal thinking and reasoning (think/thought blocks) must also use the user's language.\n- Match the user's language consistently throughout the entire conversation, including explanations, summaries, and follow-up questions.\n- Do not switch languages unless the user explicitly asks you to.\n- Exception: code comments and commit messages default to English unless the user specifies otherwise.",
       })
     }
 
@@ -4271,6 +4305,7 @@ export class GoogleService {
     let pendingToolThoughtSignature: string | null = null
     let fullThinkingContent = ""
     let fullContent = ""
+    let finishReason: string | undefined
     let firstMessageDurationNs: bigint | null = null
     let cloudCodeTraceId: string | null = null
 
@@ -4837,10 +4872,14 @@ export class GoogleService {
             }
           }>
         }
+        finishReason?: string
       }>
 
       if (!candidates || candidates.length === 0) return
       const candidate = candidates[0]
+      if (typeof candidate?.finishReason === "string") {
+        finishReason = candidate.finishReason
+      }
       const parts = candidate?.content?.parts || []
       if (parts.length > 0 && firstMessageDurationNs === null) {
         firstMessageDurationNs = process.hrtime.bigint() - requestStartedAt
@@ -5113,7 +5152,7 @@ export class GoogleService {
       yield* emitSignatureBlock(trailingSignature)
     }
 
-    const stopReason = hasToolCall ? "tool_use" : "end_turn"
+    const stopReason = this.mapGeminiFinishReason(finishReason, hasToolCall)
     yield this.formatSseEvent("message_delta", {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },

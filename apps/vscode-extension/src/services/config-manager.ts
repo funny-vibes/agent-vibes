@@ -81,6 +81,14 @@ export class ConfigManager {
     )
   }
 
+  get antigravitySystemPrompt(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<boolean>("antigravitySystemPrompt") ?? true
+    )
+  }
+
   private getConfiguredAccountPath(settingKey: string): string {
     return (
       vscode.workspace.getConfiguration("agentVibes").get<string>(settingKey) ??

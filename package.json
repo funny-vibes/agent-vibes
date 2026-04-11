@@ -60,7 +60,6 @@
     "antigravity:capture:stop": "node bin/agent-vibes capture stop",
     "antigravity:capture:status": "node bin/agent-vibes capture status",
     "antigravity:capture:repair": "node bin/agent-vibes capture repair",
-    "issues": "node bin/agent-vibes issues",
     "deploy:sync": "node bin/agent-vibes sync --deploy"
   },
   "devDependencies": {

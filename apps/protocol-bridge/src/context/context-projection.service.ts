@@ -28,30 +28,35 @@ export class ContextProjectionService {
         })
       : []
     const sourceRecords = options?.recordsOverride || state.records
-    const activeCommit = this.getActiveCommit(state)
-    if (!activeCommit) {
+    const commitChain = this.getCommitChain(state)
+    if (commitChain.length === 0) {
       return [
         ...this.buildAttachmentMessages(liveAttachments),
         ...this.buildRecordMessages(sourceRecords),
       ]
     }
 
-    const archivedIndex = sourceRecords.findIndex(
-      (record) => record.id === activeCommit.archivedThroughRecordId
+    const resolvedChain = this.resolveCommitChain(commitChain, sourceRecords)
+    if (!resolvedChain) {
+      return [
+        ...this.buildAttachmentMessages(liveAttachments),
+        ...this.buildRecordMessages(sourceRecords),
+      ]
+    }
+
+    const retainedRecords = sourceRecords.slice(
+      resolvedChain[resolvedChain.length - 1]!.archivedIndex + 1
     )
-    if (archivedIndex < 0) {
-      return [
-        ...this.buildAttachmentMessages(liveAttachments),
-        ...this.buildRecordMessages(sourceRecords),
-      ]
-    }
-
-    const retainedRecords = sourceRecords.slice(archivedIndex + 1)
 
     const projected: ProjectedContextMessage[] = [
-      this.buildBoundaryProjection(activeCommit),
-      this.buildSummaryProjection(activeCommit),
-      ...this.buildAttachmentMessages(liveAttachments, activeCommit.id),
+      ...resolvedChain.flatMap(({ commit }) => [
+        this.buildBoundaryProjection(commit),
+        this.buildSummaryProjection(commit),
+      ]),
+      ...this.buildAttachmentMessages(
+        liveAttachments,
+        commitChain[commitChain.length - 1]?.id
+      ),
     ]
 
     projected.push(...this.buildRecordMessages(retainedRecords))
@@ -66,6 +71,38 @@ export class ContextProjectionService {
     return state.compactionHistory.find(
       (commit) => commit.id === state.activeCompactionId
     )
+  }
+
+  getCommitChain(state: ContextConversationState): ContextCompactionCommit[] {
+    const activeCommit = this.getActiveCommit(state)
+    if (!activeCommit) {
+      return []
+    }
+
+    const commitById = new Map(
+      state.compactionHistory.map((commit) => [commit.id, commit])
+    )
+    const chain: ContextCompactionCommit[] = []
+    const seenCommitIds = new Set<string>()
+    let current: ContextCompactionCommit | undefined = activeCommit
+
+    while (current) {
+      if (seenCommitIds.has(current.id)) {
+        return []
+      }
+      seenCommitIds.add(current.id)
+      chain.unshift(current)
+      if (!current.parentCompactionId) {
+        break
+      }
+      const parentCommit = commitById.get(current.parentCompactionId)
+      if (!parentCommit) {
+        return []
+      }
+      current = parentCommit
+    }
+
+    return chain
   }
 
   private buildBoundaryProjection(
@@ -112,7 +149,7 @@ export class ContextProjectionService {
   renderCompactionBoundary(commit: ContextCompactionCommit): string {
     return (
       `[Context boundary ${commit.id}]\n` +
-      `Earlier conversation history was compacted into a structured summary. ` +
+      `An earlier conversation span was compacted into a structured summary. ` +
       `Continue from the retained messages below without explicitly acknowledging this boundary.`
     )
   }
@@ -156,5 +193,29 @@ export class ContextProjectionService {
       commitId,
       attachmentKind: attachment.kind,
     }))
+  }
+
+  private resolveCommitChain(
+    commitChain: readonly ContextCompactionCommit[],
+    sourceRecords: readonly ContextTranscriptRecord[]
+  ): Array<{ commit: ContextCompactionCommit; archivedIndex: number }> | null {
+    const resolved: Array<{
+      commit: ContextCompactionCommit
+      archivedIndex: number
+    }> = []
+    let lastArchivedIndex = -1
+
+    for (const commit of commitChain) {
+      const archivedIndex = sourceRecords.findIndex(
+        (record) => record.id === commit.archivedThroughRecordId
+      )
+      if (archivedIndex < 0 || archivedIndex <= lastArchivedIndex) {
+        return null
+      }
+      resolved.push({ commit, archivedIndex })
+      lastArchivedIndex = archivedIndex
+    }
+
+    return resolved
   }
 }

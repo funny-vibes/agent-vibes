@@ -3,105 +3,105 @@ import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
 import * as path from "path"
 import {
-  type ContextAttachmentSnapshot,
-  ContextManagerService,
-  type ContextInvestigationMemoryEntry,
-  type ContextUsageSnapshot,
-  extractText,
-  type LooseMessageContent,
-  normalizeToolProtocolMessages,
-  TokenCounterService,
-  ToolIntegrityService,
-  UnifiedMessage,
+    type ContextAttachmentSnapshot,
+    type ContextInvestigationMemoryEntry,
+    ContextManagerService,
+    type ContextUsageSnapshot,
+    extractText,
+    type LooseMessageContent,
+    normalizeToolProtocolMessages,
+    TokenCounterService,
+    ToolIntegrityService,
+    UnifiedMessage,
 } from "../../context"
 import {
-  type BackgroundShellSpawnResult,
-  type CursorRule,
-  CursorRuleSource,
-  type DeleteResult,
-  type DiagnosticsResult,
-  ExecClientMessageSchema,
-  type GrepResult,
-  type LsDirectoryTreeNode,
-  type LsResult,
-  type ReadResult,
-  type ShellResult,
-  ShellStream,
-  type WriteResult,
+    type BackgroundShellSpawnResult,
+    type CursorRule,
+    CursorRuleSource,
+    type DeleteResult,
+    type DiagnosticsResult,
+    ExecClientMessageSchema,
+    type GrepResult,
+    type LsDirectoryTreeNode,
+    type LsResult,
+    type ReadResult,
+    type ShellResult,
+    ShellStream,
+    type WriteResult,
 } from "../../gen/agent/v1_pb"
 import {
-  ClaudeApiService,
-  DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
+    ClaudeApiService,
+    DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
 } from "../../llm/claude-api/claude-api.service"
 import { CodexService } from "../../llm/codex/codex.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
-  applyThinkingIntentToDto,
-  buildThinkingIntentFromCursorRequest,
-  normalizeRequestedThinkingEffort,
-  type RequestedThinkingEffort,
-} from "../../llm/thinking-intent"
-import {
-  BackendType,
-  ModelRouteResult,
-  ModelRouterService,
+    BackendType,
+    ModelRouteResult,
+    ModelRouterService,
 } from "../../llm/model-router.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
+import {
+    applyThinkingIntentToDto,
+    buildThinkingIntentFromCursorRequest,
+    normalizeRequestedThinkingEffort,
+    type RequestedThinkingEffort,
+} from "../../llm/thinking-intent"
 import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/tool-continuation-policy"
+import {
+    canonicalizeOfficialAntigravityToolInvocation as canonicalizeOfficialAntigravityToolInvocationFromContract,
+    extractOfficialAntigravityArtifactMetadata as extractOfficialAntigravityArtifactMetadataFromContract,
+    type OfficialAntigravityArtifactMetadata,
+    type OfficialAntigravityCanonicalToolInvocation,
+} from "../../shared/official-antigravity-tools"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
 import { generateTraceId } from "./agent-helpers"
 import { BackendStreamAbortRegistry } from "./backend-stream-abort-registry"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./bugfix-result-normalizer"
 import {
-  ChatSession,
-  ChatSessionManager,
-  EditFailureContext,
-  InterruptedToolCallInfo,
-  PendingToolCall,
-  SessionBackgroundCommand,
-  SessionActiveToolBatch,
-  SessionRestartRecovery,
-  SessionTodoItem,
-  SessionTodoStatus,
-  SessionTopLevelAgentTurnState,
-  SubAgentContext,
+    ChatSession,
+    ChatSessionManager,
+    EditFailureContext,
+    InterruptedToolCallInfo,
+    PendingToolCall,
+    SessionActiveToolBatch,
+    SessionBackgroundCommand,
+    SessionRestartRecovery,
+    SessionTodoItem,
+    SessionTodoStatus,
+    SessionTopLevelAgentTurnState,
+    SubAgentContext,
 } from "./chat-session.service"
 import { ClientSideToolV2ExecutorService } from "./client-side-tool-v2-executor.service"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import {
-  type AttachedImage,
-  cursorRequestParser,
-  ParsedCursorRequest,
-  ParsedToolResult,
+    type AttachedImage,
+    cursorRequestParser,
+    ParsedCursorRequest,
+    ParsedToolResult,
 } from "./cursor-request-parser"
 import {
-  buildToolsForApi,
-  resolveCursorToolDefinitionKey,
-  type ToolDefinition,
+    buildToolsForApi,
+    resolveCursorToolDefinitionKey,
+    type ToolDefinition,
 } from "./cursor-tool-mapper"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import {
-  buildMcpDispatchInput,
-  normalizeMcpToolIdentifier,
-  resolveMcpCallFields as resolveMcpCallFieldsFromContract,
-  resolveMcpToolDefinition,
+    buildMcpDispatchInput,
+    normalizeMcpToolIdentifier,
+    resolveMcpCallFields as resolveMcpCallFieldsFromContract,
+    resolveMcpToolDefinition,
 } from "./mcp-call-contract"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import {
-  buildNumberedLineEntries,
-  extractEditFailureSelection,
-  findToolResultAppendPlan,
-  formatLineNumberedSnippet,
-  messageContainsToolResult,
+    buildNumberedLineEntries,
+    extractEditFailureSelection,
+    findToolResultAppendPlan,
+    formatLineNumberedSnippet,
+    messageContainsToolResult,
 } from "./tool-protocol-helpers"
-import {
-  canonicalizeOfficialAntigravityToolInvocation as canonicalizeOfficialAntigravityToolInvocationFromContract,
-  extractOfficialAntigravityArtifactMetadata as extractOfficialAntigravityArtifactMetadataFromContract,
-  type OfficialAntigravityArtifactMetadata,
-  type OfficialAntigravityCanonicalToolInvocation,
-} from "../../shared/official-antigravity-tools"
 
 /**
  * SSE Event content block structure (content_block_start)
@@ -386,6 +386,20 @@ interface PreparedToolInvocation {
   protocolToolFamilyHint?: "mcp" | "web_fetch"
 }
 
+interface TopLevelContinuationDecision {
+  adviseSynthesis: boolean
+  forceCloudCodeSynthesis: boolean
+  historyTokens: number
+  promptTokens: number
+  availableHistoryBudgetTokens: number
+  continuationCount: number
+  diminishingReturns: boolean
+  consecutiveReadOnlyBatches: number
+  verificationReadOnlyBatches: number
+  repeatedEditPaths: string[]
+  reasons: string[]
+}
+
 interface AssistantTurnStreamParams {
   conversationId: string
   session: ChatSession
@@ -415,7 +429,7 @@ interface AssistantTurnStreamOutcome {
 type CanonicalToolInvocation = OfficialAntigravityCanonicalToolInvocation
 
 interface CursorArtifactUiProjection {
-  toolName: "create_plan" | "update_todos"
+  toolName: "update_todos"
   toolInput: Record<string, unknown>
   content: string
   toolResultState: { status: ToolResultStatus; message?: string }
@@ -594,7 +608,13 @@ export class CursorConnectStreamService {
   private readonly LARGE_TOOL_RESULT_TAIL_LINES = 120
   private readonly LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS = 24_000
   private readonly GREP_RESULT_PREVIEW_MAX_LINES = 120
-  private readonly TOP_LEVEL_AGENT_MAX_READONLY_TURNS = 18
+  private readonly TOP_LEVEL_AGENT_READONLY_ADVISORY_TURNS = 3
+  private readonly TOP_LEVEL_AGENT_READONLY_FORCE_TURNS = 5
+  private readonly TOP_LEVEL_AGENT_READONLY_ADVISORY_WATERMARK = 0.72
+  private readonly TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK = 0.82
+  private readonly TOP_LEVEL_AGENT_CONTINUATION_COMPLETION_THRESHOLD = 0.9
+  private readonly TOP_LEVEL_AGENT_CONTINUATION_DIMINISHING_DELTA_TOKENS = 500
+  private readonly TOP_LEVEL_AGENT_REPEAT_EDIT_FORCE_COUNT = 2
   private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
   private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
   private readonly CLOUD_CODE_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES = new Set([
@@ -1353,7 +1373,6 @@ export class CursorConnectStreamService {
       session?: ChatSession
       toolDefinitions?: CreateMessageDto["tools"]
       additionalSystemPrompt?: string
-      disableTools?: boolean
       pendingToolUseIds?: string[]
       thinkingLevel?: number
       buildMessages: (budget: {
@@ -1385,9 +1404,7 @@ export class CursorConnectStreamService {
         ? this.tokenCounter.countMessages(contextMessages as UnifiedMessage[])
         : 0,
       systemPrompt: effectiveSystemPrompt,
-      toolDefinitions: options.disableTools
-        ? undefined
-        : options.toolDefinitions,
+      toolDefinitions: options.toolDefinitions,
       model: options.model,
     })
     const historyMessages = options.buildMessages(budget)
@@ -1412,7 +1429,7 @@ export class CursorConnectStreamService {
       stream: true,
     }
 
-    if (!options.disableTools && options.toolDefinitions) {
+    if (options.toolDefinitions) {
       dto.tools = options.toolDefinitions
     }
     if (options.conversationId) {
@@ -2575,11 +2592,18 @@ export class CursorConnectStreamService {
         `Applied context compaction (${contextLabel}): estimated ${primary.estimatedTokens} tokens after projection`
       )
     }
-    if (primary.toolResultCompaction?.changed) {
+    if (primary.snipCompaction?.changed) {
       this.logger.log(
-        `Applied ${primary.toolResultCompaction.trigger} tool-result compaction (${contextLabel}): ` +
-          `${primary.toolResultCompaction.clearedToolResults} results across ` +
-          `${primary.toolResultCompaction.compactedRounds} API rounds`
+        `Applied snip compaction (${contextLabel}): ` +
+          `${primary.snipCompaction.removedRecords} live records summarized, ` +
+          `${primary.snipCompaction.retainedRecords} retained`
+      )
+    }
+    if (primary.microcompactCompaction?.changed) {
+      this.logger.log(
+        `Applied ${primary.microcompactCompaction.trigger} microcompact (${contextLabel}): ` +
+          `${primary.microcompactCompaction.clearedToolResults} results across ` +
+          `${primary.microcompactCompaction.compactedRounds} API rounds`
       )
     }
 
@@ -3679,6 +3703,7 @@ ${raw}
       definitionKey === "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2"
     )
   }
+
 
   private trimSampleByChars(text: string): string {
     if (text.length <= this.LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS) return text
@@ -5356,6 +5381,11 @@ ${raw}
         failureContext: {
           filePath,
           reason: "missing_search_replace",
+          startLine,
+          endLine,
+          allowMultiple,
+          searchText: searchText ?? "",
+          replaceTextLength: replaceText?.length ?? 0,
         },
       }
     }
@@ -5646,7 +5676,10 @@ ${raw}
       pendingToolCall.toolInput
     )
     const artifactType = metadata?.artifactType
-    if (artifactType !== "implementation_plan" && artifactType !== "task") {
+    // Google's implementation_plan is a technical design document — not the
+    // same as Cursor's create_plan (an interactive step/todo manager).
+    // Only "task" artifacts map to Cursor UI projections (update_todos).
+    if (artifactType !== "task") {
       return null
     }
 
@@ -5662,43 +5695,6 @@ ${raw}
         "description",
         "Description",
       ]) || ""
-
-    if (artifactType === "implementation_plan") {
-      const todos = this.parseMarkdownTodoItemsForArtifact(
-        afterContent,
-        "artifact_plan"
-      )
-      const title = this.deriveArtifactTitleFromMarkdown(
-        afterContent,
-        artifactPath
-      )
-      const overview = metadata?.summary || description || title
-      const toolInput: Record<string, unknown> = {
-        title,
-        name: title,
-        plan: afterContent,
-        overview,
-        description: overview,
-        steps: todos
-          .map((todo) =>
-            this.pickFirstString(todo, ["content", "text", "title"])
-          )
-          .filter((value): value is string => !!value),
-        todos,
-      }
-      if (artifactPath) {
-        toolInput.planUri = artifactPath
-        toolInput.plan_uri = artifactPath
-      }
-      return {
-        toolName: "create_plan",
-        toolInput,
-        content: artifactPath
-          ? `[create_plan success]\nplan_uri: ${artifactPath}`
-          : "[create_plan success]",
-        toolResultState: { status: "success" },
-      }
-    }
 
     let todos = this.parseMarkdownTodoItemsForArtifact(
       afterContent,
@@ -5741,10 +5737,7 @@ ${raw}
   ): boolean {
     if (!this.isEditToolInvocation(toolName)) return false
     const metadata = this.extractOfficialAntigravityArtifactMetadata(toolInput)
-    return (
-      metadata?.artifactType === "implementation_plan" ||
-      metadata?.artifactType === "task"
-    )
+    return metadata?.artifactType === "task"
   }
 
   private canonicalizeOfficialAntigravityToolInvocation(
@@ -10557,14 +10550,14 @@ ${raw}
     )
     const canonicalToolName = canonicalInvocation.toolName
     const input = canonicalInvocation.input
-    const execDispatchResolution = this.resolveExecDispatchTarget(
-      session,
-      canonicalToolName,
-      input
-    )
+    const validationErrorMessage = canonicalInvocation.validationErrorMessage
+    const execDispatchResolution = validationErrorMessage
+      ? { target: null, errorMessage: validationErrorMessage }
+      : this.resolveExecDispatchTarget(session, canonicalToolName, input)
     const execDispatchTarget = execDispatchResolution.target
-    const deferredToolFamily =
-      execDispatchTarget && canonicalToolName === "generate_image"
+    const deferredToolFamily = validationErrorMessage
+      ? undefined
+      : execDispatchTarget && canonicalToolName === "generate_image"
         ? undefined
         : this.normalizeDeferredToolFamily(canonicalToolName)
 
@@ -10576,7 +10569,8 @@ ${raw}
       historyToolInput: canonicalInvocation.historyToolInput || input,
       deferredToolFamily,
       execDispatchTarget: execDispatchTarget || undefined,
-      dispatchErrorMessage: execDispatchResolution.errorMessage,
+      dispatchErrorMessage:
+        validationErrorMessage || execDispatchResolution.errorMessage,
       canDispatchExec: Boolean(execDispatchTarget),
       protocolToolName: execDispatchTarget?.toolName || canonicalToolName,
       protocolToolInput: execDispatchTarget?.input || input,
@@ -10615,12 +10609,8 @@ ${raw}
     conversationId: string
   ): SessionTopLevelAgentTurnState {
     if (!session.topLevelAgentTurnState) {
-      session.topLevelAgentTurnState = {
-        llmTurnCount: 1,
-        readOnlyBatchCount: 0,
-        hasMutatingToolCall: false,
-        forcedSynthesisAttempted: false,
-      }
+      session.topLevelAgentTurnState =
+        this.createInitialTopLevelAgentTurnState()
       this.sessionManager.markSessionDirty(conversationId)
     }
 
@@ -10635,13 +10625,43 @@ ${raw}
     // per-turn top-level agent state.  Do not clear it here; let bounded
     // append/replace logic control retention so recent evidence can survive
     // across top-level turns within the same conversation.
-    session.topLevelAgentTurnState = {
+    session.topLevelAgentTurnState = this.createInitialTopLevelAgentTurnState()
+    this.sessionManager.markSessionDirty(conversationId)
+  }
+
+  private createInitialTopLevelAgentTurnState(): SessionTopLevelAgentTurnState {
+    return {
       llmTurnCount: 1,
       readOnlyBatchCount: 0,
       hasMutatingToolCall: false,
       forcedSynthesisAttempted: false,
+      stalledReadOnlyContinuationCount: 0,
+      continuationBudget: {
+        continuationCount: 0,
+        lastHistoryTokens: 0,
+        lastDeltaTokens: 0,
+        startedAt: Date.now(),
+      },
+      mutationBarrier: {
+        mutatingBatchCount: 0,
+        verificationReadOnlyBatchCount: 0,
+        sameFileEditCounts: {},
+        lastEditedPaths: [],
+      },
     }
-    this.sessionManager.markSessionDirty(conversationId)
+  }
+
+  private clearReadOnlyContinuationTracking(
+    state: SessionTopLevelAgentTurnState
+  ): void {
+    state.lastReadOnlyContinuationHistoryTokens = undefined
+    state.stalledReadOnlyContinuationCount = 0
+  }
+
+  private resetMutationVerificationBarrier(
+    state: SessionTopLevelAgentTurnState
+  ): void {
+    state.mutationBarrier.verificationReadOnlyBatchCount = 0
   }
 
   private notePreparedToolBatch(
@@ -10724,12 +10744,36 @@ ${raw}
     )
     if (activeBatch.readOnly) {
       state.readOnlyBatchCount += 1
+      if (state.mutationBarrier.lastEditedPaths.length > 0) {
+        state.mutationBarrier.verificationReadOnlyBatchCount += 1
+      }
     } else {
       state.readOnlyBatchCount = 0
+      this.clearReadOnlyContinuationTracking(state)
+      const editedPaths = this.extractMutatingFilePathsFromBatch(activeBatch)
+      if (editedPaths.length > 0) {
+        const uniquePaths = Array.from(new Set(editedPaths))
+        state.mutationBarrier.mutatingBatchCount += 1
+        state.mutationBarrier.lastEditedPaths = uniquePaths
+        this.resetMutationVerificationBarrier(state)
+        for (const editedPath of uniquePaths) {
+          state.mutationBarrier.sameFileEditCounts[editedPath] =
+            (state.mutationBarrier.sameFileEditCounts[editedPath] || 0) + 1
+        }
+      }
     }
     state.activeToolBatch = undefined
     this.sessionManager.markSessionDirty(conversationId)
     return summary
+  }
+
+  private extractMutatingFilePathsFromBatch(
+    batch: SessionActiveToolBatch
+  ): string[] {
+    return batch.tools
+      .filter((tool) => this.isMutatingFileTool(tool.toolName))
+      .map((tool) => this.pickToolPath(tool.input))
+      .filter((value): value is string => !!value)
   }
 
   private buildCompletedToolBatchSummary(
@@ -10956,25 +11000,215 @@ ${raw}
     )
   }
 
-  private shouldAdviseTopLevelReadOnlySynthesis(session: ChatSession): boolean {
-    const state = session.topLevelAgentTurnState
-    if (!state) return false
-    if (state.hasMutatingToolCall) return false
-    return state.readOnlyBatchCount >= this.TOP_LEVEL_AGENT_MAX_READONLY_TURNS
+  private buildTopLevelContinuationPromptBudgetSnapshot(
+    conversationId: string,
+    session: ChatSession,
+    route: ModelRouteResult,
+    toolDefinitions: ToolDefinition[],
+    pendingToolUseIds: string[]
+  ): {
+    promptTokens: number
+    availableHistoryBudgetTokens: number
+  } {
+    const protectedContextTokens = this.isCloudCodeBackend(route.backend)
+      ? this.tokenCounter.countMessages(
+          this.buildGoogleContextMessages(
+            session,
+            conversationId
+          ) as UnifiedMessage[]
+        )
+      : 0
+    const systemPrompt = this.isCloudCodeBackend(route.backend)
+      ? this.buildGoogleSystemPrompt(session)
+      : this.buildSystemPrompt(session)
+    const budget = this.resolveMessageBudget(route.backend, {
+      session,
+      protectedContextTokens,
+      systemPrompt,
+      toolDefinitions,
+      model: session.model,
+    })
+    const promptMessages = this.truncateMessagesForBackend(
+      session,
+      route.backend,
+      {
+        maxTokens: budget.maxTokens,
+        systemPromptTokens: budget.systemPromptTokens,
+      },
+      {
+        contextLabel: `tool continuation preflight: ${conversationId}`,
+        pendingToolUseIds,
+        strategy: "reactive",
+      }
+    )
+    return {
+      promptTokens: promptMessages.length
+        ? this.tokenCounter.countMessages(promptMessages as UnifiedMessage[])
+        : 0,
+      availableHistoryBudgetTokens: Math.max(
+        1,
+        budget.maxTokens - budget.systemPromptTokens
+      ),
+    }
   }
 
-  private buildReadOnlySynthesisAdvisoryPrompt(session: ChatSession): string {
+  private buildTopLevelContinuationDecision(
+    conversationId: string,
+    session: ChatSession,
+    route: ModelRouteResult,
+    toolDefinitions: ToolDefinition[],
+    pendingToolUseIds: string[],
+    normalizedHistory: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+    }>
+  ): TopLevelContinuationDecision {
+    const state = this.getTopLevelAgentTurnState(session, conversationId)
+    const historyTokens =
+      normalizedHistory.length > 0
+        ? this.tokenCounter.countMessages(normalizedHistory as UnifiedMessage[])
+        : 0
+    const promptBudgetSnapshot =
+      this.buildTopLevelContinuationPromptBudgetSnapshot(
+        conversationId,
+        session,
+        route,
+        toolDefinitions,
+        pendingToolUseIds
+      )
+    const promptTokens = promptBudgetSnapshot.promptTokens
+    const availableHistoryBudgetTokens =
+      promptBudgetSnapshot.availableHistoryBudgetTokens
+    const promptUtilization = promptTokens / availableHistoryBudgetTokens
+    const continuationBudget = state.continuationBudget
+    const promptDelta = Math.max(
+      0,
+      promptTokens - continuationBudget.lastHistoryTokens
+    )
+    const diminishingReturns =
+      continuationBudget.continuationCount >= 3 &&
+      promptDelta <
+        this.TOP_LEVEL_AGENT_CONTINUATION_DIMINISHING_DELTA_TOKENS &&
+      continuationBudget.lastDeltaTokens <
+        this.TOP_LEVEL_AGENT_CONTINUATION_DIMINISHING_DELTA_TOKENS
+    continuationBudget.continuationCount += 1
+    continuationBudget.lastDeltaTokens = promptDelta
+    continuationBudget.lastHistoryTokens = promptTokens
+    if (
+      !Number.isFinite(continuationBudget.startedAt) ||
+      continuationBudget.startedAt <= 0
+    ) {
+      continuationBudget.startedAt = Date.now()
+    }
+
+    const repeatedEditPaths = Object.entries(
+      state.mutationBarrier.sameFileEditCounts
+    )
+      .filter(
+        ([pathValue, count]) =>
+          pathValue.trim().length > 0 &&
+          count >= this.TOP_LEVEL_AGENT_REPEAT_EDIT_FORCE_COUNT
+      )
+      .map(([pathValue]) => pathValue)
+
+    const reasons: string[] = []
+    if (
+      state.readOnlyBatchCount >= this.TOP_LEVEL_AGENT_READONLY_ADVISORY_TURNS
+    ) {
+      reasons.push(`consecutive_read_only_batches=${state.readOnlyBatchCount}`)
+    }
+    if (promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_ADVISORY_WATERMARK) {
+      reasons.push(
+        `projected_prompt_budget=${Math.round(promptUtilization * 100)}%`
+      )
+    }
+    if (diminishingReturns) {
+      reasons.push("diminishing_returns")
+    }
+    if (state.mutationBarrier.verificationReadOnlyBatchCount > 0) {
+      reasons.push(
+        `post_mutation_verification_batches=${state.mutationBarrier.verificationReadOnlyBatchCount}`
+      )
+    }
+    if (repeatedEditPaths.length > 0) {
+      reasons.push(
+        `repeated_same_file_edits=${repeatedEditPaths
+          .map((pathValue) => path.basename(pathValue))
+          .join(",")}`
+      )
+    }
+
+    const adviseSynthesis =
+      state.readOnlyBatchCount >=
+        this.TOP_LEVEL_AGENT_READONLY_ADVISORY_TURNS ||
+      promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_ADVISORY_WATERMARK ||
+      diminishingReturns ||
+      state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
+      repeatedEditPaths.length > 0
+    const forceCloudCodeSynthesis =
+      this.isCloudCodeBackend(route.backend) &&
+      ((state.mutationBarrier.mutatingBatchCount === 0 &&
+        (state.readOnlyBatchCount >=
+          this.TOP_LEVEL_AGENT_READONLY_FORCE_TURNS ||
+          promptUtilization >=
+            this.TOP_LEVEL_AGENT_CONTINUATION_COMPLETION_THRESHOLD ||
+          diminishingReturns)) ||
+        (repeatedEditPaths.length > 0 &&
+          (state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
+            promptUtilization >=
+              this.TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK ||
+            diminishingReturns)))
+    this.sessionManager.markSessionDirty(conversationId)
+
+    return {
+      adviseSynthesis: adviseSynthesis || forceCloudCodeSynthesis,
+      forceCloudCodeSynthesis,
+      historyTokens,
+      promptTokens,
+      availableHistoryBudgetTokens,
+      continuationCount: continuationBudget.continuationCount,
+      diminishingReturns,
+      consecutiveReadOnlyBatches: state.readOnlyBatchCount,
+      verificationReadOnlyBatches:
+        state.mutationBarrier.verificationReadOnlyBatchCount,
+      repeatedEditPaths,
+      reasons,
+    }
+  }
+
+  private buildTopLevelContinuationAdvisoryPrompt(
+    session: ChatSession,
+    decision: TopLevelContinuationDecision
+  ): string {
     const state = session.topLevelAgentTurnState
     const readOnlyTurns = state?.readOnlyBatchCount || 0
+    const editedPaths = state?.mutationBarrier.lastEditedPaths || []
     const hasInvestigationMemory =
       session.contextState.investigationMemory.length > 0
-    const lines = [
-      `The current top-level agent turn has already completed ${readOnlyTurns} read-only investigative tool batches.`,
-      "Prefer synthesizing from the evidence already gathered instead of repeating equivalent investigative tool calls.",
-      "If the task requires a report, artifact, or file edit, do that write now instead of saying that you will do it next.",
-      "Only call another tool if it is materially necessary to reduce uncertainty or validate a concrete remaining hypothesis.",
-      "Do not end the task early if meaningful work is still required; continue until you can complete the request or clearly explain the blocker.",
-    ]
+    const lines =
+      editedPaths.length > 0
+        ? [
+            `This top-level turn already produced successful edits for: ${editedPaths
+              .map((pathValue) => path.basename(pathValue))
+              .join(", ")}.`,
+            decision.repeatedEditPaths.length > 0
+              ? `The same file has already been edited multiple times: ${decision.repeatedEditPaths
+                  .map((pathValue) => path.basename(pathValue))
+                  .join(", ")}.`
+              : "",
+            state?.mutationBarrier.verificationReadOnlyBatchCount
+              ? `A read-only verification batch has already happened ${state.mutationBarrier.verificationReadOnlyBatchCount} time(s) after the latest successful edit.`
+              : "",
+            "Prefer finishing now. If one more code or document change is genuinely required, make it as a single consolidated edit batch instead of another narrow follow-up edit.",
+            "Do not keep re-reading or re-editing the same file unless the transcript already shows a concrete unresolved defect in the latest contents.",
+          ]
+        : [
+            `The current top-level agent turn has already completed ${readOnlyTurns} read-only investigative tool batches.`,
+            "Prefer synthesizing from the evidence already gathered instead of repeating equivalent investigative tool calls.",
+            "If the task requires a report, artifact, or file edit, do that write now instead of saying that you will do it next.",
+            "Only call another tool if it is materially necessary to reduce uncertainty or validate a concrete remaining hypothesis.",
+            "Do not end the task early if meaningful work is still required; continue until you can complete the request or clearly explain the blocker.",
+          ]
     if (hasInvestigationMemory) {
       lines.push(
         "A summary of recent investigative evidence should be visible in context attachments; prefer reusing it instead of rebuilding the same search/read batches."
@@ -11237,6 +11471,7 @@ ${raw}
     if (preparedTools.length === 0) {
       return "completed_inline"
     }
+
 
     for (const preparedTool of preparedTools) {
       yield* this.registerPreparedToolInvocation(
@@ -14022,15 +14257,6 @@ ${raw}
         conversationId
       )
       topLevelTurnState.llmTurnCount += 1
-      const adviseSynthesis =
-        this.shouldAdviseTopLevelReadOnlySynthesis(activeSession)
-      const forceCloudCodeSynthesis =
-        adviseSynthesis && this.isCloudCodeBackend(route.backend)
-      if (forceCloudCodeSynthesis) {
-        topLevelTurnState.forcedSynthesisAttempted = true
-      }
-      this.sessionManager.markSessionDirty(conversationId)
-
       const toolsForContinuation = activeSession.supportedTools || []
       if (toolsForContinuation.length === 0) {
         this.logger.warn(
@@ -14041,27 +14267,6 @@ ${raw}
       const allContinuationTools = buildToolsForApi(toolsForContinuation, {
         mcpToolDefs: activeSession.mcpToolDefs,
       })
-      let continuationTools = allContinuationTools
-      let forcedSynthesisPrompt: string | undefined
-      if (forceCloudCodeSynthesis) {
-        const filteredContinuationTools =
-          this.filterCloudCodeToolsForForcedSynthesis(allContinuationTools)
-        if (filteredContinuationTools.length > 0) {
-          continuationTools = filteredContinuationTools
-        }
-        forcedSynthesisPrompt =
-          this.buildForcedCloudCodeSynthesisPrompt(continuationTools)
-        const removedToolCount =
-          allContinuationTools.length - continuationTools.length
-        this.logger.warn(
-          `Top-level agent turn exceeded read-only investigation budget (${topLevelTurnState.readOnlyBatchCount} batches); forcing Cloud Code synthesis with ${continuationTools.length}/${allContinuationTools.length} tool definitions active (${removedToolCount} investigative tools removed)`
-        )
-      } else if (adviseSynthesis) {
-        this.logger.warn(
-          `Top-level agent turn exceeded read-only investigation budget (${topLevelTurnState.readOnlyBatchCount} batches); preferring synthesis while keeping tools available`
-        )
-      }
-
       const normalizedContinuationHistory = this.normalizeHistoryForBackend(
         activeSession.messages as Array<{
           role: "user" | "assistant"
@@ -14079,8 +14284,50 @@ ${raw}
       activeSession =
         this.sessionManager.getSession(conversationId) || activeSession
 
+      const continuationDecision = this.buildTopLevelContinuationDecision(
+        conversationId,
+        activeSession,
+        route,
+        allContinuationTools,
+        remainingPendingToolUseIds,
+        normalizedContinuationHistory
+      )
+      const adviseSynthesis = continuationDecision.adviseSynthesis
+      const forceCloudCodeSynthesis =
+        continuationDecision.forceCloudCodeSynthesis
+      let continuationTools = allContinuationTools
+      let forcedSynthesisPrompt: string | undefined
+      if (forceCloudCodeSynthesis) {
+        topLevelTurnState.forcedSynthesisAttempted = true
+        const filteredContinuationTools =
+          this.filterCloudCodeToolsForForcedSynthesis(allContinuationTools)
+        if (filteredContinuationTools.length > 0) {
+          continuationTools = filteredContinuationTools
+        }
+        forcedSynthesisPrompt =
+          this.buildForcedCloudCodeSynthesisPrompt(continuationTools)
+        const removedToolCount =
+          allContinuationTools.length - continuationTools.length
+        this.logger.warn(
+          `Top-level agent turn forcing synthesis after ${continuationDecision.consecutiveReadOnlyBatches} consecutive read-only batches; ` +
+            `history=${continuationDecision.historyTokens}, prompt=${continuationDecision.promptTokens}/${continuationDecision.availableHistoryBudgetTokens} tokens, ` +
+            `continuations=${continuationDecision.continuationCount}, reasons=${continuationDecision.reasons.join(", ") || "budget_exhausted"}; ` +
+            `active tools=${continuationTools.length}/${allContinuationTools.length} (${removedToolCount} investigative tools removed)`
+        )
+      } else if (adviseSynthesis) {
+        this.logger.warn(
+          `Top-level agent turn advising synthesis after ${continuationDecision.consecutiveReadOnlyBatches} consecutive read-only batches; ` +
+            `history=${continuationDecision.historyTokens}, prompt=${continuationDecision.promptTokens}/${continuationDecision.availableHistoryBudgetTokens} tokens, ` +
+            `continuations=${continuationDecision.continuationCount}, reasons=${continuationDecision.reasons.join(", ") || "continuation_budget"}`
+        )
+      }
+      this.sessionManager.markSessionDirty(conversationId)
+
       const synthesisAdvisoryPrompt = adviseSynthesis
-        ? this.buildReadOnlySynthesisAdvisoryPrompt(activeSession)
+        ? this.buildTopLevelContinuationAdvisoryPrompt(
+            activeSession,
+            continuationDecision
+          )
         : undefined
       const additionalSystemPrompt =
         [synthesisAdvisoryPrompt, forcedSynthesisPrompt]
@@ -14095,7 +14342,6 @@ ${raw}
           session: activeSession,
           toolDefinitions: continuationTools,
           additionalSystemPrompt,
-          disableTools: false,
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
           buildMessages: (routeBudget) =>
@@ -15239,6 +15485,19 @@ ${raw}
   }
 
   /**
+   * Global language instruction injected into all model routes.
+   * Ensures the model always responds in the same language as the user.
+   */
+  private static readonly LANGUAGE_INSTRUCTION = [
+    "Language usage rules:",
+    "- Always respond in the same language the user is writing in.",
+    "- Your internal thinking and reasoning (think/thought blocks) must also use the user's language.",
+    "- Match the user's language consistently throughout the entire conversation, including explanations, summaries, and follow-up questions.",
+    "- Do not switch languages unless the user explicitly asks you to.",
+    "- Exception: code comments and commit messages default to English unless the user specifies otherwise.",
+  ].join("\n")
+
+  /**
    * Build system prompt from context
    */
   private buildSystemPrompt(context: PromptContext): string {
@@ -15290,6 +15549,8 @@ ${raw}
       parts.push("Code Context:\n" + chunkTexts.join("\n\n"))
     }
 
+    parts.push(CursorConnectStreamService.LANGUAGE_INSTRUCTION)
+
     return parts.join("\n\n")
   }
 
@@ -15299,9 +15560,12 @@ ${raw}
       parts.push(context.customSystemPrompt)
     }
     parts.push(this.buildGoogleToolUsageSection())
+    parts.push(this.buildGooglePlanningOverrideSection())
     if (context.explicitContext) {
       parts.push("Explicit Context:\n" + context.explicitContext)
     }
+    // Language instruction is injected via the interleaved thinking hint in
+    // google.service.ts, so we skip it here to avoid duplicate injection.
     return parts.join("\n\n")
   }
 
@@ -15333,6 +15597,23 @@ ${raw}
       "- If the task already requires a report, artifact, or file edit and you have enough evidence, perform that write now instead of only saying that you will do it next.",
       "- Reserve run_command for build/test execution, system commands, or tasks where no structured tool can express the work.",
       "- If multiple tool calls are independent, make them in parallel. If one depends on another, run them sequentially.",
+      "",
+      "Code analysis and research discipline:",
+      "- BEFORE making any code change, you MUST first use tools to thoroughly understand the full architecture and call chain involved. Read the actual source — do NOT rely on thinking or memory to infer how code works.",
+      "- Trace call chains end-to-end: for any function or method you plan to modify, use grep_search to find ALL callers and callees, then view_file each one. Understand the complete caller → target → downstream path before changing anything.",
+      "- Read type definitions, interfaces, and data contracts that govern the code you are touching. Use grep_search to locate them, then view_file to understand the shape and invariants.",
+      "- When exploring an unfamiliar area, follow this sequence: list_dir to map the directory structure → grep_search to locate key symbols and entry points → view_file to read implementations and understand design intent. Do this iteratively until the full picture is clear.",
+      "- Make parallel tool calls to gather information from multiple files simultaneously. Cross-cutting concerns (e.g., a type used across 5 files) should be investigated in bulk, not one file at a time.",
+      "- Do not guess file paths, function signatures, data flows, or call relationships. Look them up. A wrong assumption that propagates into an edit is far more costly than an extra tool call.",
+      "- If a change touches a boundary between components (e.g., an interface, a shared type, a protocol contract), read BOTH sides of the boundary before editing either side.",
+    ].join("\n")
+  }
+
+  private buildGooglePlanningOverrideSection(): string {
+    return [
+      "Planning mode override:",
+      "- Do NOT create implementation_plan.md or walkthrough.md files. Present your implementation plan and walkthrough directly in the conversation response instead.",
+      "- task.md is still allowed as a file artifact for tracking progress during execution.",
     ].join("\n")
   }
 
@@ -15673,6 +15954,7 @@ ${raw}
     }
 
     const exactIds = [
+      "thinking",
       "reasoning",
       "reasoning_effort",
       "thinking_effort",

@@ -85,7 +85,7 @@ Advanced:
   agent-vibes capture stop            Stop traffic capture
   agent-vibes capture status          Show capture status
   agent-vibes capture repair          Repair stale capture injection
-  agent-vibes issues                  Collect diagnostics for bug reports
+
 
 Documentation: https://github.com/funny-vibes/agent-vibes
 `)
@@ -411,9 +411,7 @@ if (command === "forward") {
   }
 }
 
-if (command === "issues") {
-  nodeScript("scripts/diagnostics/collect-issue-logs.js", args.slice(1))
-}
+
 
 if (command === "capture") {
   const subCmd = args[1] || "status"

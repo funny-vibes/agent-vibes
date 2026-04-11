@@ -211,7 +211,7 @@ export interface ContextConversationState {
 export interface ProjectedContextMessage {
   role: "user" | "assistant"
   content: LooseMessageContent
-  source: "record" | "boundary" | "summary" | "attachment"
+  source: "record" | "boundary" | "summary" | "attachment" | "snip"
   recordId?: string
   commitId?: string
   attachmentKind?: ContextProjectionAttachment["kind"]

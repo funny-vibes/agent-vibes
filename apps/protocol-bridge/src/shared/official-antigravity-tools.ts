@@ -26,6 +26,15 @@ export interface OfficialAntigravityCanonicalToolInvocation {
   input: Record<string, unknown>
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
+  validationErrorMessage?: string
+}
+
+interface OfficialAntigravityNormalizedEditChunk {
+  allowMultiple?: boolean
+  targetContent?: string
+  replacementContent?: string
+  startLine?: number
+  endLine?: number
 }
 
 export type OfficialAntigravityArtifactType =
@@ -664,6 +673,21 @@ function pickFirstRawString(
   return undefined
 }
 
+function pickFirstRawStringFromSources(
+  sources: Array<Record<string, unknown> | undefined>,
+  keys: string[],
+  options?: { allowEmpty?: boolean }
+): string | undefined {
+  for (const source of sources) {
+    if (!source) continue
+    const value = pickFirstRawString(source, keys, options)
+    if (value !== undefined) {
+      return value
+    }
+  }
+  return undefined
+}
+
 function pickFirstNumber(
   source: Record<string, unknown>,
   keys: string[]
@@ -683,6 +707,20 @@ function pickFirstNumber(
   return undefined
 }
 
+function pickFirstNumberFromSources(
+  sources: Array<Record<string, unknown> | undefined>,
+  keys: string[]
+): number | undefined {
+  for (const source of sources) {
+    if (!source) continue
+    const value = pickFirstNumber(source, keys)
+    if (value !== undefined) {
+      return value
+    }
+  }
+  return undefined
+}
+
 function pickFirstBoolean(
   source: Record<string, unknown>,
   keys: string[]
@@ -697,6 +735,52 @@ function pickFirstBoolean(
     }
   }
   return undefined
+}
+
+function pickFirstBooleanFromSources(
+  sources: Array<Record<string, unknown> | undefined>,
+  keys: string[]
+): boolean | undefined {
+  for (const source of sources) {
+    if (!source) continue
+    const value = pickFirstBoolean(source, keys)
+    if (value !== undefined) {
+      return value
+    }
+  }
+  return undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+}
+
+function pickFirstObject(
+  source: Record<string, unknown>,
+  keys: string[]
+): Record<string, unknown> | undefined {
+  for (const key of keys) {
+    const raw = source[key]
+    if (isRecord(raw)) {
+      return raw
+    }
+  }
+  return undefined
+}
+
+function pickRecordArray(
+  source: Record<string, unknown>,
+  keys: string[]
+): Record<string, unknown>[] {
+  for (const key of keys) {
+    const raw = source[key]
+    if (!Array.isArray(raw)) continue
+    const records = raw.filter(isRecord)
+    if (records.length > 0) {
+      return records
+    }
+  }
+  return []
 }
 
 function pickStringArray(
@@ -829,6 +913,322 @@ function buildCanonicalOfficialAntigravityEditMetadata(
               : {}),
             ...(metadata.summary ? { Summary: metadata.summary } : {}),
           },
+        }
+      : {}),
+  }
+}
+
+function hasOwnEditChunkField(source: Record<string, unknown>): boolean {
+  return [
+    "AllowMultiple",
+    "allowMultiple",
+    "allow_multiple",
+    "TargetContent",
+    "targetContent",
+    "target_content",
+    "search",
+    "target",
+    "old_text",
+    "oldText",
+    "ReplacementContent",
+    "replacementContent",
+    "replacement_content",
+    "replace",
+    "replacement",
+    "new_text",
+    "newText",
+    "StartLine",
+    "startLine",
+    "start_line",
+    "EndLine",
+    "endLine",
+    "end_line",
+  ].some((key) => Object.prototype.hasOwnProperty.call(source, key))
+}
+
+function normalizeOfficialEditChunkFromSources(
+  sources: Array<Record<string, unknown> | undefined>
+): OfficialAntigravityNormalizedEditChunk {
+  return {
+    allowMultiple: pickFirstBooleanFromSources(sources, [
+      "AllowMultiple",
+      "allowMultiple",
+      "allow_multiple",
+    ]),
+    targetContent: pickFirstRawStringFromSources(
+      sources,
+      [
+        "TargetContent",
+        "targetContent",
+        "target_content",
+        "search",
+        "target",
+        "old_text",
+        "oldText",
+      ],
+      { allowEmpty: true }
+    ),
+    replacementContent: pickFirstRawStringFromSources(
+      sources,
+      [
+        "ReplacementContent",
+        "replacementContent",
+        "replacement_content",
+        "replace",
+        "replacement",
+        "new_text",
+        "newText",
+      ],
+      { allowEmpty: true }
+    ),
+    startLine: pickFirstNumberFromSources(sources, [
+      "StartLine",
+      "startLine",
+      "start_line",
+    ]),
+    endLine: pickFirstNumberFromSources(sources, [
+      "EndLine",
+      "endLine",
+      "end_line",
+    ]),
+  }
+}
+
+function buildCanonicalReplacementChunk(
+  chunk: OfficialAntigravityNormalizedEditChunk
+): Record<string, unknown> {
+  return {
+    ...(typeof chunk.allowMultiple === "boolean"
+      ? { allowMultiple: chunk.allowMultiple }
+      : {}),
+    ...(chunk.targetContent !== undefined
+      ? { targetContent: chunk.targetContent }
+      : {}),
+    ...(chunk.replacementContent !== undefined
+      ? { replacementContent: chunk.replacementContent }
+      : {}),
+    ...(typeof chunk.startLine === "number"
+      ? { startLine: chunk.startLine }
+      : {}),
+    ...(typeof chunk.endLine === "number" ? { endLine: chunk.endLine } : {}),
+  }
+}
+
+function buildOfficialEditValidationError(
+  toolName: string,
+  issues: string[]
+): string {
+  return `${toolName} invalid input: ${issues.join("; ")}`
+}
+
+function validateOfficialEditChunk(
+  chunk: OfficialAntigravityNormalizedEditChunk,
+  options?: { index?: number }
+): string[] {
+  const issues: string[] = []
+  const prefix =
+    typeof options?.index === "number"
+      ? `ReplacementChunks[${options.index}]`
+      : ""
+
+  if (chunk.targetContent === undefined) {
+    issues.push(`${prefix || "TargetContent"} is required`)
+  } else if (chunk.targetContent.length === 0) {
+    issues.push(
+      `${prefix ? `${prefix}.TargetContent` : "TargetContent"} must be non-empty`
+    )
+  }
+
+  if (chunk.replacementContent === undefined) {
+    issues.push(
+      `${prefix ? `${prefix}.ReplacementContent` : "ReplacementContent"} is required`
+    )
+  }
+
+  if (chunk.startLine != null && chunk.startLine < 1) {
+    issues.push(`${prefix ? `${prefix}.StartLine` : "StartLine"} must be >= 1`)
+  }
+  if (chunk.endLine != null && chunk.endLine < 1) {
+    issues.push(`${prefix ? `${prefix}.EndLine` : "EndLine"} must be >= 1`)
+  }
+  if (
+    chunk.startLine != null &&
+    chunk.endLine != null &&
+    chunk.endLine < chunk.startLine
+  ) {
+    issues.push(
+      `${prefix ? `${prefix}.EndLine` : "EndLine"} must be >= ${prefix ? `${prefix}.StartLine` : "StartLine"}`
+    )
+  }
+
+  return issues
+}
+
+function pickOfficialTargetLintErrorIds(
+  input: Record<string, unknown>
+): string[] | undefined {
+  const ids = pickStringArray(input, [
+    "TargetLintErrorIds",
+    "targetLintErrorIds",
+    "target_lint_error_ids",
+  ])
+  return ids.length > 0 ? ids : undefined
+}
+
+function buildCanonicalOfficialSingleEditInvocation(
+  toolName: string,
+  input: Record<string, unknown>,
+  historyToolName: string,
+  historyToolInput: Record<string, unknown>,
+  filePath: string
+): OfficialAntigravityCanonicalToolInvocation {
+  const singleChunk = pickFirstObject(input, [
+    "ReplacementChunk",
+    "replacementChunk",
+    "replacement_chunk",
+  ])
+  const targetLintErrorIds = pickOfficialTargetLintErrorIds(input)
+  const chunkArray = pickRecordArray(input, [
+    "ReplacementChunks",
+    "replacementChunks",
+    "replacement_chunks",
+  ])
+  const issues: string[] = []
+  if (!filePath) {
+    issues.push("TargetFile is required")
+  }
+  if (chunkArray.length > 1) {
+    issues.push(
+      `received ${chunkArray.length} ReplacementChunks; use multi_replace_file_content for multiple edits`
+    )
+  }
+
+  const chunk = normalizeOfficialEditChunkFromSources([
+    input,
+    singleChunk,
+    chunkArray[0],
+  ])
+  issues.push(...validateOfficialEditChunk(chunk))
+
+  return {
+    toolName: "edit_file_v2",
+    input: {
+      ...buildCanonicalOfficialAntigravityEditMetadata(input, filePath),
+      replacementChunks: [buildCanonicalReplacementChunk(chunk)],
+      ...(targetLintErrorIds
+        ? { target_lint_error_ids: targetLintErrorIds }
+        : {}),
+    },
+    historyToolName,
+    historyToolInput,
+    ...(issues.length > 0
+      ? {
+          validationErrorMessage: buildOfficialEditValidationError(
+            toolName,
+            issues
+          ),
+        }
+      : {}),
+  }
+}
+
+function buildCanonicalOfficialMultiEditInvocation(
+  toolName: string,
+  input: Record<string, unknown>,
+  historyToolName: string,
+  historyToolInput: Record<string, unknown>,
+  filePath: string
+): OfficialAntigravityCanonicalToolInvocation {
+  const chunkArray = pickRecordArray(input, [
+    "ReplacementChunks",
+    "replacementChunks",
+    "replacement_chunks",
+  ])
+  const targetLintErrorIds = pickOfficialTargetLintErrorIds(input)
+  const singleChunk = pickFirstObject(input, [
+    "ReplacementChunk",
+    "replacementChunk",
+    "replacement_chunk",
+  ])
+  const rawChunks =
+    chunkArray.length > 0
+      ? chunkArray
+      : singleChunk
+        ? [singleChunk]
+        : hasOwnEditChunkField(input)
+          ? [input]
+          : []
+
+  const issues: string[] = []
+  if (!filePath) {
+    issues.push("TargetFile is required")
+  }
+  if (rawChunks.length === 0) {
+    issues.push("ReplacementChunks must contain at least one replacement chunk")
+  }
+
+  const replacementChunks = rawChunks.map((rawChunk, index) => {
+    const chunk = normalizeOfficialEditChunkFromSources([rawChunk])
+    issues.push(...validateOfficialEditChunk(chunk, { index }))
+    return buildCanonicalReplacementChunk(chunk)
+  })
+
+  return {
+    toolName: "edit_file_v2",
+    input: {
+      ...buildCanonicalOfficialAntigravityEditMetadata(input, filePath),
+      replacementChunks,
+      ...(targetLintErrorIds
+        ? { target_lint_error_ids: targetLintErrorIds }
+        : {}),
+    },
+    historyToolName,
+    historyToolInput,
+    ...(issues.length > 0
+      ? {
+          validationErrorMessage: buildOfficialEditValidationError(
+            toolName,
+            issues
+          ),
+        }
+      : {}),
+  }
+}
+
+function buildCanonicalOfficialWriteToFileInvocation(
+  toolName: string,
+  input: Record<string, unknown>,
+  historyToolName: string,
+  historyToolInput: Record<string, unknown>,
+  filePath: string
+): OfficialAntigravityCanonicalToolInvocation {
+  const fileText = pickFirstRawString(
+    input,
+    ["CodeContent", "content", "file_text", "fileText", "text"],
+    { allowEmpty: true }
+  )
+  const issues: string[] = []
+  if (!filePath) {
+    issues.push("TargetFile is required")
+  }
+  if (fileText === undefined) {
+    issues.push("CodeContent is required")
+  }
+
+  return {
+    toolName: "edit_file_v2",
+    input: {
+      ...buildCanonicalOfficialAntigravityEditMetadata(input, filePath),
+      ...(fileText !== undefined ? { file_text: fileText } : {}),
+    },
+    historyToolName,
+    historyToolInput,
+    ...(issues.length > 0
+      ? {
+          validationErrorMessage: buildOfficialEditValidationError(
+            toolName,
+            issues
+          ),
         }
       : {}),
   }
@@ -1014,115 +1414,29 @@ export function canonicalizeOfficialAntigravityToolInvocation(
         historyToolInput,
       }
     case "replace_file_content":
-      return {
-        toolName: "edit_file_v2",
-        input: {
-          ...buildCanonicalOfficialAntigravityEditMetadata(input, filePath),
-          search:
-            input.TargetContent ||
-            input.targetContent ||
-            input.target_content ||
-            input.search ||
-            input.old_text ||
-            input.oldText ||
-            input.target,
-          replace:
-            pickFirstRawString(
-              input,
-              [
-                "ReplacementContent",
-                "replacementContent",
-                "replacement_content",
-                "replace",
-                "new_text",
-                "newText",
-                "replacement",
-              ],
-              { allowEmpty: true }
-            ) ?? undefined,
-          allow_multiple: pickFirstBoolean(input, [
-            "AllowMultiple",
-            "allowMultiple",
-            "allow_multiple",
-          ]),
-          start_line: pickFirstNumber(input, [
-            "StartLine",
-            "startLine",
-            "start_line",
-          ]),
-          end_line: pickFirstNumber(input, ["EndLine", "endLine", "end_line"]),
-          target_lint_error_ids:
-            input.TargetLintErrorIds ||
-            input.targetLintErrorIds ||
-            input.target_lint_error_ids,
-        },
+      return buildCanonicalOfficialSingleEditInvocation(
+        toolName,
+        input,
         historyToolName,
         historyToolInput,
-      }
-    case "multi_replace_file_content": {
-      const rawChunks = Array.isArray(input.ReplacementChunks)
-        ? input.ReplacementChunks
-        : Array.isArray(input.replacementChunks)
-          ? input.replacementChunks
-          : []
-      const replacementChunks = rawChunks
-        .filter(
-          (entry): entry is Record<string, unknown> =>
-            !!entry && typeof entry === "object"
-        )
-        .map((chunk) => ({
-          allowMultiple: pickFirstBoolean(chunk, [
-            "AllowMultiple",
-            "allowMultiple",
-            "allow_multiple",
-          ]),
-          targetContent: pickFirstRawString(chunk, [
-            "TargetContent",
-            "targetContent",
-            "target_content",
-            "search",
-          ]),
-          replacementContent: pickFirstRawString(
-            chunk,
-            [
-              "ReplacementContent",
-              "replacementContent",
-              "replacement_content",
-              "replace",
-            ],
-            { allowEmpty: true }
-          ),
-          startLine: pickFirstNumber(chunk, [
-            "StartLine",
-            "startLine",
-            "start_line",
-          ]),
-          endLine: pickFirstNumber(chunk, ["EndLine", "endLine", "end_line"]),
-        }))
-      return {
-        toolName: "edit_file_v2",
-        input: {
-          ...buildCanonicalOfficialAntigravityEditMetadata(input, filePath),
-          replacementChunks,
-        },
+        filePath
+      )
+    case "multi_replace_file_content":
+      return buildCanonicalOfficialMultiEditInvocation(
+        toolName,
+        input,
         historyToolName,
         historyToolInput,
-      }
-    }
+        filePath
+      )
     case "write_to_file":
-      return {
-        toolName: "edit_file_v2",
-        input: {
-          ...buildCanonicalOfficialAntigravityEditMetadata(input, filePath),
-          file_text: pickFirstRawString(
-            input,
-            ["CodeContent", "content", "file_text", "fileText", "text"],
-            { allowEmpty: true }
-          ),
-        },
+      return buildCanonicalOfficialWriteToFileInvocation(
+        toolName,
+        input,
         historyToolName,
         historyToolInput,
-      }
+        filePath
+      )
     case "search_web":
       return {
         toolName: "web_search",

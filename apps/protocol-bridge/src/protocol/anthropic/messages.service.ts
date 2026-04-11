@@ -318,11 +318,18 @@ export class MessagesService implements OnModuleInit {
           `${result.estimatedTokens} tokens (${dto.messages.length} -> ${result.messages.length} messages)`
       )
     }
-    if (result.toolResultCompaction?.changed) {
+    if (result.snipCompaction?.changed) {
       this.logger.log(
-        `Applied ${result.toolResultCompaction.trigger} tool-result compaction for ${route.backend}: ` +
-          `${result.toolResultCompaction.clearedToolResults} results across ` +
-          `${result.toolResultCompaction.compactedRounds} API rounds`
+        `Applied snip compaction for ${route.backend}: ` +
+          `${result.snipCompaction.removedRecords} live records summarized, ` +
+          `${result.snipCompaction.retainedRecords} retained`
+      )
+    }
+    if (result.microcompactCompaction?.changed) {
+      this.logger.log(
+        `Applied ${result.microcompactCompaction.trigger} microcompact for ${route.backend}: ` +
+          `${result.microcompactCompaction.clearedToolResults} results across ` +
+          `${result.microcompactCompaction.compactedRounds} API rounds`
       )
     }
 

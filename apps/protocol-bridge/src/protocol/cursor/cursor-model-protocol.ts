@@ -27,7 +27,7 @@ import {
 } from "../../llm/model-registry"
 import { parseModelRequest } from "../../llm/model-request"
 
-export const CURSOR_REASONING_PARAMETER_ID = "reasoning"
+export const CURSOR_REASONING_PARAMETER_ID = "thinking"
 export const CURSOR_LEGACY_REASONING_PARAMETER_ID = "reasoning_effort"
 export const CURSOR_FAST_PARAMETER_ID = "fast"
 export const STANDARD_SERVICE_TIER = "standard"
@@ -935,6 +935,8 @@ export function buildLegacyCursorAvailableModels(
   options?: {
     defaultOn?: boolean
     preferredDefaultModelName?: string
+    /** When set, fast-mode variants whose effort is in this set get defaultOn=true. */
+    defaultOnFastEfforts?: ReadonlySet<string>
   }
 ): AvailableModelsResponse_AvailableModel[] {
   if (model.family !== "gpt") {
@@ -978,13 +980,15 @@ export function buildLegacyCursorAvailableModels(
     )
 
     for (const effort of legacyEfforts) {
+      const fastDefaultOn = options?.defaultOnFastEfforts
+        ? options.defaultOnFastEfforts.has(effort)
+        : model.name === options?.preferredDefaultModelName &&
+          effort === "xhigh"
       legacyModels.push(
         buildLegacySingleVariantModel(model, namedModelSectionIndex, {
           effort,
           fastMode: true,
-          defaultOn:
-            model.name === options?.preferredDefaultModelName &&
-            effort === "xhigh",
+          defaultOn: fastDefaultOn,
           preferredDefaultModelName: options?.preferredDefaultModelName,
         })
       )

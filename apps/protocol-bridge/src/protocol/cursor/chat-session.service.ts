@@ -7,6 +7,7 @@ import {
 import * as path from "path"
 import { enforceToolProtocol } from "../../context/message-integrity-guard"
 import type {
+  ContextCompactionCommit,
   ContextConversationState,
   ContextInvestigationMemoryEntry,
   ContextTranscriptRecord,
@@ -200,11 +201,29 @@ export interface SessionActiveToolBatch {
   }>
 }
 
+export interface SessionTopLevelContinuationBudget {
+  continuationCount: number
+  lastHistoryTokens: number
+  lastDeltaTokens: number
+  startedAt: number
+}
+
+export interface SessionTopLevelMutationBarrier {
+  mutatingBatchCount: number
+  verificationReadOnlyBatchCount: number
+  sameFileEditCounts: Record<string, number>
+  lastEditedPaths: string[]
+}
+
 export interface SessionTopLevelAgentTurnState {
   llmTurnCount: number
   readOnlyBatchCount: number
   hasMutatingToolCall: boolean
   forcedSynthesisAttempted: boolean
+  lastReadOnlyContinuationHistoryTokens?: number
+  stalledReadOnlyContinuationCount: number
+  continuationBudget: SessionTopLevelContinuationBudget
+  mutationBarrier: SessionTopLevelMutationBarrier
   activeToolBatch?: SessionActiveToolBatch
 }
 
@@ -596,11 +615,15 @@ interface PersistedTopLevelAgentTurnState {
   readOnlyBatchCount: number
   hasMutatingToolCall: boolean
   forcedSynthesisAttempted: boolean
+  lastReadOnlyContinuationHistoryTokens?: number
+  stalledReadOnlyContinuationCount: number
+  continuationBudget?: SessionTopLevelContinuationBudget
+  mutationBarrier?: SessionTopLevelMutationBarrier
   activeToolBatch?: PersistedActiveToolBatch
 }
 
 interface PersistedChatSessionV1 {
-  version: 1 | 2 | 3 | 4 | 5
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
   conversationId: string
   messages: SessionMessage[]
   messageRecords?: ContextTranscriptRecord[]
@@ -867,6 +890,19 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       readOnlyBatchCount: 0,
       hasMutatingToolCall: false,
       forcedSynthesisAttempted: false,
+      stalledReadOnlyContinuationCount: 0,
+      continuationBudget: {
+        continuationCount: 0,
+        lastHistoryTokens: 0,
+        lastDeltaTokens: 0,
+        startedAt: Date.now(),
+      },
+      mutationBarrier: {
+        mutatingBatchCount: 0,
+        verificationReadOnlyBatchCount: 0,
+        sameFileEditCounts: {},
+        lastEditedPaths: [],
+      },
     }
   }
 
@@ -1078,7 +1114,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 5,
+      version: 8,
       conversationId: session.conversationId,
       messages: session.messages,
       messageRecords: session.messageRecords,
@@ -1089,6 +1125,34 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         hasMutatingToolCall: session.topLevelAgentTurnState.hasMutatingToolCall,
         forcedSynthesisAttempted:
           session.topLevelAgentTurnState.forcedSynthesisAttempted,
+        lastReadOnlyContinuationHistoryTokens:
+          session.topLevelAgentTurnState.lastReadOnlyContinuationHistoryTokens,
+        stalledReadOnlyContinuationCount:
+          session.topLevelAgentTurnState.stalledReadOnlyContinuationCount,
+        continuationBudget: {
+          continuationCount:
+            session.topLevelAgentTurnState.continuationBudget.continuationCount,
+          lastHistoryTokens:
+            session.topLevelAgentTurnState.continuationBudget.lastHistoryTokens,
+          lastDeltaTokens:
+            session.topLevelAgentTurnState.continuationBudget.lastDeltaTokens,
+          startedAt:
+            session.topLevelAgentTurnState.continuationBudget.startedAt,
+        },
+        mutationBarrier: {
+          mutatingBatchCount:
+            session.topLevelAgentTurnState.mutationBarrier.mutatingBatchCount,
+          verificationReadOnlyBatchCount:
+            session.topLevelAgentTurnState.mutationBarrier
+              .verificationReadOnlyBatchCount,
+          sameFileEditCounts: {
+            ...session.topLevelAgentTurnState.mutationBarrier
+              .sameFileEditCounts,
+          },
+          lastEditedPaths: [
+            ...session.topLevelAgentTurnState.mutationBarrier.lastEditedPaths,
+          ],
+        },
         activeToolBatch: session.topLevelAgentTurnState.activeToolBatch
           ? {
               batchId: session.topLevelAgentTurnState.activeToolBatch.batchId,
@@ -1399,6 +1463,57 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private normalizeCompactionHistory(
+    state: ContextConversationState,
+    persistedVersion: PersistedChatSessionV1["version"]
+  ): {
+    compactionHistory: ContextCompactionCommit[]
+    activeCompactionId?: string
+  } {
+    const history = Array.isArray(state.compactionHistory)
+      ? state.compactionHistory.filter(
+          (commit): commit is ContextCompactionCommit =>
+            !!commit &&
+            typeof commit === "object" &&
+            typeof commit.id === "string" &&
+            commit.id.trim().length > 0 &&
+            typeof commit.archivedThroughRecordId === "string" &&
+            commit.archivedThroughRecordId.trim().length > 0 &&
+            typeof commit.summary === "string"
+        )
+      : []
+    const activeCompactionId =
+      typeof state.activeCompactionId === "string" &&
+      state.activeCompactionId.trim().length > 0
+        ? state.activeCompactionId
+        : undefined
+    const activeCommit = activeCompactionId
+      ? history.find((commit) => commit.id === activeCompactionId)
+      : undefined
+
+    if (persistedVersion >= 8) {
+      return {
+        compactionHistory: history,
+        activeCompactionId: activeCommit?.id,
+      }
+    }
+
+    return activeCommit
+      ? {
+          compactionHistory: [
+            {
+              ...activeCommit,
+              parentCompactionId: undefined,
+            },
+          ],
+          activeCompactionId: activeCommit.id,
+        }
+      : {
+          compactionHistory: [],
+          activeCompactionId: undefined,
+        }
+  }
+
   private syncMessagesFromRecords(
     records: ContextTranscriptRecord[]
   ): SessionMessage[] {
@@ -1545,6 +1660,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       persisted.contextState && typeof persisted.contextState === "object"
         ? persisted.contextState
         : undefined
+    const normalizedCompactionState = rawContextState
+      ? this.normalizeCompactionHistory(rawContextState, persisted.version)
+      : undefined
     const contextState =
       rawContextState &&
       Array.isArray(rawContextState.records) &&
@@ -1556,6 +1674,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         ? {
             ...rawContextState,
             records: messageRecords,
+            compactionHistory:
+              normalizedCompactionState?.compactionHistory || [],
+            activeCompactionId: normalizedCompactionState?.activeCompactionId,
             compactionEpoch:
               typeof rawContextState.compactionEpoch === "number" &&
               rawContextState.compactionEpoch >= 0
@@ -1660,6 +1781,135 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
             persisted.topLevelAgentTurnState.hasMutatingToolCall === true,
           forcedSynthesisAttempted:
             persisted.topLevelAgentTurnState.forcedSynthesisAttempted === true,
+          lastReadOnlyContinuationHistoryTokens:
+            typeof persisted.topLevelAgentTurnState
+              .lastReadOnlyContinuationHistoryTokens === "number" &&
+            Number.isFinite(
+              persisted.topLevelAgentTurnState
+                .lastReadOnlyContinuationHistoryTokens
+            ) &&
+            persisted.topLevelAgentTurnState
+              .lastReadOnlyContinuationHistoryTokens >= 0
+              ? persisted.topLevelAgentTurnState
+                  .lastReadOnlyContinuationHistoryTokens
+              : undefined,
+          stalledReadOnlyContinuationCount:
+            typeof persisted.topLevelAgentTurnState
+              .stalledReadOnlyContinuationCount === "number" &&
+            persisted.topLevelAgentTurnState.stalledReadOnlyContinuationCount >=
+              0
+              ? persisted.topLevelAgentTurnState
+                  .stalledReadOnlyContinuationCount
+              : 0,
+          continuationBudget:
+            persisted.topLevelAgentTurnState.continuationBudget &&
+            typeof persisted.topLevelAgentTurnState.continuationBudget ===
+              "object"
+              ? {
+                  continuationCount:
+                    typeof persisted.topLevelAgentTurnState.continuationBudget
+                      .continuationCount === "number" &&
+                    persisted.topLevelAgentTurnState.continuationBudget
+                      .continuationCount >= 0
+                      ? persisted.topLevelAgentTurnState.continuationBudget
+                          .continuationCount
+                      : 0,
+                  lastHistoryTokens:
+                    typeof persisted.topLevelAgentTurnState.continuationBudget
+                      .lastHistoryTokens === "number" &&
+                    persisted.topLevelAgentTurnState.continuationBudget
+                      .lastHistoryTokens >= 0
+                      ? persisted.topLevelAgentTurnState.continuationBudget
+                          .lastHistoryTokens
+                      : 0,
+                  lastDeltaTokens:
+                    typeof persisted.topLevelAgentTurnState.continuationBudget
+                      .lastDeltaTokens === "number" &&
+                    persisted.topLevelAgentTurnState.continuationBudget
+                      .lastDeltaTokens >= 0
+                      ? persisted.topLevelAgentTurnState.continuationBudget
+                          .lastDeltaTokens
+                      : 0,
+                  startedAt:
+                    typeof persisted.topLevelAgentTurnState.continuationBudget
+                      .startedAt === "number" &&
+                    Number.isFinite(
+                      persisted.topLevelAgentTurnState.continuationBudget
+                        .startedAt
+                    ) &&
+                    persisted.topLevelAgentTurnState.continuationBudget
+                      .startedAt > 0
+                      ? persisted.topLevelAgentTurnState.continuationBudget
+                          .startedAt
+                      : Date.now(),
+                }
+              : {
+                  continuationCount: 0,
+                  lastHistoryTokens: 0,
+                  lastDeltaTokens: 0,
+                  startedAt: Date.now(),
+                },
+          mutationBarrier:
+            persisted.topLevelAgentTurnState.mutationBarrier &&
+            typeof persisted.topLevelAgentTurnState.mutationBarrier === "object"
+              ? {
+                  mutatingBatchCount:
+                    typeof persisted.topLevelAgentTurnState.mutationBarrier
+                      .mutatingBatchCount === "number" &&
+                    persisted.topLevelAgentTurnState.mutationBarrier
+                      .mutatingBatchCount >= 0
+                      ? persisted.topLevelAgentTurnState.mutationBarrier
+                          .mutatingBatchCount
+                      : 0,
+                  verificationReadOnlyBatchCount:
+                    typeof persisted.topLevelAgentTurnState.mutationBarrier
+                      .verificationReadOnlyBatchCount === "number" &&
+                    persisted.topLevelAgentTurnState.mutationBarrier
+                      .verificationReadOnlyBatchCount >= 0
+                      ? persisted.topLevelAgentTurnState.mutationBarrier
+                          .verificationReadOnlyBatchCount
+                      : 0,
+                  sameFileEditCounts:
+                    persisted.topLevelAgentTurnState.mutationBarrier
+                      .sameFileEditCounts &&
+                    typeof persisted.topLevelAgentTurnState.mutationBarrier
+                      .sameFileEditCounts === "object" &&
+                    !Array.isArray(
+                      persisted.topLevelAgentTurnState.mutationBarrier
+                        .sameFileEditCounts
+                    )
+                      ? Object.fromEntries(
+                          Object.entries(
+                            persisted.topLevelAgentTurnState.mutationBarrier
+                              .sameFileEditCounts
+                          ).map(([path, count]) => [
+                            path,
+                            typeof count === "number" &&
+                            Number.isFinite(count) &&
+                            count > 0
+                              ? Math.floor(count)
+                              : 0,
+                          ])
+                        )
+                      : {},
+                  lastEditedPaths: Array.isArray(
+                    persisted.topLevelAgentTurnState.mutationBarrier
+                      .lastEditedPaths
+                  )
+                    ? persisted.topLevelAgentTurnState.mutationBarrier.lastEditedPaths
+                        .filter(
+                          (value): value is string =>
+                            typeof value === "string" && value.trim().length > 0
+                        )
+                        .map((value) => value.trim())
+                    : [],
+                }
+              : {
+                  mutatingBatchCount: 0,
+                  verificationReadOnlyBatchCount: 0,
+                  sameFileEditCounts: {},
+                  lastEditedPaths: [],
+                },
           activeToolBatch: persisted.topLevelAgentTurnState.activeToolBatch
             ? {
                 batchId:

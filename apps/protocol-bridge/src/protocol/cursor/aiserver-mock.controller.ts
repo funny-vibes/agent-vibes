@@ -92,6 +92,16 @@ const ENABLED_CURSOR_FEATURES = new Set<string>([
   "use_react_model_picker",
 ])
 
+/**
+ * Models that are enabled by default in the model picker.
+ * GPT-5.4 variants (High Fast, Extra high Fast, etc.) must be enabled
+ * manually in Cursor UI because defaultOn only works at the model level.
+ */
+const DEFAULT_ON_MODELS = new Set<string>([
+  "claude-opus-4-6-thinking",
+  "gemini-3.1-pro-high",
+])
+
 function buildStatsigBootstrapConfig(featureGates: Iterable<string>): string {
   const now = Date.now()
   const featureGateEntries = Array.from(
@@ -625,29 +635,48 @@ export class AiserverMockController {
         `AvailableModels request flags: nightly=${request.isNightly}, reactPicker=${request.useReactModelPicker}, useModelParameters=${request.useModelParameters}, variantsExploded=${request.variantsWillBeShownInExplodedList}, includeLongContext=${request.includeLongContextModels}, excludeMaxNamedModels=${request.excludeMaxNamedModels}, includeHidden=${request.includeHiddenModels}, doNotUseMarkdown=${request.doNotUseMarkdown}, forAutomations=${request.forAutomations}, scope=${request.scope ?? "unspecified"}, additionalModelNames=${request.additionalModelNames.join(",") || "(none)"}`
       )
 
-      const protoModels = allModels.flatMap((model) =>
-        parameterizedMode
-          ? [
-              buildCursorAvailableModel(
-                model,
-                this.getNamedModelSectionIndex(model.family),
-                {
-                  parameterized: true,
-                  defaultOn: model.name !== "gpt-5.4",
-                  includeEffortInDisplayName:
-                    request.variantsWillBeShownInExplodedList,
-                }
-              ),
-            ]
-          : buildLegacyCursorAvailableModels(
+      const protoModels = allModels.flatMap((model) => {
+        // GPT models use legacy mode so each variant gets independent defaultOn
+        if (model.family === "gpt") {
+          return buildLegacyCursorAvailableModels(
+            model,
+            this.getNamedModelSectionIndex(model.family),
+            {
+              defaultOn: false,
+              preferredDefaultModelName: defaultSelection.model,
+              defaultOnFastEfforts:
+                model.name === "gpt-5.4"
+                  ? new Set(["high", "xhigh"])
+                  : undefined,
+            }
+          )
+        }
+
+        // Non-GPT models use parameterized mode
+        if (parameterizedMode) {
+          return [
+            buildCursorAvailableModel(
               model,
               this.getNamedModelSectionIndex(model.family),
               {
-                defaultOn: false,
-                preferredDefaultModelName: defaultSelection.model,
+                parameterized: true,
+                defaultOn: DEFAULT_ON_MODELS.has(model.name),
+                includeEffortInDisplayName:
+                  request.variantsWillBeShownInExplodedList,
               }
-            )
-      )
+            ),
+          ]
+        }
+
+        return buildLegacyCursorAvailableModels(
+          model,
+          this.getNamedModelSectionIndex(model.family),
+          {
+            defaultOn: DEFAULT_ON_MODELS.has(model.name),
+            preferredDefaultModelName: defaultSelection.model,
+          }
+        )
+      })
       const featureModelConfig = this.buildFeatureModelConfig(
         defaultSelection.model,
         allModels

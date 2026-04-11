@@ -222,6 +222,11 @@
           "default": false,
           "description": "Auto-estimate Cloud Code Claude thinking budget based on task complexity"
         },
+        "agentVibes.antigravitySystemPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load the built-in Antigravity system prompt for Google backend (requires restart)"
+        },
         "agentVibes.dataDir": {
           "type": "string",
           "default": "",

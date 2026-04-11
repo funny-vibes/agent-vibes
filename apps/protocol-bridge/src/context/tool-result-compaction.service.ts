@@ -35,7 +35,7 @@ type ApiRound = {
 }
 
 export interface ToolResultCompactionOptions {
-  trigger: "reactive" | "time-based"
+  trigger: "reactive" | "preflight"
   targetTokens?: number
   keepRecentRounds?: number
 }

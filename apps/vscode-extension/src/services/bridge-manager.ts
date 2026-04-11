@@ -120,6 +120,10 @@ export class BridgeManager extends EventEmitter {
         env.THINKING_BUDGET_AUTO = "true"
       }
 
+      if (!this.config.antigravitySystemPrompt) {
+        env.ANTIGRAVITY_SYSTEM_PROMPT = "false"
+      }
+
       this.rotateLogFile()
 
       // Spawn detached — Bridge survives Cursor restarts

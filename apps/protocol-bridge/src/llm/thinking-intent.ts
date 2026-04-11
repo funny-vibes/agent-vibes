@@ -84,20 +84,22 @@ function convertLegacyEffortToBudget(
   effort: ThinkingIntentEffort,
   thinkingLevel: number
 ): number {
+  // Budget tiers aligned with Vertex AI migration guide:
+  //   LOW ≤1,024; MEDIUM 1,024–8,192; HIGH >8,192
   switch (effort) {
     case "minimal":
-      return 512
     case "low":
-      return 8192
+      return 1024
     case "medium":
-      return 16384
+      return 4096
     case "high":
-      return 24576
+      return 8192
     case "xhigh":
+      return thinkingLevel >= 2 ? 32768 : 10240
     case "max":
-      return Math.max(32768, thinkingLevel >= 2 ? 32768 : 24576)
+      return 32768
     default:
-      return thinkingLevel >= 2 ? 32768 : 16384
+      return 1024
   }
 }
 

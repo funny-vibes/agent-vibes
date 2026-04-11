@@ -570,6 +570,7 @@ export class DashboardPanel {
       "debugMode",
       "autoStart",
       "thinkingBudgetAuto",
+      "antigravitySystemPrompt",
     ])
     const allowedNumbers = new Set(["port", "healthCheckInterval"])
     const allowedStrings = new Set([
@@ -795,6 +796,20 @@ export class DashboardPanel {
                 key: "healthCheckInterval",
                 value: this.config.healthCheckInterval,
               },
+            ],
+          },
+          {
+            id: "antigravity",
+            label: "Antigravity",
+            desc: "Antigravity (Google Cloud Code) backend settings.",
+            items: [
+              {
+                label: "System Prompt",
+                desc: "Load the built-in Antigravity system prompt for Google backend (requires restart)",
+                type: "toggle",
+                key: "antigravitySystemPrompt",
+                value: this.config.antigravitySystemPrompt,
+              },
               {
                 label: "Thinking Budget Auto",
                 desc: "Auto-estimate Claude thinking budget based on task complexity (requires restart)",
@@ -929,7 +944,7 @@ export class DashboardPanel {
         id: "forwarding",
         label: "Enable traffic forwarding",
         description: forwardingActive
-          ? "Loopback alias, hosts mapping, and relay process appear active."
+          ? `Hosts mapping and ${this.network.getForwardingBackend() === "relay" ? "TCP relay" : this.network.getForwardingBackend() === "portproxy" ? "port proxy" : "iptables"} appear active.`
           : "Redirect Cursor domains to the local bridge.",
         status: forwardingActive
           ? "done"
@@ -1382,23 +1397,25 @@ export class DashboardPanel {
 
         // ── 5. Traffic Forwarding ──
         case "forwarding": {
-          const hasHosts = this.network.hasHostEntries()
+          const forwarding = this.network.getForwardingStatus()
           emit(
-            hasHosts
+            forwarding.hasHosts
               ? "✓ /etc/hosts entries found"
               : "✗ /etc/hosts entries missing"
           )
-          const hasLoopback = this.network.hasLoopbackAlias()
+
+          if (forwarding.hasLoopbackAlias !== null) {
+            emit(
+              forwarding.hasLoopbackAlias
+                ? "✓ Loopback alias (127.0.0.2) active"
+                : "✗ Loopback alias missing"
+            )
+          }
+
           emit(
-            hasLoopback
-              ? "✓ Loopback alias (127.0.0.2) active"
-              : "✗ Loopback alias missing"
-          )
-          const hasRelay = this.network.isRelayRunning()
-          emit(
-            hasRelay
-              ? "✓ TCP relay process running"
-              : "✗ TCP relay process not running"
+            forwarding.backendConfigured
+              ? `✓ ${forwarding.backendStatusLabel} active`
+              : `✗ ${forwarding.backendStatusLabel} missing`
           )
 
           // End-to-end: try connecting 127.0.0.2:443
@@ -1408,17 +1425,25 @@ export class DashboardPanel {
           sock.once("connect", () => {
             emit("✓ End-to-end forwarding OK")
             sock.destroy()
-            done(hasHosts && hasLoopback && hasRelay ? "pass" : "warn")
+            done(forwarding.active ? "pass" : "warn")
           })
           sock.once("timeout", () => {
             emit("✗ 127.0.0.2:443 timed out")
             sock.destroy()
-            done(hasHosts || hasRelay ? "warn" : "fail")
+            done(
+              forwarding.hasHosts || forwarding.backendConfigured
+                ? "warn"
+                : "fail"
+            )
           })
           sock.once("error", (err: Error) => {
             emit(`✗ 127.0.0.2:443: ${err.message}`)
             sock.destroy()
-            done(hasHosts || hasRelay ? "warn" : "fail")
+            done(
+              forwarding.hasHosts || forwarding.backendConfigured
+                ? "warn"
+                : "fail"
+            )
           })
           sock.connect(443, "127.0.0.2")
           return // async

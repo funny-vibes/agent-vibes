@@ -15,14 +15,14 @@ import {
   type RequestedModel_ModelParameterValue,
   UserMessage,
 } from "../../gen/agent/v1_pb"
+import { parseModelRequest } from "../../llm/model-request"
+import { normalizeRequestedThinkingEffort } from "../../llm/thinking-intent"
+import { parseCursorVariantString } from "./cursor-model-protocol"
 import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
 import { KvStorageService } from "./kv-storage.service"
-import { normalizeRequestedThinkingEffort } from "../../llm/thinking-intent"
-import { parseModelRequest } from "../../llm/model-request"
-import { parseCursorVariantString } from "./cursor-model-protocol"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
@@ -398,6 +398,7 @@ export class CursorRequestParser {
     }
 
     const exactIds = [
+      "thinking",
       "reasoning",
       "reasoning_effort",
       "thinking_effort",

@@ -2,7 +2,15 @@
 
 English | [中文](README_zh.md)
 
-> **Unified Agent Gateway** — Use **Antigravity** and **Codex** AI backends with **Claude Code CLI** and **Cursor IDE**.
+> [!WARNING]
+> The **dev** branch is currently undergoing a major refactoring based on
+> the **Claude Code** source architecture, along with extensive testing.
+> **Not recommended for production coding tasks.**
+> A stable LTS release will be published once testing is complete.
+> Versions prior to **Agent Vibes v0.1.10 (Cursor 3.0.16)** contain
+> numerous known defects. Please update to v0.1.10 or later.
+
+**Unified Agent Gateway** — Use **Antigravity** and **Codex** AI backends with **Claude Code CLI** and **Cursor IDE**.
 
 [![CI](https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -81,75 +89,23 @@ native client compatibility for Cursor and native upstream fidelity for Antigrav
 
 ## Quick Start
 
-### Install & Setup (Required)
+### Install Option 1: Prompt Install (Recommended)
 
-**From source (all platforms):**
+Copy the prompt below and send it to any LLM (ChatGPT / Claude / Gemini, etc.).
+It will guide you through installation and configuration, and fix issues by analyzing the source and your environment:
 
-> **Tip:** If you only need Cursor IDE support, skip this and use the [Extension install](#cursor-ide) instead — no source build required.
->
-> **Note:** Primary development and testing is done on macOS.
-> Linux and Windows support is implemented but not fully tested —
-> scripts may have edge-case bugs on those platforms. PRs welcome!
+> Please guide me through installing, configuring, and testing
+> the Agent Vibes Cursor extension. The extension is installed via VSIX
+> from GitHub Releases. If any step fails, analyze the source code
+> (<https://github.com/funny-vibes/agent-vibes>) and my current environment
+> and provide a fix. Answer in Chinese, prefer executable commands.
+> If the fix succeeds and a bug was found, help me submit an issue to
+> funny-vibes/agent-vibes using `gh issue create`,
+> and let me confirm before submitting.
 
-```bash
-git clone https://github.com/funny-vibes/agent-vibes.git
-cd agent-vibes
-npm install && npm run build
-npm link                          # makes `agent-vibes` available globally
-```
-
-Generate SSL certificates:
-
-```bash
-# Install mkcert first: https://github.com/FiloSottile/mkcert#installation
-mkcert -install
-agent-vibes cert
-```
-
-### Choose One Upstream Source
-
-Antigravity ([Antigravity IDE](https://antigravity.google) or [Antigravity Manager](https://github.com/lbjlaq/Antigravity-Manager)):
-
-```bash
-agent-vibes sync --ide       # from Antigravity IDE
-agent-vibes sync --tools     # from Antigravity Manager
-```
-
-Claude Code third-party config:
-
-```bash
-agent-vibes sync --claude
-```
-
-Codex:
-
-```bash
-codex --login
-agent-vibes sync --codex
-```
-
-### Daily Use
-
-#### Claude Code CLI
-
-```bash
-agent-vibes                  # start proxy
-```
-
-In another terminal:
-
-```bash
-export ANTHROPIC_BASE_URL=https://localhost:8000
-claude
-```
-
-> **Tip:** Add `export ANTHROPIC_BASE_URL=https://localhost:8000` to your shell profile to make it persistent.
-
-#### Cursor IDE
+### Install Option 2: Extension Install (Cursor IDE)
 
 For the Cursor client side, a free account is enough. No paid Cursor plan is required.
-
-**Option A: Extension (Recommended)**
 
 One-click download + install from [GitHub Releases](https://github.com/funny-vibes/agent-vibes/releases):
 Compatible Cursor version: `3.0.16`.
@@ -198,29 +154,74 @@ Restart Cursor after installation.
 The extension auto-starts the proxy server and guides you through first-run setup
 (SSL certificates, account sync, network forwarding — all from the Command Palette).
 
-**Option B: CLI**
+### Install Option 3: From Source (All Platforms)
+
+> **Note:** Primary development and testing is done on macOS.
+> Linux and Windows support is implemented but not fully tested —
+> scripts may have edge-case bugs on those platforms. PRs welcome!
+
+```bash
+git clone https://github.com/funny-vibes/agent-vibes.git
+cd agent-vibes
+npm install && npm run build
+npm link                          # makes `agent-vibes` available globally
+```
+
+Generate SSL certificates:
+
+```bash
+# Install mkcert first: https://github.com/FiloSottile/mkcert#installation
+mkcert -install
+agent-vibes cert
+```
 
 Cursor requires HTTPS interception — one-time setup:
 
 ```bash
-# 1. Add DNS redirect to hosts file
-agent-vibes forward hosts
-
-# 2. Enable port forwarding (uses TCP relay on macOS, iptables on Linux, netsh on Windows)
-agent-vibes forward on
+agent-vibes forward hosts        # Add DNS redirect to hosts file
+agent-vibes forward on           # Enable port forwarding
+agent-vibes                      # Start the proxy
+agent-vibes forward status       # Verify everything is working
 ```
 
-Then start the proxy:
+### Choose One Upstream Source
+
+Antigravity ([Antigravity IDE](https://antigravity.google) or [Antigravity Manager](https://github.com/lbjlaq/Antigravity-Manager)):
 
 ```bash
-agent-vibes
+agent-vibes sync --ide       # from Antigravity IDE
+agent-vibes sync --tools     # from Antigravity Manager
 ```
 
-Verify everything is working:
+Claude Code third-party config:
 
 ```bash
-agent-vibes forward status
+agent-vibes sync --claude
 ```
+
+Codex:
+
+```bash
+codex --login
+agent-vibes sync --codex
+```
+
+### Daily Use
+
+#### Claude Code CLI
+
+```bash
+agent-vibes                  # start proxy
+```
+
+In another terminal:
+
+```bash
+export ANTHROPIC_BASE_URL=https://localhost:8000
+claude
+```
+
+> **Tip:** Add `export ANTHROPIC_BASE_URL=https://localhost:8000` to your shell profile to make it persistent.
 
 ## Backend Configuration Reference
 
@@ -422,7 +423,6 @@ agent-vibes/
 └── scripts/
     ├── lib/                                   # Shared cross-platform utilities
     ├── accounts/                              # Account credential sync helpers
-    ├── diagnostics/                           # One-click issue report collector
     ├── proxy/                                 # Port forwarding (TCP relay/iptables/netsh)
     └── capture/                               # Traffic capture and dump inspection
 ```
@@ -484,8 +484,6 @@ Join the discussion and share your thoughts about Agent Vibes on [LINUX DO](http
 ## Contributing
 
 Found a bug or have an idea? Use our [issue templates](https://github.com/funny-vibes/agent-vibes/issues/new/choose) to report bugs or request features.
-
-> **Tip:** Run `agent-vibes issues` (or `npm run issues`) to auto-collect diagnostics — the report is copied to your clipboard, ready to paste into the bug report template.
 
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening PRs.
 
