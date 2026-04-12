@@ -259,9 +259,11 @@ jobs:
           echo "── Cursor extensions ──"
           ls -lh extensions/
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft)
+        id: create_release
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           name: Agent Vibes v${{ steps.version.outputs.version }} (Cursor ${{ steps.version.outputs.cursor_version }})
           files: |
             extensions/*.vsix
@@ -314,3 +316,8 @@ jobs:
             # Install
             cursor --install-extension agent-vibes-win32-x64-${{ steps.version.outputs.version }}.vsix --force
             ```
+
+      - name: Publish release (remove draft flag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false

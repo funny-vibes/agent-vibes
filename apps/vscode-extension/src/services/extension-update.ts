@@ -1,11 +1,10 @@
-import * as vscode from "vscode"
+import { createWriteStream, promises as fs } from "fs"
+import { IncomingMessage } from "http"
+import * as https from "https"
 import * as os from "os"
 import * as path from "path"
-import * as https from "https"
-import { IncomingMessage } from "http"
-import { createWriteStream } from "fs"
-import { promises as fs } from "fs"
 import { pipeline } from "stream/promises"
+import * as vscode from "vscode"
 import {
   DEFAULTS,
   EXTENSION_DISPLAY_NAME,
@@ -186,10 +185,9 @@ export class ExtensionUpdateService {
       return
     }
 
-    await this.context.globalState.update(LAST_CHECK_AT_KEY, now)
-
     try {
       await this.checkForUpdates({ userInitiated: false })
+      await this.context.globalState.update(LAST_CHECK_AT_KEY, Date.now())
     } catch (error) {
       logger.warn(
         `Extension update check failed: ${error instanceof Error ? error.message : String(error)}`
