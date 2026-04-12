@@ -128,6 +128,7 @@
     .overview-meta {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 10px;
       margin-top: 6px;
     }
@@ -767,6 +768,7 @@
       'claude-api': {
         label: 'Claude API', barCls: 'ch-bar-cl', beCls: 'be-cl', color: '#f87171',
         mode: 'form',
+        sync: [{ label: 'Sync Claude', cmd: 'agentVibes.syncClaude' }],
         fields: [
           { key: 'label', label: 'Label', type: 'text' },
           { key: 'baseUrl', label: 'Base URL', type: 'text', ph: 'https://api.anthropic.com' },
@@ -1096,7 +1098,8 @@
           '<span class="meta-pill-label">' + esc(item.label) + '</span>' +
           '<span class="meta-pill-value">' + esc(item.value) + '</span>' +
         '</div>';
-      }).join('');
+      }).join('') +
+        '<button class="btn btn-ghost" style="height:24px;padding:0 10px;font-size:var(--text-xs)" onclick="checkUpdatesBtn(this)">Check updates</button>';
 
       const isRunning = s.bridge === 'Running';
       const setup = s.setup || null;
@@ -1976,6 +1979,16 @@
     function rmAcct(ch, i) { vscode.postMessage({ type: 'removeAccount', channel: ch, index: i }); }
     function activateCodexCli(i) { vscode.postMessage({ type: 'activateCodexCli', index: i }); }
     function runCmd(cmd) { vscode.postMessage({ type: 'runCommand', command: cmd }); }
+    function checkUpdatesBtn(btn) {
+      if (btn.classList.contains('btn-loading')) return;
+      btn.classList.add('btn-loading');
+      btn.innerHTML = '<span class="btn-spinner"></span>Checking…';
+      runCmd('agentVibes.checkExtensionUpdates');
+      setTimeout(function() {
+        btn.classList.remove('btn-loading');
+        btn.innerHTML = 'Check updates';
+      }, 8000);
+    }
     function runCmdWithLoading(btn, cmd) {
       if (getPendingCommand()) return;
       beginPendingCommand(cmd);

@@ -11,7 +11,7 @@ import {
   getAgentVibesPgDataDir,
   getAgentVibesAccountsDir,
   ensureAgentVibesDirs,
-} from "./agent-vibes-paths"
+} from "../shared/agent-vibes-paths"
 import { resolveProtocolBridgePath } from "../shared/protocol-bridge-paths"
 
 const DB_FILENAME = "agent-vibes.db"

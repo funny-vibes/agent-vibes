@@ -1,0 +1,106 @@
+name: Bug Report
+description: Report a bug. Fill only what you know.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep it simple. Fill only the fields that help explain the bug.
+        You can also skip this form and open a blank issue instead.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly describe the bug.
+      placeholder: What is broken?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: Client
+      options:
+        - Cursor IDE
+        - Claude Code CLI
+        - Both
+        - Not sure
+    validations:
+      required: false
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Issue type
+      options:
+        - Installation / startup
+        - Forwarding / certificates
+        - Account configuration
+        - Cursor IDE request flow
+        - Claude Code CLI request flow
+        - Dashboard / logs / diagnostics
+        - Routing / model behavior
+        - Other / Not sure
+    validations:
+      required: false
+
+  - type: input
+    id: cursor_version
+    attributes:
+      label: Cursor version
+      placeholder: 3.0.16
+    validations:
+      required: false
+
+  - type: input
+    id: agent_vibes_version
+    attributes:
+      label: Agent Vibes version
+      placeholder: 0.1.10
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      placeholder: What should happen?
+    validations:
+      required: false
+
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual behavior
+      placeholder: What actually happens?
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / screenshots
+      description: Paste only logs, screenshots, or diagnostics that are directly relevant.
+      placeholder: Paste logs or diagnostics here
+      render: text
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste secrets, tokens, API keys, or private account data.

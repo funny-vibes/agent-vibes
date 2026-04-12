@@ -1,28 +1,27 @@
 import { Module } from "@nestjs/common"
-import { ClaudeApiModule } from "../../llm/claude-api/claude-api.module"
-import { HistoryModule } from "../../context/history.module"
-import { TokenizerModule } from "../../context/tokenizer.module"
-import { CodexModule } from "../../llm/codex/codex.module"
+import { AnthropicApiModule } from "../../llm/anthropic/anthropic-api.module"
+import { ContextModule } from "../../context/context.module"
+import { CodexModule } from "../../llm/openai/codex.module"
 import { GoogleModule } from "../../llm/google/google.module"
-import { ModelModule } from "../../llm/model.module"
-import { OpenaiCompatModule } from "../../llm/openai-compat/openai-compat.module"
+import { ModelModule } from "../../llm/shared/model.module"
+import { OpenaiCompatModule } from "../../llm/openai/openai-compat.module"
 import { MessagesController } from "./messages.controller"
 import { MessagesService } from "./messages.service"
+import { TokenizerService } from "./tokenizer.service"
 
 @Module({
   imports: [
-    ClaudeApiModule,
+    AnthropicApiModule,
     CodexModule,
     GoogleModule,
-    HistoryModule,
+    ContextModule,
     ModelModule,
     OpenaiCompatModule,
-    TokenizerModule,
   ],
   controllers: [MessagesController],
-  providers: [MessagesService],
+  providers: [MessagesService, TokenizerService],
   exports: [
-    ClaudeApiModule,
+    AnthropicApiModule,
     CodexModule,
     GoogleModule,
     MessagesService,

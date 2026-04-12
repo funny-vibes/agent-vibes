@@ -1,13 +1,13 @@
 /**
  * Context Module Exports
  *
- * Provides conversation history management, projection, compaction, and tokenization.
+ * Provides conversation history management, projection, and compaction.
  */
 
 // Types
 export * from "./types"
 
-// History services
+// Context services
 export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
 export { ToolResultCompactionService } from "./tool-result-compaction.service"
@@ -24,15 +24,11 @@ export { ContextSummaryService } from "./context-summary.service"
 export { ContextUsageLedgerService } from "./context-usage-ledger.service"
 export { normalizeToolProtocolMessages } from "./tool-protocol-normalizer"
 export type { ToolProtocolNormalizationResult } from "./tool-protocol-normalizer"
-export { enforceToolProtocol, assertIntegrity } from "./message-integrity-guard"
+export { enforceToolProtocol, assertIntegrity } from "./tool-protocol-integrity"
 export type {
   RepairResult,
   IntegrityViolation,
-} from "./message-integrity-guard"
-
-// Tokenizer service
-export { TokenizerService } from "./tokenizer.service"
+} from "./tool-protocol-integrity"
 
 // Modules
-export { HistoryModule } from "./history.module"
-export { TokenizerModule } from "./tokenizer.module"
+export { ContextModule } from "./context.module"

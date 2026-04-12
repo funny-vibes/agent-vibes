@@ -1,29 +1,29 @@
 import { Module } from "@nestjs/common"
-import { HistoryModule } from "../../context/history.module"
+import { ContextModule } from "../../context/context.module"
 import { AnthropicModule } from "../anthropic/anthropic.module"
-import { CodexModule } from "../../llm/codex/codex.module"
+import { CodexModule } from "../../llm/openai/codex.module"
 import { GoogleModule } from "../../llm/google/google.module"
-import { ModelModule } from "../../llm/model.module"
-import { OpenaiCompatModule } from "../../llm/openai-compat/openai-compat.module"
-import { AiserverMockController } from "./aiserver-mock.controller"
+import { ModelModule } from "../../llm/shared/model.module"
+import { OpenaiCompatModule } from "../../llm/openai/openai-compat.module"
 import { AntigravityIdeSyncService } from "./antigravity-ide-sync.service"
-import { AuthController } from "./auth.controller"
-import { ChatSessionManager } from "./chat-session.service"
-import { ClientSideToolV2ExecutorService } from "./client-side-tool-v2-executor.service"
-import { CursorAdapterController } from "./cursor-adapter.controller"
 import { CursorAuthService } from "./cursor-auth.service"
-import { CursorConnectStreamService } from "./cursor-connect-stream.service"
-import { CursorGrpcService } from "./cursor-grpc.service"
+import { AiserverMockController } from "./controllers/aiserver-mock.controller"
+import { AuthController } from "./controllers/auth.controller"
+import { CursorAdapterController } from "./controllers/cursor-adapter.controller"
+import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
-import { KnowledgeBaseService } from "./knowledge-base.service"
+import { CursorGrpcService } from "./cursor-grpc.service"
+import { ChatSessionManager } from "./session/chat-session.service"
+import { CursorConnectStreamService } from "./cursor-connect-stream.service"
+import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
 
 @Module({
   imports: [
     AnthropicModule,
     CodexModule,
     GoogleModule,
-    HistoryModule,
+    ContextModule,
     ModelModule,
     OpenaiCompatModule,
   ],

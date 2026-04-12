@@ -24,8 +24,8 @@ import {
   resolveCloudCodeModel,
   resolveModelThinkingCapability,
   type CursorDisplayModel,
-} from "../../llm/model-registry"
-import { parseModelRequest } from "../../llm/model-request"
+} from "../../llm/shared/model-registry"
+import { parseModelRequest } from "../../llm/shared/model-request"
 
 export const CURSOR_REASONING_PARAMETER_ID = "thinking"
 export const CURSOR_LEGACY_REASONING_PARAMETER_ID = "reasoning_effort"

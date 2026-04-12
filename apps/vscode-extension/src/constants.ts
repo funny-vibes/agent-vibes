@@ -21,16 +21,14 @@ export const CMD = {
   SYNC_ANTIGRAVITY_TOOLS: "agentVibes.syncAntigravityTools",
   SYNC_CLAUDE: "agentVibes.syncClaude",
   SYNC_CODEX: "agentVibes.syncCodex",
+  OPEN_OPENAI_COMPAT_ACCOUNTS: "agentVibes.openOpenAICompatAccounts",
+  OPEN_CLAUDE_API_ACCOUNTS: "agentVibes.openClaudeApiAccounts",
   GENERATE_CERT: "agentVibes.generateCert",
   ENABLE_FORWARDING: "agentVibes.enableForwarding",
   DISABLE_FORWARDING: "agentVibes.disableForwarding",
   FORWARDING_STATUS: "agentVibes.forwardingStatus",
-  COLLECT_DIAGNOSTICS: "agentVibes.collectDiagnostics",
   CHECK_UPDATES: "agentVibes.checkExtensionUpdates",
   OPEN_CONFIG: "agentVibes.openConfig",
-  PATCH_CURSOR: "agentVibes.patchCursor",
-  RESTORE_CURSOR: "agentVibes.restoreCursor",
-  REFRESH_DASHBOARD: "agentVibes.refreshDashboard",
   OPEN_DASHBOARD: "agentVibes.openDashboard",
 } as const
 

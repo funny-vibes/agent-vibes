@@ -10,7 +10,7 @@ import { TokenCounterService } from "./token-counter.service"
 import {
   enforceToolProtocol,
   type EnforceToolProtocolOptions,
-} from "./message-integrity-guard"
+} from "./tool-protocol-integrity"
 
 /**
  * Result of sanitizeMessages operation
@@ -494,7 +494,11 @@ export class ToolIntegrityService {
   ): number {
     const clampedStart = Math.max(0, Math.min(startIndex, messages.length))
 
-    for (let candidate = clampedStart; candidate <= messages.length; candidate++) {
+    for (
+      let candidate = clampedStart;
+      candidate <= messages.length;
+      candidate++
+    ) {
       if (
         this.retainedMessagesHaveValidToolResults(
           messages.slice(candidate),
@@ -558,7 +562,7 @@ export class ToolIntegrityService {
       }
     }
 
-    // Delegate all repair logic to the unified MessageIntegrityGuard
+    // Delegate all repair logic to the unified tool protocol integrity helper
     const guardResult = enforceToolProtocol(
       messages as Array<
         UnifiedMessage & { role: "user" | "assistant"; content: unknown }

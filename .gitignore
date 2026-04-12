@@ -25,11 +25,6 @@ apps/protocol-bridge/data/accounts.json
 apps/protocol-bridge/data/accounts.local.json
 apps/protocol-bridge/data/*-accounts.json
 apps/protocol-bridge/data/*-account-state.json
-.runtime/
-data/accounts.json
-data/accounts.local.json
-data/*-accounts.json
-data/*-account-state.json
 apps/protocol-bridge/proto/
 scripts/cursor/
 backups/

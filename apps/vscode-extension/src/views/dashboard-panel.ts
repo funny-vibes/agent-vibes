@@ -1537,21 +1537,20 @@ export class DashboardPanel {
       const result = await flow.waitForResult()
 
       // Save to antigravity-accounts.json
-      const filePath = this.config.antigravityAccountsPath
       const account: Record<string, string> = {
         email: result.email,
         accessToken: result.accessToken,
         refreshToken: result.refreshToken,
         expiresAt: result.expiresAt,
       }
-      this.config.addAccount(filePath, account)
+      this.upsertAntigravityAccount(account)
 
       // Notify frontend: success
       this.panel.webview.postMessage({
         type: "oauthStatus",
         data: {
           status: "success",
-          message: `Account added: ${result.email}`,
+          message: `Account saved: ${result.email}`,
         },
       })
 
@@ -1638,6 +1637,33 @@ export class DashboardPanel {
         data: { status: "error", message: errorMsg },
       })
     }
+  }
+
+  private upsertAntigravityAccount(account: Record<string, unknown>): void {
+    const filePath = this.config.antigravityAccountsPath
+    const accounts = this.config.readAccounts(filePath)
+    const email = String(account.email || "")
+      .trim()
+      .toLowerCase()
+
+    const findIndex = accounts.findIndex((candidate) => {
+      const rowEmail = String(candidate.email || "")
+        .trim()
+        .toLowerCase()
+      return email.length > 0 && rowEmail === email
+    })
+
+    const nextAccounts = [...accounts]
+    if (findIndex >= 0) {
+      nextAccounts[findIndex] = {
+        ...nextAccounts[findIndex],
+        ...account,
+      }
+    } else {
+      nextAccounts.push(account)
+    }
+
+    this.config.writeAccounts(filePath, nextAccounts)
   }
 
   private upsertCodexAccount(account: Record<string, unknown>): void {

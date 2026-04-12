@@ -13,12 +13,12 @@ if (process.platform === "win32") {
   // PowerShell equivalent of build-sea.sh
   const script = [
     `Set-Location "${bridgeDir}"`,
-    "node esbuild.sea.js",
+    "node sea/esbuild.js",
     '$srcMigrations = "src\\persistence\\migrations"',
     '$dstMigrations = "dist\\persistence\\migrations"',
     "New-Item -ItemType Directory -Force -Path $dstMigrations | Out-Null",
     'Copy-Item "$srcMigrations\\*.sql" $dstMigrations -Force',
-    "node scripts/generate-sea-config.mjs",
+    "node sea/generate-config.mjs",
     "node --experimental-sea-config dist/sea-config.generated.json",
     "$nodeBin = (Get-Command node).Source",
     '$binaryName = "agent-vibes-bridge-win32-x64.exe"',
@@ -33,12 +33,8 @@ if (process.platform === "win32") {
     cwd: bridgeDir,
   })
 } else {
-  execFileSync(
-    "bash",
-    [path.join(bridgeDir, "scripts", "build-sea.sh"), "--clean"],
-    {
-      stdio: "inherit",
-      cwd: bridgeDir,
-    }
-  )
+  execFileSync("bash", [path.join(bridgeDir, "sea", "build.sh"), "--clean"], {
+    stdio: "inherit",
+    cwd: bridgeDir,
+  })
 }

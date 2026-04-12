@@ -1,5 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common"
-import { createSpanContext, generateBlobId } from "./agent-helpers"
+import { createSpanContext, generateBlobId } from "./tools/agent-helpers"
 
 export interface KvBlobData {
   blobId: string

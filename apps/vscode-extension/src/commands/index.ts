@@ -10,7 +10,6 @@ import { BridgeManager } from "../services/bridge-manager"
 import { CertManager } from "../services/cert-manager"
 import { CertTrustService } from "../services/cert-trust"
 import { ConfigManager } from "../services/config-manager"
-import { CursorPatchService } from "../services/cursor-patch"
 import { ExtensionUpdateService } from "../services/extension-update"
 import { NetworkManager } from "../services/network-manager"
 import { logger } from "../utils/logger"
@@ -87,6 +86,19 @@ function mergeAntigravityAccountWithExisting(
         }
       : {}),
   }
+}
+
+async function openJsonFile(filePath: string): Promise<void> {
+  const fs = await import("fs")
+  const dirPath = path.dirname(filePath)
+
+  fs.mkdirSync(dirPath, { recursive: true })
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, JSON.stringify({ accounts: [] }, null, 2) + "\n")
+  }
+
+  const document = await vscode.workspace.openTextDocument(filePath)
+  await vscode.window.showTextDocument(document)
 }
 
 /**
@@ -333,6 +345,35 @@ export function registerCommands(
     })
   )
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.OPEN_OPENAI_COMPAT_ACCOUNTS,
+      async () => {
+        try {
+          await openJsonFile(config.openaiCompatAccountsPath)
+        } catch (err) {
+          logger.error("Failed to open OpenAI-compatible accounts file", err)
+          vscode.window.showErrorMessage(
+            `Open OpenAI-compatible accounts file failed: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.OPEN_CLAUDE_API_ACCOUNTS, async () => {
+      try {
+        await openJsonFile(config.claudeApiAccountsPath)
+      } catch (err) {
+        logger.error("Failed to open Claude API accounts file", err)
+        vscode.window.showErrorMessage(
+          `Open Claude API accounts file failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+    })
+  )
+
   // ── SSL certificates ──────────────────────────────────────────────
 
   context.subscriptions.push(
@@ -434,14 +475,6 @@ export function registerCommands(
   )
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(CMD.COLLECT_DIAGNOSTICS, () => {
-      vscode.window.showInformationMessage(
-        "Diagnostics collection — coming soon"
-      )
-    })
-  )
-
-  context.subscriptions.push(
     vscode.commands.registerCommand(CMD.CHECK_UPDATES, async () => {
       try {
         await updater.checkForUpdates({ userInitiated: true })
@@ -460,76 +493,6 @@ export function registerCommands(
         "workbench.action.openSettings",
         "agentVibes"
       )
-    })
-  )
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand(CMD.PATCH_CURSOR, async () => {
-      const patcher = new CursorPatchService(logger)
-      const status = patcher.getStatus()
-
-      if (!status.fileExists) {
-        vscode.window.showErrorMessage(
-          "Cursor workbench file not found. Is Cursor installed?"
-        )
-        return
-      }
-
-      if (status.allApplied) {
-        vscode.window.showInformationMessage(
-          "All transport patches are already applied."
-        )
-        return
-      }
-
-      const confirm = await vscode.window.showWarningMessage(
-        "This will patch Cursor's workbench to enable traffic capture. " +
-          "A backup will be created automatically.",
-        "Apply Patches",
-        "Cancel"
-      )
-
-      if (confirm !== "Apply Patches") return
-
-      const result = patcher.applyPatches()
-      if (result.success) {
-        vscode.window.showInformationMessage(
-          `Applied ${result.applied} transport patch(es). Restart Cursor to activate.`
-        )
-      } else {
-        vscode.window.showErrorMessage(
-          `Patching issues: ${result.errors.join("; ")}`
-        )
-      }
-    })
-  )
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand(CMD.RESTORE_CURSOR, async () => {
-      const patcher = new CursorPatchService(logger)
-      const status = patcher.getStatus()
-
-      if (!status.backupExists) {
-        vscode.window.showWarningMessage("No backup found. Nothing to restore.")
-        return
-      }
-
-      const confirm = await vscode.window.showWarningMessage(
-        "This will restore Cursor's original workbench file from backup.",
-        "Restore",
-        "Cancel"
-      )
-
-      if (confirm !== "Restore") return
-
-      const restored = patcher.restore()
-      if (restored) {
-        vscode.window.showInformationMessage(
-          "Cursor workbench restored. Restart Cursor to apply."
-        )
-      } else {
-        vscode.window.showErrorMessage("Failed to restore — check output logs.")
-      }
     })
   )
 }

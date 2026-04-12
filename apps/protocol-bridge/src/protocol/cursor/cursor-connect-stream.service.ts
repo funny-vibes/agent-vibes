@@ -3,105 +3,105 @@ import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
 import * as path from "path"
 import {
-    type ContextAttachmentSnapshot,
-    type ContextInvestigationMemoryEntry,
-    ContextManagerService,
-    type ContextUsageSnapshot,
-    extractText,
-    type LooseMessageContent,
-    normalizeToolProtocolMessages,
-    TokenCounterService,
-    ToolIntegrityService,
-    UnifiedMessage,
+  type ContextAttachmentSnapshot,
+  type ContextInvestigationMemoryEntry,
+  ContextManagerService,
+  type ContextUsageSnapshot,
+  extractText,
+  type LooseMessageContent,
+  normalizeToolProtocolMessages,
+  TokenCounterService,
+  ToolIntegrityService,
+  UnifiedMessage,
 } from "../../context"
 import {
-    type BackgroundShellSpawnResult,
-    type CursorRule,
-    CursorRuleSource,
-    type DeleteResult,
-    type DiagnosticsResult,
-    ExecClientMessageSchema,
-    type GrepResult,
-    type LsDirectoryTreeNode,
-    type LsResult,
-    type ReadResult,
-    type ShellResult,
-    ShellStream,
-    type WriteResult,
+  type BackgroundShellSpawnResult,
+  type CursorRule,
+  CursorRuleSource,
+  type DeleteResult,
+  type DiagnosticsResult,
+  ExecClientMessageSchema,
+  type GrepResult,
+  type LsDirectoryTreeNode,
+  type LsResult,
+  type ReadResult,
+  type ShellResult,
+  ShellStream,
+  type WriteResult,
 } from "../../gen/agent/v1_pb"
 import {
-    ClaudeApiService,
-    DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
-} from "../../llm/claude-api/claude-api.service"
-import { CodexService } from "../../llm/codex/codex.service"
+  AnthropicApiService,
+  DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
+} from "../../llm/anthropic/anthropic-api.service"
+import { CodexService } from "../../llm/openai/codex.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
-    BackendType,
-    ModelRouteResult,
-    ModelRouterService,
-} from "../../llm/model-router.service"
-import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
+  BackendType,
+  ModelRouteResult,
+  ModelRouterService,
+} from "../../llm/shared/model-router.service"
+import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
 import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
 import {
-    applyThinkingIntentToDto,
-    buildThinkingIntentFromCursorRequest,
-    normalizeRequestedThinkingEffort,
-    type RequestedThinkingEffort,
-} from "../../llm/thinking-intent"
-import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/tool-continuation-policy"
+  applyThinkingIntentToDto,
+  buildThinkingIntentFromCursorRequest,
+  normalizeRequestedThinkingEffort,
+  type RequestedThinkingEffort,
+} from "../../llm/shared/thinking-intent"
+import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/shared/tool-continuation-policy"
 import {
-    canonicalizeOfficialAntigravityToolInvocation as canonicalizeOfficialAntigravityToolInvocationFromContract,
-    extractOfficialAntigravityArtifactMetadata as extractOfficialAntigravityArtifactMetadataFromContract,
-    type OfficialAntigravityArtifactMetadata,
-    type OfficialAntigravityCanonicalToolInvocation,
+  canonicalizeOfficialAntigravityToolInvocation as canonicalizeOfficialAntigravityToolInvocationFromContract,
+  extractOfficialAntigravityArtifactMetadata as extractOfficialAntigravityArtifactMetadataFromContract,
+  type OfficialAntigravityArtifactMetadata,
+  type OfficialAntigravityCanonicalToolInvocation,
 } from "../../shared/official-antigravity-tools"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
-import { generateTraceId } from "./agent-helpers"
-import { BackendStreamAbortRegistry } from "./backend-stream-abort-registry"
-import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./bugfix-result-normalizer"
+import { generateTraceId } from "./tools/agent-helpers"
+import { BackendStreamAbortRegistry } from "./session/backend-stream-abort-registry"
+import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import {
-    ChatSession,
-    ChatSessionManager,
-    EditFailureContext,
-    InterruptedToolCallInfo,
-    PendingToolCall,
-    SessionActiveToolBatch,
-    SessionBackgroundCommand,
-    SessionRestartRecovery,
-    SessionTodoItem,
-    SessionTodoStatus,
-    SessionTopLevelAgentTurnState,
-    SubAgentContext,
-} from "./chat-session.service"
-import { ClientSideToolV2ExecutorService } from "./client-side-tool-v2-executor.service"
+  ChatSession,
+  ChatSessionManager,
+  EditFailureContext,
+  InterruptedToolCallInfo,
+  PendingToolCall,
+  SessionActiveToolBatch,
+  SessionBackgroundCommand,
+  SessionRestartRecovery,
+  SessionTodoItem,
+  SessionTodoStatus,
+  SessionTopLevelAgentTurnState,
+  SubAgentContext,
+} from "./session/chat-session.service"
+import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import {
-    type AttachedImage,
-    cursorRequestParser,
-    ParsedCursorRequest,
-    ParsedToolResult,
-} from "./cursor-request-parser"
+  type AttachedImage,
+  cursorRequestParser,
+  ParsedCursorRequest,
+  ParsedToolResult,
+} from "./tools/cursor-request-parser"
 import {
-    buildToolsForApi,
-    resolveCursorToolDefinitionKey,
-    type ToolDefinition,
-} from "./cursor-tool-mapper"
+  buildToolsForApi,
+  resolveCursorToolDefinitionKey,
+  type ToolDefinition,
+} from "./tools/cursor-tool-mapper"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import {
-    buildMcpDispatchInput,
-    normalizeMcpToolIdentifier,
-    resolveMcpCallFields as resolveMcpCallFieldsFromContract,
-    resolveMcpToolDefinition,
-} from "./mcp-call-contract"
+  buildMcpDispatchInput,
+  normalizeMcpToolIdentifier,
+  resolveMcpCallFields as resolveMcpCallFieldsFromContract,
+  resolveMcpToolDefinition,
+} from "./tools/mcp-call-contract"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import {
-    buildNumberedLineEntries,
-    extractEditFailureSelection,
-    findToolResultAppendPlan,
-    formatLineNumberedSnippet,
-    messageContainsToolResult,
-} from "./tool-protocol-helpers"
+  buildNumberedLineEntries,
+  extractEditFailureSelection,
+  findToolResultAppendPlan,
+  formatLineNumberedSnippet,
+  messageContainsToolResult,
+} from "./tools/tool-protocol-helpers"
 
 /**
  * SSE Event content block structure (content_block_start)
@@ -668,7 +668,7 @@ export class CursorConnectStreamService {
     private readonly grpcService: CursorGrpcService,
     private readonly googleService: GoogleService,
     private readonly codexService: CodexService,
-    private readonly claudeApiService: ClaudeApiService,
+    private readonly anthropicApiService: AnthropicApiService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly modelRouter: ModelRouterService,
     private readonly kvStorageService: KvStorageService,
@@ -1198,7 +1198,7 @@ export class CursorConnectStreamService {
         this.logger.log(
           `Routing to Claude API backend for model: ${route.model}`
         )
-        for await (const event of this.claudeApiService.sendClaudeMessageStream(
+        for await (const event of this.anthropicApiService.sendClaudeMessageStream(
           routedDto,
           {},
           options?.abortSignal
@@ -1488,7 +1488,7 @@ export class CursorConnectStreamService {
     }
     if (backend === "claude-api" && model) {
       return (
-        this.claudeApiService.getConfiguredMaxContextTokens(model) ??
+        this.anthropicApiService.getConfiguredMaxContextTokens(model) ??
         DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS
       )
     }
@@ -3338,7 +3338,7 @@ ${raw}
           this.appendAssistantTextBlock(assistantBlocks, delta.text)
 
           if (emitTokenDeltas) {
-            const { estimateTokenCount } = await import("./agent-helpers")
+            const { estimateTokenCount } = await import("./tools/agent-helpers")
             const outputTokens = estimateTokenCount(delta.text)
             if (outputTokens > 0) {
               yield this.grpcService.createTokenDeltaResponse(0, outputTokens)
@@ -3703,7 +3703,6 @@ ${raw}
       definitionKey === "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2"
     )
   }
-
 
   private trimSampleByChars(text: string): string {
     if (text.length <= this.LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS) return text
@@ -11471,7 +11470,6 @@ ${raw}
     if (preparedTools.length === 0) {
       return "completed_inline"
     }
-
 
     for (const preparedTool of preparedTools) {
       yield* this.registerPreparedToolInvocation(

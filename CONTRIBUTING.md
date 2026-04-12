@@ -49,12 +49,12 @@ This repo uses Conventional Commits:
 
 ## Secret Handling
 
-Never commit real credentials, tokens, certificates, or local account files.
+Never commit real credentials, tokens, certificates, local account files, or machine-specific runtime data.
 
-These must stay local:
+Keep these local:
 
-- `.env`, `.env.local`
-- `apps/protocol-bridge/.env`, `apps/protocol-bridge/.env.local`
-- `apps/protocol-bridge/data/accounts.json`
-- `apps/protocol-bridge/certs/*`
-- `~/.protocol-bridge/*`
+- user-home runtime data under `~/.agent-vibes/` (for example `certs/`, `data/*-accounts.json`, `runtime/`, `logs/`, `config.json`)
+- local env files such as `.env*` and `apps/protocol-bridge/.env*`
+- repo-local debug-only cert or account files such as `apps/protocol-bridge/certs/*` and `apps/protocol-bridge/data/*-accounts.json`
+
+If you need to share configuration examples, use sanitized placeholders instead of real values.

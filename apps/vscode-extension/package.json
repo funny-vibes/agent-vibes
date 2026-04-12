@@ -73,22 +73,15 @@
   "contributes": {
     "commands": [
       {
-        "command": "agentVibes.startServer",
-        "title": "Start Server",
+        "command": "agentVibes.openDashboard",
+        "title": "Open Dashboard",
         "category": "Agent Vibes",
-        "icon": "$(play)"
+        "icon": "$(dashboard)"
       },
       {
-        "command": "agentVibes.stopServer",
-        "title": "Stop Server",
-        "category": "Agent Vibes",
-        "icon": "$(debug-stop)"
-      },
-      {
-        "command": "agentVibes.restartServer",
-        "title": "Restart Server",
-        "category": "Agent Vibes",
-        "icon": "$(debug-restart)"
+        "command": "agentVibes.generateCert",
+        "title": "Generate SSL Certificates",
+        "category": "Agent Vibes"
       },
       {
         "command": "agentVibes.syncAntigravityIDE",
@@ -111,9 +104,20 @@
         "category": "Agent Vibes"
       },
       {
-        "command": "agentVibes.generateCert",
-        "title": "Generate SSL Certificates",
+        "command": "agentVibes.openOpenAICompatAccounts",
+        "title": "Open OpenAI-Compatible Accounts JSON",
         "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.openClaudeApiAccounts",
+        "title": "Open Claude API Accounts JSON",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.startServer",
+        "title": "Start Server",
+        "category": "Agent Vibes",
+        "icon": "$(play)"
       },
       {
         "command": "agentVibes.enableForwarding",
@@ -131,15 +135,10 @@
         "category": "Agent Vibes"
       },
       {
-        "command": "agentVibes.openDashboard",
-        "title": "Open Dashboard",
+        "command": "agentVibes.openConfig",
+        "title": "Edit Configuration",
         "category": "Agent Vibes",
-        "icon": "$(dashboard)"
-      },
-      {
-        "command": "agentVibes.collectDiagnostics",
-        "title": "Collect Diagnostics",
-        "category": "Agent Vibes"
+        "icon": "$(gear)"
       },
       {
         "command": "agentVibes.checkExtensionUpdates",
@@ -148,26 +147,16 @@
         "icon": "$(cloud-download)"
       },
       {
-        "command": "agentVibes.openConfig",
-        "title": "Edit Configuration",
+        "command": "agentVibes.stopServer",
+        "title": "Stop Server",
         "category": "Agent Vibes",
-        "icon": "$(gear)"
+        "icon": "$(debug-stop)"
       },
       {
-        "command": "agentVibes.patchCursor",
-        "title": "Apply Cursor Patch",
-        "category": "Agent Vibes"
-      },
-      {
-        "command": "agentVibes.restoreCursor",
-        "title": "Restore Cursor Original",
-        "category": "Agent Vibes"
-      },
-      {
-        "command": "agentVibes.refreshDashboard",
-        "title": "Refresh Dashboard",
+        "command": "agentVibes.restartServer",
+        "title": "Restart Server",
         "category": "Agent Vibes",
-        "icon": "$(refresh)"
+        "icon": "$(debug-restart)"
       }
     ],
     "configuration": {

@@ -1,15 +1,15 @@
 import { Module } from "@nestjs/common"
 import { ConfigModule } from "@nestjs/config"
 import * as path from "path"
-import { NativeModule } from "./llm/native/native.module"
+import { GoogleModule } from "./llm/google/google.module"
 import { AnthropicModule } from "./protocol/anthropic/anthropic.module"
 import { CursorModule } from "./protocol/cursor/cursor.module"
-import { HistoryModule } from "./context/history.module"
+import { ContextModule } from "./context/context.module"
 import { HealthController } from "./health.controller"
-import { ModelModule } from "./llm/model.module"
+import { ModelModule } from "./llm/shared/model.module"
 import { PersistenceModule } from "./persistence"
 import { validateEnv } from "./shared/env.validation"
-import { UsageStatsModule } from "./usage/usage-stats.module"
+import { UsageStatsModule } from "./usage"
 
 const ENV_FILE_CANDIDATES = [
   path.resolve(process.cwd(), "apps/protocol-bridge/.env.local"),
@@ -28,11 +28,11 @@ const ENV_FILE_CANDIDATES = [
       validate: validateEnv,
     }),
     PersistenceModule,
+    GoogleModule,
     AnthropicModule,
     CursorModule,
-    HistoryModule,
+    ContextModule,
     ModelModule,
-    NativeModule,
     UsageStatsModule,
   ],
   controllers: [HealthController],

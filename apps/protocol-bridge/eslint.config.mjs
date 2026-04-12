@@ -5,13 +5,7 @@ import tseslint from "typescript-eslint"
 
 export default tseslint.config(
   {
-    ignores: [
-      "eslint.config.mjs",
-      "dist/**",
-      "src/gen/**",
-      "src/llm/native/worker.js",
-      "src/sea/**",
-    ],
+    ignores: ["eslint.config.mjs", "dist/**", "src/gen/**", "sea/**"],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
@@ -52,7 +46,7 @@ export default tseslint.config(
     files: [
       "src/protocol/cursor/cursor-connect-stream.service.ts",
       "src/protocol/cursor/cursor-grpc.service.ts",
-      "src/protocol/cursor/cursor-request-parser.ts",
+      "src/protocol/cursor/tools/cursor-request-parser.ts",
     ],
     rules: {
       "@typescript-eslint/no-unsafe-call": "off",
@@ -76,7 +70,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["src/sea-entry.ts", "src/main.ts"],
+    files: ["sea/sea-entry.ts", "src/main.ts"],
     rules: {
       "@typescript-eslint/no-require-imports": "off",
       "@typescript-eslint/no-unsafe-call": "off",

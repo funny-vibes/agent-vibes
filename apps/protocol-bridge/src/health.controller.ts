@@ -1,17 +1,17 @@
 import { Controller, Get, Post, Query } from "@nestjs/common"
 import { ApiOperation, ApiTags } from "@nestjs/swagger"
-import { ClaudeApiService } from "./llm/claude-api/claude-api.service"
-import { CodexService } from "./llm/codex/codex.service"
-import { ProcessPoolService } from "./llm/native/process-pool.service"
-import { OpenaiCompatService } from "./llm/openai-compat/openai-compat.service"
+import { AnthropicApiService } from "./llm/anthropic/anthropic-api.service"
+import { CodexService } from "./llm/openai/codex.service"
+import { ProcessPoolService } from "./llm/google/process-pool.service"
+import { OpenaiCompatService } from "./llm/openai/openai-compat.service"
 import type {
   BackendPoolEntryState,
   BackendPoolEntryStatus,
   BackendPoolStatus,
 } from "./llm/shared/backend-pool-status"
-import type { GoogleQuotaAccountSnapshot } from "./llm/native/process-pool.service"
-import { ChatSessionManager } from "./protocol/cursor/chat-session.service"
-import { UsageStatsService } from "./usage/usage-stats.service"
+import type { GoogleQuotaAccountSnapshot } from "./llm/google/process-pool.service"
+import { ChatSessionManager } from "./protocol/cursor/session/chat-session.service"
+import { UsageStatsService } from "./usage"
 
 type NativePoolStatusSummary = Pick<
   ReturnType<ProcessPoolService["getStatus"]>,
@@ -56,7 +56,7 @@ export class HealthController {
     private readonly processPool: ProcessPoolService,
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
-    private readonly claudeApiService: ClaudeApiService,
+    private readonly anthropicApiService: AnthropicApiService,
     private readonly usageStats: UsageStatsService,
     private readonly chatSessions: ChatSessionManager
   ) {}
@@ -92,7 +92,7 @@ export class HealthController {
           this.openaiCompatService.getPoolStatus()
         ),
         claudeApi: this.redactBackendPoolStatus(
-          this.claudeApiService.getPoolStatus()
+          this.anthropicApiService.getPoolStatus()
         ),
       },
     }

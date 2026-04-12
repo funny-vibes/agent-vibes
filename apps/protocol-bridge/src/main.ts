@@ -16,7 +16,7 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 import { AppModule } from "./app.module"
-import { ModelRouterService } from "./llm/model-router.service"
+import { ModelRouterService } from "./llm/shared/model-router.service"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
 

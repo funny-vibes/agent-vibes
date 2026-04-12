@@ -2,8 +2,8 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import {
   getDefaultModelIds,
   isSupportedModel as isRegistrySupported,
-} from "../model-registry"
-import { ProcessPoolService } from "../native/process-pool.service"
+} from "../shared/model-registry"
+import { ProcessPoolService } from "./process-pool.service"
 
 /**
  * Model info from Cloud Code API

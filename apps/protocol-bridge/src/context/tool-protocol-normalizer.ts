@@ -1,7 +1,7 @@
 import {
   enforceToolProtocol,
   type EnforceToolProtocolOptions,
-} from "./message-integrity-guard"
+} from "./tool-protocol-integrity"
 
 export interface ToolProtocolMessage {
   role: "user" | "assistant"
@@ -20,8 +20,8 @@ export interface ToolProtocolNormalizationResult<
 /**
  * Normalize tool protocol messages for strict backends (e.g. Cloud Code).
  *
- * This is a thin wrapper around MessageIntegrityGuard.enforceToolProtocol().
- * All actual repair logic lives in the Guard module.
+ * This is a thin wrapper around the shared tool protocol integrity helpers.
+ * All actual repair logic lives in the integrity module.
  *
  * - Removes orphan tool_result blocks (no matching tool_use)
  * - Injects synthetic tool_result for orphan tool_use blocks (no matching tool_result)

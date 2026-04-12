@@ -1,7 +1,7 @@
+import { execFileSync } from "child_process"
 import fs from "fs"
 import os from "os"
 import path from "path"
-import { execFileSync } from "child_process"
 import { fileURLToPath } from "url"
 
 const __filename = fileURLToPath(import.meta.url)
@@ -17,7 +17,7 @@ const sourceGoWorkerDir = path.join(
   protocolBridgeRoot,
   "src",
   "llm",
-  "native",
+  "google",
   "go-worker"
 )
 

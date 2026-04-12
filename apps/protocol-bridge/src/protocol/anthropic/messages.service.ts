@@ -5,13 +5,12 @@ import {
   TokenCounterService,
   UnifiedMessage,
 } from "../../context"
-import { TokenizerService } from "../../context/tokenizer.service"
-import { CodexService } from "../../llm/codex/codex.service"
-import type { CodexForwardHeaders } from "../../llm/codex/codex-header-utils"
+import { CodexService } from "../../llm/openai/codex.service"
+import type { CodexForwardHeaders } from "../../llm/openai/codex-header-utils"
 import {
-  ClaudeApiService,
+  AnthropicApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
-} from "../../llm/claude-api/claude-api.service"
+} from "../../llm/anthropic/anthropic-api.service"
 import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
@@ -19,16 +18,17 @@ import {
   getCodexPublicModelIds,
   getPublicModelMetadata,
   resolveCloudCodeModel,
-} from "../../llm/model-registry"
+} from "../../llm/shared/model-registry"
 import {
   ModelRouteResult,
   ModelRouterService,
-} from "../../llm/model-router.service"
-import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
+} from "../../llm/shared/model-router.service"
+import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
 import { BackendApiError } from "../../llm/shared/backend-errors"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { CountTokensDto } from "./dto/count-tokens.dto"
 import { CreateMessageDto } from "./dto/create-message.dto"
+import { TokenizerService } from "./tokenizer.service"
 
 /**
  * MessagesService - Routes requests to Google or Codex backend.
@@ -64,7 +64,7 @@ export class MessagesService implements OnModuleInit {
     private readonly contextManager: ContextManagerService,
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
-    private readonly claudeApiService: ClaudeApiService
+    private readonly anthropicApiService: AnthropicApiService
   ) {}
 
   private isGptBackendAvailable(): boolean {
@@ -89,7 +89,7 @@ export class MessagesService implements OnModuleInit {
       () => this.googleService.checkAvailability(),
       () => this.codexService.checkAvailability(),
       () => this.openaiCompatService.checkAvailability(),
-      () => this.claudeApiService.checkAvailability()
+      () => this.anthropicApiService.checkAvailability()
     )
     this.modelRouter.setGptAvailabilityProviders({
       codex: () => this.codexService.isAvailable(),
@@ -98,7 +98,7 @@ export class MessagesService implements OnModuleInit {
       openaiCompatSupportsModel: () => this.openaiCompatService.isAvailable(),
     })
     this.modelRouter.setClaudeAvailabilityProvider((model) =>
-      this.claudeApiService.supportsModel(model)
+      this.anthropicApiService.supportsModel(model)
     )
     this.logger.log("Backend availability tests completed")
   }
@@ -251,7 +251,7 @@ export class MessagesService implements OnModuleInit {
     }
     if (route.backend === "claude-api") {
       return (
-        this.claudeApiService.getConfiguredMaxContextTokens(route.model) ??
+        this.anthropicApiService.getConfiguredMaxContextTokens(route.model) ??
         DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS
       )
     }
@@ -431,7 +431,7 @@ export class MessagesService implements OnModuleInit {
 
       if (route.backend === "claude-api") {
         this.logger.log(`[ROUTE] Claude API backend | model: ${route.model}`)
-        return await this.claudeApiService.sendClaudeMessage(
+        return await this.anthropicApiService.sendClaudeMessage(
           routedDto,
           forwardHeaders
         )
@@ -537,7 +537,7 @@ export class MessagesService implements OnModuleInit {
         this.logger.log(
           `[ROUTE] Claude API backend | model: ${route.model} | stream: true`
         )
-        for await (const event of this.claudeApiService.sendClaudeMessageStream(
+        for await (const event of this.anthropicApiService.sendClaudeMessageStream(
           routedDto,
           forwardHeaders
         )) {
@@ -687,7 +687,7 @@ export class MessagesService implements OnModuleInit {
 
     // ── Upstream first ──
     try {
-      const upstreamResult = await this.claudeApiService.countTokensUpstream(
+      const upstreamResult = await this.anthropicApiService.countTokensUpstream(
         dto as unknown as Record<string, unknown>
       )
       if (upstreamResult) {
@@ -827,7 +827,7 @@ export class MessagesService implements OnModuleInit {
       }
 
       return (
-        this.claudeApiService.supportsModel(modelId) ||
+        this.anthropicApiService.supportsModel(modelId) ||
         canRouteViaGoogle(modelId)
       )
     }
@@ -871,7 +871,7 @@ export class MessagesService implements OnModuleInit {
     }
 
     // 2) Compatibility aliases we intentionally keep for existing clients
-    for (const model of this.claudeApiService.getPublicModels()) {
+    for (const model of this.anthropicApiService.getPublicModels()) {
       if (modelMap.has(model.id)) {
         continue
       }

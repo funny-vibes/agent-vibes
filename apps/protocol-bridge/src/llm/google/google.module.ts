@@ -1,20 +1,23 @@
 import { Module } from "@nestjs/common"
-import { HistoryModule } from "../../context/history.module"
-import { NativeModule } from "../native/native.module"
+import { ContextModule } from "../../context/context.module"
+import { UsageStatsModule } from "../../usage"
 import { GoogleModelCacheService } from "./google-model-cache.service"
 import { GoogleService } from "./google.service"
+import { ProcessPoolService } from "./process-pool.service"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
 
 @Module({
-  imports: [HistoryModule, NativeModule],
+  imports: [ContextModule, UsageStatsModule],
   providers: [
     GoogleModelCacheService,
     GoogleService,
+    ProcessPoolService,
     ToolThoughtSignatureService,
   ],
   exports: [
     GoogleService,
     GoogleModelCacheService,
+    ProcessPoolService,
     ToolThoughtSignatureService,
   ],
 })

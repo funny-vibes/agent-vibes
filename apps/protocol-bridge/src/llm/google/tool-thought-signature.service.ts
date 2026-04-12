@@ -1,7 +1,10 @@
 import { Injectable, Logger } from "@nestjs/common"
 import * as fs from "fs"
 import * as path from "path"
-import { getAgentVibesHome, ensureAgentVibesDirs } from "../../persistence"
+import {
+  getAgentVibesHome,
+  ensureAgentVibesDirs,
+} from "../../shared/agent-vibes-paths"
 
 /**
  * ToolThoughtSignatureStore - Cross-turn signature cache

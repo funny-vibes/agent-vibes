@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, Logger } from "@nestjs/common"
 import { DatabaseSync } from "node:sqlite"
 import * as fs from "fs"
 import * as path from "path"
-import type { NativeAccount } from "../../llm/native/process-pool.service"
+import type { NativeAccount } from "../../llm/google/process-pool.service"
 import {
   resolveAntigravityIdeStateDbPath,
   resolveDefaultAccountConfigPath,

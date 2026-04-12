@@ -344,9 +344,9 @@ import {
   type Value,
   ValueSchema,
 } from "../../gen/google/protobuf/value_pb"
-import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./bugfix-result-normalizer"
-import { resolveCursorToolDefinitionKey } from "./cursor-tool-mapper"
-import { resolveMcpCallFields as resolveMcpCallFieldsFromContract } from "./mcp-call-contract"
+import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
+import { resolveCursorToolDefinitionKey } from "./tools/cursor-tool-mapper"
+import { resolveMcpCallFields as resolveMcpCallFieldsFromContract } from "./tools/mcp-call-contract"
 
 /**
  * Safely convert unknown value to string

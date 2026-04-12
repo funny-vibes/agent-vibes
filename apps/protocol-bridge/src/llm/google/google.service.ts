@@ -16,15 +16,15 @@ import {
   DEFAULT_CLAUDE_MODEL,
   doesModelSupportThinking,
   resolveCloudCodeModel,
-} from "../model-registry"
+} from "../shared/model-registry"
 import {
   ProcessPoolService,
   WorkerPoolCooldownError,
-} from "../native/process-pool.service"
+} from "./process-pool.service"
 import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import { BackendApiError } from "../shared/backend-errors"
-import { resolveThinkingIntentFromDto } from "../thinking-intent"
-import { findPendingToolUseIdsInMessages } from "../tool-continuation-policy"
+import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
+import { findPendingToolUseIdsInMessages } from "../shared/tool-continuation-policy"
 import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
 import { GoogleModelCacheService } from "./google-model-cache.service"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"

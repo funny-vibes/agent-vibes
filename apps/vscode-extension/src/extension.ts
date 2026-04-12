@@ -1,14 +1,14 @@
 import * as vscode from "vscode"
-import { logger } from "./utils/logger"
-import { ConfigManager } from "./services/config-manager"
-import { BridgeManager } from "./services/bridge-manager"
-import { NetworkManager } from "./services/network-manager"
-import { CertManager } from "./services/cert-manager"
-import { StatusIndicator } from "./views/status-indicator"
 import { registerCommands } from "./commands"
-import { executePrivileged } from "./utils/terminal"
 import { CMD, type ServerState } from "./constants"
+import { BridgeManager } from "./services/bridge-manager"
+import { CertManager } from "./services/cert-manager"
+import { ConfigManager } from "./services/config-manager"
 import { ExtensionUpdateService } from "./services/extension-update"
+import { NetworkManager } from "./services/network-manager"
+import { logger } from "./utils/logger"
+import { executePrivileged } from "./utils/terminal"
+import { StatusIndicator } from "./views/status-indicator"
 
 // Singleton references for cleanup
 let bridge: BridgeManager | null = null
@@ -131,12 +131,35 @@ export async function activate(
         await vscode.commands.executeCommand(CMD.GENERATE_CERT)
       }
       if (!hasAnyAccounts) {
-        await vscode.commands.executeCommand(CMD.OPEN_CONFIG)
+        await vscode.commands.executeCommand(CMD.OPEN_DASHBOARD)
         vscode.window.showInformationMessage(
-          "Add your backend account files to the configured Agent Vibes account paths " +
-            "(for example, antigravity-accounts.json or codex-accounts.json)."
+          "Add at least one backend account from the Agent Vibes Dashboard."
         )
       }
+    }
+  }
+
+  const FORWARDING_RELOAD_PROMPTED_KEY = "agentVibes.forwardingReloadPrompted"
+
+  const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
+    if (!network) return
+    if (context.globalState.get<boolean>(FORWARDING_RELOAD_PROMPTED_KEY)) {
+      return
+    }
+
+    const becameActive = await network.waitForForwardingActive()
+    if (!becameActive) return
+
+    await context.globalState.update(FORWARDING_RELOAD_PROMPTED_KEY, true)
+
+    const action = await vscode.window.showInformationMessage(
+      "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",
+      "Quit Cursor Now",
+      "Later"
+    )
+
+    if (action === "Quit Cursor Now") {
+      await vscode.commands.executeCommand("workbench.action.quit")
     }
   }
 
@@ -163,6 +186,7 @@ export async function activate(
                 network!.getEnableCommand(),
                 "Agent Vibes — Enable Forwarding"
               )
+              void promptReloadAfterForwardingEnabled()
             }
           }
         }
