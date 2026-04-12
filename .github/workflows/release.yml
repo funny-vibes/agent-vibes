@@ -45,7 +45,7 @@ jobs:
       - name: Build SEA binary (Unix)
         if: runner.os != 'Windows'
         working-directory: apps/protocol-bridge
-        run: bash scripts/build-sea.sh --clean
+        run: bash sea/build.sh --clean
 
       - name: Build SEA binary (Windows)
         if: runner.os == 'Windows'
@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           # Windows SEA build (PowerShell equivalent of build-sea.sh)
-          node esbuild.sea.js
+          node sea/esbuild.js
 
           # Sync migration assets
           $srcMigrations = "src\persistence\migrations"
@@ -64,7 +64,7 @@ jobs:
           Write-Host "Synced $migrationCount migration(s)"
 
           # Generate SEA config from dist migrations
-          node scripts/generate-sea-config.mjs
+          node sea/generate-config.mjs
           node --experimental-sea-config dist/sea-config.generated.json
 
           $nodeBin = (Get-Command node).Source
@@ -145,7 +145,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: apps/protocol-bridge/src/llm/native/go-worker/go.mod
+          go-version-file: apps/protocol-bridge/src/llm/google/go-worker/go.mod
 
       - name: Install dependencies
         run: npm ci
