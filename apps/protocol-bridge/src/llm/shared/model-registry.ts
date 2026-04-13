@@ -311,26 +311,6 @@ const CLAUDE_MODELS: Record<
     displayName: "Claude 3.7 Sonnet (→ Sonnet 4.5)",
     isThinking: false,
   },
-  "claude-haiku-4-5": {
-    cloudCodeId: "claude-sonnet-4-5",
-    displayName: "Claude 4.5 Haiku (→ Sonnet 4.5)",
-    isThinking: false,
-  },
-  "claude-haiku-4.5": {
-    cloudCodeId: "claude-sonnet-4-5",
-    displayName: "Claude 4.5 Haiku (→ Sonnet 4.5)",
-    isThinking: false,
-  },
-  "claude-haiku-4-5-20251001": {
-    cloudCodeId: "claude-sonnet-4-5",
-    displayName: "Claude 4.5 Haiku (→ Sonnet 4.5)",
-    isThinking: false,
-  },
-  "claude-3-5-haiku-20241022": {
-    cloudCodeId: "claude-sonnet-4-5",
-    displayName: "Claude 3.5 Haiku (→ Sonnet 4.5)",
-    isThinking: false,
-  },
 }
 
 // ---------------------------------------------------------------------------
@@ -578,11 +558,6 @@ export const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5"
 export const DEFAULT_CODEX_MODEL = "gpt-5-codex-mini"
 
 const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
-  "claude-haiku-4-5-20251001": {
-    createdAt: 1759276800,
-    ownedBy: "anthropic",
-    displayName: "Claude 4.5 Haiku",
-  },
   "claude-sonnet-4-5-20250929": {
     createdAt: 1759104000,
     ownedBy: "anthropic",
@@ -803,7 +778,14 @@ export function resolveModelThinkingCapability(
   }
 
   if (resolved?.isThinking) {
-    return createLevelThinkingCapability(["low", "medium", "high"])
+    // 只有 GPT / Codex 这类模型在缺少显式 thinking metadata 时，
+    // 才回退为 level-based reasoning capability。
+    // Claude / Gemini 的 isThinking 更接近布尔 thinking toggle，
+    // 不能错误投影成 low / medium / high effort。
+    if (resolved.family === "gpt") {
+      return createLevelThinkingCapability(["low", "medium", "high"])
+    }
+    return null
   }
 
   return null
@@ -1066,7 +1048,7 @@ const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
   "gpt-5.2",
 ])
 
-const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   {
     name: "gpt-5.4",
     displayName: "GPT-5.4",
@@ -1219,18 +1201,26 @@ export function doesModelIdRequireExplicitThinkingSupport(
 }
 
 export function canPublicClaudeModelUseGoogle(modelId: string): boolean {
-  const resolved = resolveCloudCodeModel(modelId)
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
+  const resolved = resolveCloudCodeModel(normalized)
   if (!resolved || resolved.family !== "claude") {
     return false
   }
 
+  // Google Cloud Code 侧当前没有 Haiku 产品线，
+  // registry 中的 Haiku -> Sonnet 映射不能被当成 Google 可原生承载的证据。
+  if (normalized.includes("haiku")) {
+    return false
+  }
+
   // Opus models always route through Google (only thinking variant exists)
-  if (isOpusModel(modelId)) {
+  if (isOpusModel(normalized)) {
     return true
   }
 
   return (
-    !!resolveModelThinkingCapability(modelId) ||
+    normalized.includes("sonnet") ||
+    !!resolveModelThinkingCapability(normalized) ||
     !resolved.cloudCodeId.includes("thinking")
   )
 }

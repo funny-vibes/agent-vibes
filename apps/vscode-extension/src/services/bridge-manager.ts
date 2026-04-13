@@ -17,6 +17,7 @@ const PREVIOUS_LOG_FILE = path.join(
   os.tmpdir(),
   "agent-vibes-bridge.previous.log"
 )
+const STARTUP_HEALTH_TIMEOUT_MS = 45000
 
 /**
  * Manages the Protocol Bridge process lifecycle (start / stop / restart).
@@ -124,6 +125,10 @@ export class BridgeManager extends EventEmitter {
         env.ANTIGRAVITY_SYSTEM_PROMPT = "false"
       }
 
+      if (!this.config.antigravityOfficialTools) {
+        env.ANTIGRAVITY_OFFICIAL_TOOLS = "false"
+      }
+
       this.rotateLogFile()
 
       // Spawn detached — Bridge survives Cursor restarts
@@ -166,14 +171,14 @@ export class BridgeManager extends EventEmitter {
       fs.closeSync(logFd)
 
       // Wait for the server to be ready
-      const healthy = await this.waitForHealth(15000)
+      const healthy = await this.waitForHealth(STARTUP_HEALTH_TIMEOUT_MS)
       if (healthy) {
         this.setState("running")
         this.startHealthCheck()
         logger.info(`Protocol Bridge is running on port ${this.config.port}`)
       } else {
         logger.warn(
-          "Protocol Bridge started but health check failed — check logs"
+          `Protocol Bridge started but health check failed after ${STARTUP_HEALTH_TIMEOUT_MS}ms — check logs`
         )
         this.setState("running")
         this.startHealthCheck()

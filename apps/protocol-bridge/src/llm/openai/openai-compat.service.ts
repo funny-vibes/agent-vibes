@@ -151,6 +151,8 @@ function resolveOpenAiCompatReasoningEffort(dto: CreateMessageDto): string {
   }
 
   switch (intent.mode) {
+    case "explicit_effort":
+      return normalizeOpenAiCompatReasoningEffort(intent.effort)
     case "explicit_budget":
       return convertOpenAiCompatBudgetToEffort(intent.budgetTokens)
     case "disabled":

@@ -10,6 +10,7 @@ interface BuildCodexHttpHeadersParams {
   isApiKey: boolean
   stream: boolean
   accountId?: string
+  workspaceId?: string
   cacheHeaders?: Record<string, string>
   forwardHeaders?: CodexForwardHeaders
   omitAccountId?: boolean
@@ -19,6 +20,7 @@ interface BuildCodexWebSocketHeadersParams {
   token: string
   isApiKey: boolean
   accountId?: string
+  workspaceId?: string
   cacheHeaders?: Record<string, string>
   forwardHeaders?: CodexForwardHeaders
   omitAccountId?: boolean
@@ -156,6 +158,10 @@ export function buildCodexHttpHeaders(
     if (accountId) {
       headers["Chatgpt-Account-Id"] = accountId
     }
+    const workspaceId = params.workspaceId?.trim() || ""
+    if (workspaceId) {
+      headers["OpenAI-Organization"] = workspaceId
+    }
   }
 
   return sanitizeHeaders(headers)
@@ -226,6 +232,10 @@ export function buildCodexWebSocketHeaders(
     const accountId = params.omitAccountId ? "" : params.accountId?.trim() || ""
     if (accountId) {
       headers["Chatgpt-Account-Id"] = accountId
+    }
+    const workspaceId = params.workspaceId?.trim() || ""
+    if (workspaceId) {
+      headers["OpenAI-Organization"] = workspaceId
     }
   }
 

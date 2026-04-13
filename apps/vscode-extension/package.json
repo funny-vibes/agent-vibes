@@ -208,13 +208,18 @@
         },
         "agentVibes.thinkingBudgetAuto": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Auto-estimate Cloud Code Claude thinking budget based on task complexity"
         },
         "agentVibes.antigravitySystemPrompt": {
           "type": "boolean",
           "default": true,
-          "description": "Load the built-in Antigravity system prompt for Google backend (requires restart)"
+          "description": "System prompt mode for Google backend: on = Antigravity (Google), off = Cursor (requires restart)"
+        },
+        "agentVibes.antigravityOfficialTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use official Antigravity tool declarations for Cloud Code Claude instead of passthrough Cursor tools (requires restart)"
         },
         "agentVibes.dataDir": {
           "type": "string",

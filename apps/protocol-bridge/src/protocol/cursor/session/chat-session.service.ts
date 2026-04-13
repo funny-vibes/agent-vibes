@@ -16,10 +16,10 @@ import type {
   InvestigationMemorySummaryLike,
   LooseMessageContent,
 } from "../../../context/types"
-import type { EditFailureSelection } from "../tools/tool-protocol-helpers"
 import type { BackendType } from "../../../llm/shared/model-router.service"
 import { PersistenceService } from "../../../persistence"
 import { ParsedCursorRequest } from "../tools/cursor-request-parser"
+import type { EditFailureSelection } from "../tools/tool-protocol-helpers"
 
 /**
  * Content block types for messages

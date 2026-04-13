@@ -91,6 +91,7 @@ export class DashboardPanel {
         command?: string
         channel?: string
         index?: number
+        accountId?: string
         raw?: string
         data?: Record<string, unknown>
         key?: string
@@ -164,6 +165,7 @@ export class DashboardPanel {
     command?: string
     channel?: string
     index?: number
+    accountId?: string
     raw?: string
     data?: Record<string, unknown>
     key?: string
@@ -228,10 +230,14 @@ export class DashboardPanel {
         break
 
       case "removeAccount":
-        if (msg.channel !== undefined && msg.index !== undefined) {
+        if (msg.channel !== undefined) {
           const filePath = this.getChannelPath(msg.channel)
           if (filePath) {
-            this.config.removeAccount(filePath, msg.index)
+            if (msg.channel === "codex" && msg.accountId) {
+              this.config.removeCodexAccount(filePath, msg.accountId)
+            } else if (msg.index !== undefined) {
+              this.config.removeAccount(filePath, msg.index)
+            }
             this.sendAllData()
           }
         }
@@ -274,6 +280,10 @@ export class DashboardPanel {
 
       case "getUsageSummary":
         void this.sendUsageSummary()
+        break
+
+      case "getDailyUsage":
+        void this.sendDailyUsage()
         break
 
       case "updateSetting":
@@ -558,6 +568,60 @@ export class DashboardPanel {
     }
   }
 
+  private async sendDailyUsage(): Promise<void> {
+    if (this.bridge.state !== "running") {
+      this.panel.webview.postMessage({
+        type: "dailyUsageUpdate",
+        data: null,
+      })
+      return
+    }
+
+    try {
+      const https = require("https") as typeof import("https")
+      const caCert = this.config.caCertPath
+      const caData = fs.existsSync(caCert) ? fs.readFileSync(caCert) : undefined
+
+      const data = await new Promise<string>((resolve, reject) => {
+        const options: import("https").RequestOptions = {
+          hostname: "localhost",
+          port: this.config.port,
+          path: "/usage/daily",
+          method: "GET",
+          ca: caData,
+          rejectUnauthorized: !!caData,
+          timeout: 5000,
+        }
+        const req = https.get(options, (res) => {
+          let body = ""
+          res.on("data", (chunk: Buffer) => {
+            body += chunk.toString()
+          })
+          res.on("end", () => resolve(body))
+        })
+        req.on("error", reject)
+        req.setTimeout(5000, () => {
+          req.destroy()
+          reject(new Error("timeout"))
+        })
+      })
+
+      const parsed = JSON.parse(data) as Record<string, unknown>
+      this.panel.webview.postMessage({
+        type: "dailyUsageUpdate",
+        data: parsed,
+      })
+    } catch (err) {
+      logger.debug(
+        `Daily usage fetch failed: ${err instanceof Error ? err.message : String(err)}`
+      )
+      this.panel.webview.postMessage({
+        type: "dailyUsageUpdate",
+        data: null,
+      })
+    }
+  }
+
   /**
    * Persist a setting change from the webview to VS Code configuration.
    * Only whitelisted keys are accepted to prevent arbitrary config writes.
@@ -571,6 +635,7 @@ export class DashboardPanel {
       "autoStart",
       "thinkingBudgetAuto",
       "antigravitySystemPrompt",
+      "antigravityOfficialTools",
     ])
     const allowedNumbers = new Set(["port", "healthCheckInterval"])
     const allowedStrings = new Set([
@@ -805,17 +870,24 @@ export class DashboardPanel {
             items: [
               {
                 label: "System Prompt",
-                desc: "Load the built-in Antigravity system prompt for Google backend (requires restart)",
+                desc: "Default Antigravity system prompt; off = Cursor+Claude Code hybrid (requires restart)",
                 type: "toggle",
                 key: "antigravitySystemPrompt",
                 value: this.config.antigravitySystemPrompt,
               },
               {
-                label: "Thinking Budget Auto",
-                desc: "Auto-estimate Claude thinking budget based on task complexity (requires restart)",
+                label: "Thinking Budget",
+                desc: "Default Antigravity thinking budget; off = auto-estimation (requires restart)",
                 type: "toggle",
                 key: "thinkingBudgetAuto",
                 value: this.config.thinkingBudgetAuto,
+              },
+              {
+                label: "Official Tools",
+                desc: "Default Antigravity tool declarations; off = passthrough Cursor tools (requires restart)",
+                type: "toggle",
+                key: "antigravityOfficialTools",
+                value: this.config.antigravityOfficialTools,
               },
             ],
           },

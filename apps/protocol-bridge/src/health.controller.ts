@@ -1,15 +1,16 @@
 import { Controller, Get, Post, Query } from "@nestjs/common"
 import { ApiOperation, ApiTags } from "@nestjs/swagger"
 import { AnthropicApiService } from "./llm/anthropic/anthropic-api.service"
-import { CodexService } from "./llm/openai/codex.service"
+import type { GoogleQuotaAccountSnapshot } from "./llm/google/process-pool.service"
 import { ProcessPoolService } from "./llm/google/process-pool.service"
+import { CodexService } from "./llm/openai/codex.service"
 import { OpenaiCompatService } from "./llm/openai/openai-compat.service"
 import type {
   BackendPoolEntryState,
   BackendPoolEntryStatus,
   BackendPoolStatus,
+  CodexRateLimitWindow,
 } from "./llm/shared/backend-pool-status"
-import type { GoogleQuotaAccountSnapshot } from "./llm/google/process-pool.service"
 import { ChatSessionManager } from "./protocol/cursor/session/chat-session.service"
 import { UsageStatsService } from "./usage"
 
@@ -205,6 +206,12 @@ export class HealthController {
     }
   }
 
+  @Get("usage/daily")
+  @ApiOperation({ summary: "Get daily token usage for heatmap calendar" })
+  getDailyUsage() {
+    return this.usageStats.getDailyUsage()
+  }
+
   @Get("quota/codex")
   @ApiOperation({ summary: "Get Codex per-account rate limit snapshots" })
   async getCodexQuotaStatus(@Query("force") force?: string) {
@@ -214,7 +221,7 @@ export class HealthController {
     // the full pool when explicitly requested.
     const poolStatus = this.codexService.getPoolStatus()
     const hasUnprobed = poolStatus.entries.some(
-      (e) => !e.rateLimits && e.state !== "disabled"
+      (e) => !e.rateLimits?.models?.length && e.state !== "disabled"
     )
     if (forceRefresh || hasUnprobed) {
       await this.codexService.probeRateLimits(forceRefresh)
@@ -224,43 +231,84 @@ export class HealthController {
     const freshStatus = this.codexService.getPoolStatus()
     const accounts = freshStatus.entries.map((entry, index) => {
       const rateLimits = entry.rateLimits
-      const primary = rateLimits?.primary
-      const secondary = rateLimits?.secondary
+      const effective = rateLimits?.effective
+      const serializeWindow = (
+        window: CodexRateLimitWindow | null | undefined
+      ) =>
+        window
+          ? {
+              usedPercent: window.usedPercent,
+              remainingPercent: Math.max(
+                0,
+                +(100 - window.usedPercent).toFixed(1)
+              ),
+              windowMinutes: window.windowMinutes,
+              resetsAt: window.resetsAt
+                ? new Date(window.resetsAt * 1000).toISOString()
+                : null,
+            }
+          : null
 
       return {
         label: entry.label || `codex-${index + 1}`,
+        email: entry.email || null,
         accountId: entry.accountId || null,
+        workspaceId: entry.workspaceId || null,
         state: entry.state,
         planType: entry.planType || null,
+        modelCooldowns: entry.modelCooldowns,
         rateLimits: rateLimits
           ? {
-              primary: primary
+              effective: effective
                 ? {
-                    usedPercent: primary.usedPercent,
-                    remainingPercent: Math.max(
-                      0,
-                      +(100 - primary.usedPercent).toFixed(1)
-                    ),
-                    windowMinutes: primary.windowMinutes,
-                    resetsAt: primary.resetsAt
-                      ? new Date(primary.resetsAt * 1000).toISOString()
-                      : null,
+                    model: effective.model,
+                    displayModel: effective.displayModel,
+                    source: effective.source,
+                    primary: serializeWindow(effective.primary),
+                    secondary: serializeWindow(effective.secondary),
+                    updatedAt: new Date(effective.updatedAt).toISOString(),
                   }
                 : null,
-              secondary: secondary
-                ? {
-                    usedPercent: secondary.usedPercent,
-                    remainingPercent: Math.max(
-                      0,
-                      +(100 - secondary.usedPercent).toFixed(1)
-                    ),
-                    windowMinutes: secondary.windowMinutes,
-                    resetsAt: secondary.resetsAt
-                      ? new Date(secondary.resetsAt * 1000).toISOString()
-                      : null,
-                  }
+              models: rateLimits.models.map((modelSummary) => ({
+                model: modelSummary.model,
+                displayModel: modelSummary.displayModel,
+                updatedAt: new Date(modelSummary.updatedAt).toISOString(),
+                effective: modelSummary.effective
+                  ? {
+                      source: modelSummary.effective.source,
+                      primary: serializeWindow(modelSummary.effective.primary),
+                      secondary: serializeWindow(
+                        modelSummary.effective.secondary
+                      ),
+                      updatedAt: new Date(
+                        modelSummary.effective.updatedAt
+                      ).toISOString(),
+                    }
+                  : null,
+                request: modelSummary.request
+                  ? {
+                      primary: serializeWindow(modelSummary.request.primary),
+                      secondary: serializeWindow(
+                        modelSummary.request.secondary
+                      ),
+                      updatedAt: new Date(
+                        modelSummary.request.updatedAt
+                      ).toISOString(),
+                    }
+                  : null,
+                probe: modelSummary.probe
+                  ? {
+                      primary: serializeWindow(modelSummary.probe.primary),
+                      secondary: serializeWindow(modelSummary.probe.secondary),
+                      updatedAt: new Date(
+                        modelSummary.probe.updatedAt
+                      ).toISOString(),
+                    }
+                  : null,
+              })),
+              updatedAt: rateLimits.updatedAt
+                ? new Date(rateLimits.updatedAt).toISOString()
                 : null,
-              updatedAt: new Date(rateLimits.updatedAt).toISOString(),
             }
           : null,
       }

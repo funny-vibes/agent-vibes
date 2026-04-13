@@ -38,6 +38,7 @@ const PREVIOUS_LOG_FILE = path.join(
   os.tmpdir(),
   "agent-vibes-bridge.previous.log"
 )
+const STARTUP_HEALTH_TIMEOUT_MS = 45000
 
 function stripJsonComments(input) {
   return input
@@ -277,7 +278,11 @@ function rotateLogFile() {
   } catch {}
 }
 
-function waitForHealth(port, caCertPath, timeoutMs = 15000) {
+function waitForHealth(
+  port,
+  caCertPath,
+  timeoutMs = STARTUP_HEALTH_TIMEOUT_MS
+) {
   const ca = fs.existsSync(caCertPath) ? fs.readFileSync(caCertPath) : undefined
   const startedAt = Date.now()
 
@@ -350,6 +355,7 @@ async function main() {
 
   throw new Error(
     `Bridge restart did not pass health check on port ${port}. ` +
+      `Timed out after ${STARTUP_HEALTH_TIMEOUT_MS}ms. ` +
       `Check ${LOG_FILE} or run "Agent Vibes: Restart Server" in Cursor.`
   )
 }

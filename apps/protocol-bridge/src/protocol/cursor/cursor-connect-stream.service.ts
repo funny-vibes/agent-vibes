@@ -1,6 +1,7 @@
 import { fromBinary } from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
+import { closeSync, openSync, readFileSync, readSync, statSync } from "fs"
 import * as path from "path"
 import {
   type ContextAttachmentSnapshot,
@@ -33,15 +34,15 @@ import {
   AnthropicApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
 } from "../../llm/anthropic/anthropic-api.service"
-import { CodexService } from "../../llm/openai/codex.service"
 import { GoogleService } from "../../llm/google/google.service"
+import { CodexService } from "../../llm/openai/codex.service"
+import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
+import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
 import {
   BackendType,
   ModelRouteResult,
   ModelRouterService,
 } from "../../llm/shared/model-router.service"
-import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
-import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
 import {
   applyThinkingIntentToDto,
   buildThinkingIntentFromCursorRequest,
@@ -56,9 +57,11 @@ import {
   type OfficialAntigravityCanonicalToolInvocation,
 } from "../../shared/official-antigravity-tools"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
-import { generateTraceId } from "./tools/agent-helpers"
+import { CursorGrpcService } from "./cursor-grpc.service"
+import { KnowledgeBaseService } from "./knowledge-base.service"
+import { KvStorageService } from "./kv-storage.service"
+import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import { BackendStreamAbortRegistry } from "./session/backend-stream-abort-registry"
-import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import {
   ChatSession,
   ChatSessionManager,
@@ -73,8 +76,9 @@ import {
   SessionTopLevelAgentTurnState,
   SubAgentContext,
 } from "./session/chat-session.service"
+import { generateTraceId } from "./tools/agent-helpers"
+import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
-import { CursorGrpcService } from "./cursor-grpc.service"
 import {
   type AttachedImage,
   cursorRequestParser,
@@ -86,15 +90,12 @@ import {
   resolveCursorToolDefinitionKey,
   type ToolDefinition,
 } from "./tools/cursor-tool-mapper"
-import { KnowledgeBaseService } from "./knowledge-base.service"
-import { KvStorageService } from "./kv-storage.service"
 import {
   buildMcpDispatchInput,
   normalizeMcpToolIdentifier,
   resolveMcpCallFields as resolveMcpCallFieldsFromContract,
   resolveMcpToolDefinition,
 } from "./tools/mcp-call-contract"
-import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import {
   buildNumberedLineEntries,
   extractEditFailureSelection,
@@ -275,8 +276,6 @@ type DeferredToolFamily =
   | "exa_search"
   | "exa_fetch"
   | "setup_vm_environment"
-  | "todo_read"
-  | "todo_write"
   | "task"
   | "apply_agent_diff"
   | "generate_image"
@@ -607,6 +606,43 @@ export class CursorConnectStreamService {
   private readonly LARGE_TOOL_RESULT_HEAD_LINES = 220
   private readonly LARGE_TOOL_RESULT_TAIL_LINES = 120
   private readonly LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS = 24_000
+  private readonly LARGE_READ_FILE_SIZE_BYTES = 256 * 1024
+  private readonly OFFICIAL_VIEW_FILE_MAX_LINES = 800
+  private readonly OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS = 18_000
+  private readonly OFFICIAL_VIEW_FILE_BINARY_EXTENSIONS = new Set([
+    ".7z",
+    ".avi",
+    ".bin",
+    ".bmp",
+    ".dll",
+    ".exe",
+    ".flac",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".m4a",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".otf",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".so",
+    ".tar",
+    ".tgz",
+    ".ttf",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".zip",
+  ])
   private readonly GREP_RESULT_PREVIEW_MAX_LINES = 120
   private readonly TOP_LEVEL_AGENT_READONLY_ADVISORY_TURNS = 3
   private readonly TOP_LEVEL_AGENT_READONLY_FORCE_TURNS = 5
@@ -4563,6 +4599,26 @@ ${raw}
       replaceText
     )
     if (occurrenceCount === 0) {
+      // Workaround: Cloud Code API / model sometimes returns over-escaped
+      // backslashes in functionCall.args (e.g. `\\` instead of `\` for
+      // template literal content).  Before failing, try collapsing one
+      // layer of backslash escaping and re-match.
+      if (searchText.includes("\\\\")) {
+        const unescapedSearch = searchText.replace(/\\\\/g, "\\")
+        const unescapedReplace = replaceText.replace(/\\\\/g, "\\")
+        const retryResult = this.applySearchReplaceWithinRange(content, {
+          ...options,
+          searchText: unescapedSearch,
+          replaceText: unescapedReplace,
+        })
+        if (!retryResult.warning) {
+          this.logger.debug(
+            `${options.warningPrefix}: over-escape retry succeeded ` +
+              `(collapsed ${searchText.length - unescapedSearch.length} excess backslash chars)`
+          )
+          return retryResult
+        }
+      }
       // Following claude-code's design: searchText not found is always a
       // failure — never silently assume the edit was "already applied".
       // If replaceText happens to exist in the range, add a diagnostic
@@ -5788,55 +5844,37 @@ ${raw}
     }
   }
 
-  private resolveOfficialFirstViewFileWindow(
-    startLine?: number,
-    endLine?: number
-  ): { startLine?: number; endLine?: number } {
-    const enforcedWindowLines = 800
-
-    if (startLine == null && endLine == null) {
-      return { startLine: 1, endLine: enforcedWindowLines }
-    }
-
-    if (startLine != null && endLine != null) {
-      const requestedSpan = endLine - startLine + 1
-      if (requestedSpan >= enforcedWindowLines) {
-        return { startLine, endLine }
-      }
-      return {
-        startLine: Math.max(1, endLine - (enforcedWindowLines - 1)),
-        endLine,
-      }
-    }
-
-    if (endLine != null) {
-      return {
-        startLine: Math.max(1, endLine - (enforcedWindowLines - 1)),
-        endLine,
-      }
-    }
-
-    return {
-      startLine,
-      endLine: (startLine || 1) + (enforcedWindowLines - 1),
-    }
-  }
-
-  private enforceOfficialViewFileFirstReadWindow(
+  private normalizeOfficialViewFileInvocation(
     session: ChatSession,
     invocation: CanonicalToolInvocation
   ): CanonicalToolInvocation {
     if (
       invocation.toolName !== "read_file" ||
-      invocation.historyToolName !== "view_file"
+      (invocation.historyToolName || "").trim().toLowerCase() !== "view_file"
     ) {
       return invocation
     }
 
     const filePath =
-      this.pickFirstString(invocation.input, ["path", "AbsolutePath"]) || ""
-    if (!filePath || session.readPaths.has(filePath)) {
+      this.pickFirstString(invocation.input, [
+        "path",
+        "file_path",
+        "filePath",
+        "AbsolutePath",
+      ]) ||
+      this.pickFirstString(invocation.historyToolInput || {}, [
+        "AbsolutePath",
+        "path",
+        "file_path",
+        "filePath",
+      ]) ||
+      ""
+    if (!filePath) {
       return invocation
+    }
+
+    if (!this.shouldAutoWindowOfficialViewFile(filePath)) {
+      return this.stripOfficialViewFileWindow(invocation)
     }
 
     const requestedStartLine = this.pickFirstNumber(invocation.input, [
@@ -5849,32 +5887,451 @@ ${raw}
       "endLine",
       "EndLine",
     ])
-    const expandedWindow = this.resolveOfficialFirstViewFileWindow(
-      requestedStartLine,
-      requestedEndLine
-    )
 
-    if (
-      expandedWindow.startLine === requestedStartLine &&
-      expandedWindow.endLine === requestedEndLine
-    ) {
-      return invocation
+    const resolvedWindow = this.resolveOfficialViewFileWindow(
+      filePath,
+      requestedStartLine,
+      requestedEndLine,
+      !session.readPaths.has(filePath)
+    )
+    if (resolvedWindow.validationErrorMessage) {
+      return {
+        ...invocation,
+        validationErrorMessage: resolvedWindow.validationErrorMessage,
+      }
     }
 
-    this.logger.debug(
-      `Expanded first official view_file window for ${filePath}: ` +
-        `${requestedStartLine ?? "?"}-${requestedEndLine ?? "?"} -> ` +
-        `${expandedWindow.startLine ?? "?"}-${expandedWindow.endLine ?? "?"}`
-    )
+    const nextInput = {
+      ...invocation.input,
+      start_line: resolvedWindow.startLine,
+      end_line: resolvedWindow.endLine,
+    }
+
+    if (
+      nextInput.start_line !== invocation.input.start_line ||
+      nextInput.end_line !== invocation.input.end_line
+    ) {
+      this.logger.debug(
+        `Normalized official view_file window for ${filePath}: ` +
+          `${requestedStartLine ?? "?"}-${requestedEndLine ?? "?"} -> ` +
+          `${resolvedWindow.startLine}-${resolvedWindow.endLine}`
+      )
+    }
 
     return {
       ...invocation,
-      input: {
-        ...invocation.input,
-        start_line: expandedWindow.startLine,
-        end_line: expandedWindow.endLine,
-      },
+      input: nextInput,
     }
+  }
+
+  private shouldAutoWindowOfficialViewFile(filePath: string): boolean {
+    const extension = path.extname(filePath).toLowerCase()
+    if (extension && this.OFFICIAL_VIEW_FILE_BINARY_EXTENSIONS.has(extension)) {
+      return false
+    }
+
+    let fd: number | null = null
+    try {
+      fd = openSync(filePath, "r")
+      const sample = Buffer.allocUnsafe(4096)
+      const bytesRead = readSync(fd, sample, 0, sample.length, 0)
+      if (bytesRead <= 0) {
+        return true
+      }
+
+      return this.isLikelyTextViewFileBuffer(sample.subarray(0, bytesRead))
+    } catch {
+      return true
+    } finally {
+      if (fd != null) {
+        closeSync(fd)
+      }
+    }
+  }
+
+  private isLikelyTextViewFileBuffer(sample: Buffer): boolean {
+    if (sample.length === 0) {
+      return true
+    }
+
+    let suspiciousByteCount = 0
+    for (const byte of sample) {
+      if (byte === 0) {
+        return false
+      }
+
+      const isSuspiciousControlByte =
+        (byte >= 1 && byte <= 8) ||
+        byte === 11 ||
+        byte === 12 ||
+        (byte >= 14 && byte <= 31) ||
+        byte === 127
+      if (isSuspiciousControlByte) {
+        suspiciousByteCount += 1
+      }
+    }
+
+    return suspiciousByteCount / sample.length < 0.3
+  }
+
+  private stripOfficialViewFileWindow(
+    invocation: CanonicalToolInvocation
+  ): CanonicalToolInvocation {
+    const stripLineFields = (
+      value: Record<string, unknown> | undefined
+    ): Record<string, unknown> | undefined => {
+      if (!value) {
+        return value
+      }
+
+      const nextValue = { ...value }
+      delete nextValue.start_line
+      delete nextValue.startLine
+      delete nextValue.StartLine
+      delete nextValue.end_line
+      delete nextValue.endLine
+      delete nextValue.EndLine
+      return nextValue
+    }
+
+    return {
+      ...invocation,
+      input: stripLineFields(invocation.input) || {},
+      historyToolInput: stripLineFields(invocation.historyToolInput),
+    }
+  }
+
+  private resolveOfficialViewFileWindow(
+    filePath: string,
+    requestedStartLine?: number,
+    requestedEndLine?: number,
+    expandFirstReadWindow = false
+  ): {
+    startLine: number
+    endLine: number
+    validationErrorMessage?: string
+  } {
+    const hasRequestedStart =
+      requestedStartLine != null && Number.isFinite(requestedStartLine)
+    const hasRequestedEnd =
+      requestedEndLine != null && Number.isFinite(requestedEndLine)
+
+    if (hasRequestedStart && requestedStartLine < 1) {
+      return {
+        startLine: 1,
+        endLine: 1,
+        validationErrorMessage:
+          "view_file StartLine must be >= 1. Re-run with a valid StartLine/EndLine range.",
+      }
+    }
+    if (hasRequestedEnd && requestedEndLine < 1) {
+      return {
+        startLine: 1,
+        endLine: 1,
+        validationErrorMessage:
+          "view_file EndLine must be >= 1. Re-run with a valid StartLine/EndLine range.",
+      }
+    }
+    if (
+      hasRequestedStart &&
+      hasRequestedEnd &&
+      requestedEndLine < requestedStartLine
+    ) {
+      return {
+        startLine: 1,
+        endLine: 1,
+        validationErrorMessage:
+          "view_file EndLine must be >= StartLine. Re-run with a valid StartLine/EndLine range.",
+      }
+    }
+
+    let totalLines = 1
+    let lines: string[] = []
+    try {
+      const stats = statSync(filePath)
+      if (!stats.isFile()) {
+        return {
+          startLine: requestedStartLine ?? 1,
+          endLine: requestedEndLine ?? requestedStartLine ?? 1,
+        }
+      }
+      const content = readFileSync(filePath, "utf8")
+      lines = this.splitContentLinesForViewFile(content)
+      totalLines = Math.max(1, lines.length)
+    } catch {
+      return {
+        startLine: requestedStartLine ?? 1,
+        endLine: requestedEndLine ?? requestedStartLine ?? 1,
+      }
+    }
+
+    const normalizedRequestedStart = hasRequestedStart
+      ? Math.floor(requestedStartLine)
+      : undefined
+    const normalizedRequestedEnd = hasRequestedEnd
+      ? Math.floor(requestedEndLine)
+      : undefined
+
+    if (
+      normalizedRequestedStart != null &&
+      normalizedRequestedStart > totalLines
+    ) {
+      return {
+        startLine: totalLines,
+        endLine: totalLines,
+        validationErrorMessage:
+          `view_file StartLine ${normalizedRequestedStart} is outside this file ` +
+          `(${totalLines} line(s)). Re-run with a valid StartLine/EndLine range.`,
+      }
+    }
+    if (normalizedRequestedEnd != null && normalizedRequestedEnd > totalLines) {
+      return {
+        startLine: totalLines,
+        endLine: totalLines,
+        validationErrorMessage:
+          `view_file EndLine ${normalizedRequestedEnd} is outside this file ` +
+          `(${totalLines} line(s)). Re-run with a valid StartLine/EndLine range.`,
+      }
+    }
+
+    const candidateWindow = this.buildOfficialViewFileCandidateWindow(
+      totalLines,
+      normalizedRequestedStart,
+      normalizedRequestedEnd,
+      expandFirstReadWindow
+    )
+    if (
+      candidateWindow.endLine - candidateWindow.startLine + 1 >
+      this.OFFICIAL_VIEW_FILE_MAX_LINES
+    ) {
+      return {
+        startLine: candidateWindow.startLine,
+        endLine: candidateWindow.endLine,
+        validationErrorMessage:
+          `view_file can return at most ${this.OFFICIAL_VIEW_FILE_MAX_LINES} lines at a time. ` +
+          `Re-run with a narrower StartLine/EndLine range.`,
+      }
+    }
+
+    const fit = this.fitOfficialViewFileWindowToBudget(lines, candidateWindow, {
+      requestedStartLine: normalizedRequestedStart,
+      requestedEndLine: normalizedRequestedEnd,
+    })
+    if (fit.validationErrorMessage) {
+      return fit
+    }
+
+    return fit
+  }
+
+  private buildOfficialViewFileCandidateWindow(
+    totalLines: number,
+    requestedStartLine?: number,
+    requestedEndLine?: number,
+    expandFirstReadWindow = false
+  ): { startLine: number; endLine: number } {
+    const maxLines = this.OFFICIAL_VIEW_FILE_MAX_LINES
+
+    let startLine = requestedStartLine
+    let endLine = requestedEndLine
+
+    if (startLine == null && endLine == null) {
+      startLine = 1
+      endLine = Math.min(totalLines, maxLines)
+    } else if (startLine != null && endLine == null) {
+      endLine = Math.min(totalLines, startLine + (maxLines - 1))
+    } else if (startLine == null && endLine != null) {
+      startLine = Math.max(1, endLine - (maxLines - 1))
+    }
+
+    const safeStartLine = Math.max(1, Math.min(totalLines, startLine ?? 1))
+    const safeEndLine = Math.max(
+      safeStartLine,
+      Math.min(totalLines, endLine ?? safeStartLine)
+    )
+
+    if (!expandFirstReadWindow) {
+      return {
+        startLine: safeStartLine,
+        endLine: safeEndLine,
+      }
+    }
+
+    return this.expandOfficialViewFileWindowToTargetSpan(
+      safeStartLine,
+      safeEndLine,
+      totalLines,
+      maxLines
+    )
+  }
+
+  private expandOfficialViewFileWindowToTargetSpan(
+    startLine: number,
+    endLine: number,
+    totalLines: number,
+    targetSpan: number
+  ): { startLine: number; endLine: number } {
+    const currentSpan = Math.max(1, endLine - startLine + 1)
+    if (currentSpan >= targetSpan) {
+      return { startLine, endLine }
+    }
+
+    let expandBefore = Math.min(
+      startLine - 1,
+      Math.floor((targetSpan - currentSpan) / 2)
+    )
+    let expandAfter = Math.min(
+      totalLines - endLine,
+      targetSpan - currentSpan - expandBefore
+    )
+    let remaining = targetSpan - currentSpan - expandBefore - expandAfter
+
+    if (remaining > 0) {
+      const extraBefore = Math.min(startLine - 1 - expandBefore, remaining)
+      expandBefore += extraBefore
+      remaining -= extraBefore
+    }
+
+    if (remaining > 0) {
+      const extraAfter = Math.min(totalLines - endLine - expandAfter, remaining)
+      expandAfter += extraAfter
+    }
+
+    return {
+      startLine: Math.max(1, startLine - expandBefore),
+      endLine: Math.min(totalLines, endLine + expandAfter),
+    }
+  }
+
+  private fitOfficialViewFileWindowToBudget(
+    lines: string[],
+    candidateWindow: { startLine: number; endLine: number },
+    options: {
+      requestedStartLine?: number
+      requestedEndLine?: number
+    }
+  ): {
+    startLine: number
+    endLine: number
+    validationErrorMessage?: string
+  } {
+    const candidateLineCosts: number[] = []
+    for (
+      let lineNumber = candidateWindow.startLine;
+      lineNumber <= candidateWindow.endLine;
+      lineNumber++
+    ) {
+      const text = lines[lineNumber - 1] ?? ""
+      candidateLineCosts.push(
+        this.tokenCounter.countText(`${lineNumber} | ${text}`, false)
+      )
+    }
+
+    const prefixSums = [0]
+    for (const cost of candidateLineCosts) {
+      prefixSums.push((prefixSums[prefixSums.length - 1] ?? 0) + cost)
+    }
+
+    const rangeTokens = (startLine: number, endLine: number): number => {
+      const startIndex = startLine - candidateWindow.startLine
+      const endIndex = endLine - candidateWindow.startLine + 1
+      const tokenSum =
+        (prefixSums[endIndex] ?? 0) - (prefixSums[startIndex] ?? 0)
+      return tokenSum + Math.max(0, endLine - startLine) + 48
+    }
+
+    const requiredStartLine =
+      options.requestedStartLine ??
+      options.requestedEndLine ??
+      candidateWindow.startLine
+    const requiredEndLine =
+      options.requestedEndLine ??
+      options.requestedStartLine ??
+      candidateWindow.startLine
+
+    if (
+      rangeTokens(requiredStartLine, requiredEndLine) >
+      this.OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS
+    ) {
+      const rangeLabel =
+        options.requestedStartLine != null || options.requestedEndLine != null
+          ? `${requiredStartLine}-${requiredEndLine}`
+          : `${candidateWindow.startLine}-${candidateWindow.endLine}`
+      return {
+        startLine: requiredStartLine,
+        endLine: requiredEndLine,
+        validationErrorMessage:
+          `view_file window ${rangeLabel} is too dense to return safely because the file contains very long lines. ` +
+          `Re-run with a narrower StartLine/EndLine range or use grep_search first to locate the relevant section.`,
+      }
+    }
+
+    let fittedStartLine = candidateWindow.startLine
+    let fittedEndLine = candidateWindow.endLine
+
+    while (
+      rangeTokens(fittedStartLine, fittedEndLine) >
+      this.OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS
+    ) {
+      const canTrimStart = fittedStartLine < requiredStartLine
+      const canTrimEnd = fittedEndLine > requiredEndLine
+      if (!canTrimStart && !canTrimEnd) {
+        break
+      }
+
+      if (canTrimStart && canTrimEnd) {
+        const startCost =
+          candidateLineCosts[fittedStartLine - candidateWindow.startLine] ?? 0
+        const endCost =
+          candidateLineCosts[fittedEndLine - candidateWindow.startLine] ?? 0
+        if (startCost >= endCost) {
+          fittedStartLine += 1
+        } else {
+          fittedEndLine -= 1
+        }
+        continue
+      }
+
+      if (canTrimStart) {
+        fittedStartLine += 1
+      } else {
+        fittedEndLine -= 1
+      }
+    }
+
+    if (
+      rangeTokens(fittedStartLine, fittedEndLine) >
+      this.OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS
+    ) {
+      return {
+        startLine: fittedStartLine,
+        endLine: fittedEndLine,
+        validationErrorMessage:
+          `view_file window ${fittedStartLine}-${fittedEndLine} is still too large to return safely. ` +
+          `Re-run with a narrower StartLine/EndLine range or use grep_search first to locate the relevant section.`,
+      }
+    }
+
+    return {
+      startLine: fittedStartLine,
+      endLine: fittedEndLine,
+    }
+  }
+
+  private splitContentLinesForViewFile(content: string): string[] {
+    if (content.length === 0) {
+      return []
+    }
+
+    const lines = content.split(/\r?\n/)
+    if (
+      lines.length > 0 &&
+      lines[lines.length - 1] === "" &&
+      /\r?\n$/.test(content)
+    ) {
+      lines.pop()
+    }
+    return lines
   }
 
   private normalizeDeferredToolFamily(
@@ -5921,10 +6378,6 @@ ${raw}
           return "get_mcp_tools"
         case "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT":
           return "setup_vm_environment"
-        case "CLIENT_SIDE_TOOL_V2_TODO_READ":
-          return "todo_read"
-        case "CLIENT_SIDE_TOOL_V2_TODO_WRITE":
-          return "todo_write"
         case "CLIENT_SIDE_TOOL_V2_TASK":
         case "CLIENT_SIDE_TOOL_V2_TASK_V2":
           return "task"
@@ -6038,22 +6491,6 @@ ${raw}
       compact.includes("searchfiles")
     ) {
       return "file_search"
-    }
-    if (
-      snake.includes("todo_read") ||
-      snake.includes("read_todos") ||
-      compact.includes("todoread") ||
-      compact.includes("readtodos")
-    ) {
-      return "todo_read"
-    }
-    if (
-      snake.includes("todo_write") ||
-      snake.includes("update_todos") ||
-      compact.includes("todowrite") ||
-      compact.includes("updatetodos")
-    ) {
-      return "todo_write"
     }
     if (
       snake === "task" ||
@@ -6178,6 +6615,16 @@ ${raw}
     }
 
     const normalizedToolName = toolName.trim().toLowerCase()
+    const readDispatchError = this.validateReadDispatchTarget(
+      normalizedToolName,
+      input
+    )
+    if (readDispatchError) {
+      return {
+        errorMessage: readDispatchError,
+      }
+    }
+
     if (
       normalizedToolName === "mcp" ||
       normalizedToolName === "mcp_tool" ||
@@ -6363,15 +6810,101 @@ ${raw}
     }
   }
 
+  private validateReadDispatchTarget(
+    normalizedToolName: string,
+    input: Record<string, unknown>
+  ): string | undefined {
+    if (
+      normalizedToolName !== "read_file" &&
+      normalizedToolName !== "read_file_v2"
+    ) {
+      return undefined
+    }
+
+    const filePath =
+      this.pickFirstString(input, [
+        "path",
+        "file_path",
+        "filePath",
+        "AbsolutePath",
+      ]) || ""
+    if (!filePath) {
+      return undefined
+    }
+
+    let fileSize = 0
+    try {
+      const stats = statSync(filePath)
+      if (!stats.isFile()) {
+        return undefined
+      }
+      fileSize = stats.size
+    } catch {
+      return undefined
+    }
+
+    if (fileSize <= this.LARGE_READ_FILE_SIZE_BYTES) {
+      return undefined
+    }
+
+    if (this.hasBoundedReadWindow(input)) {
+      return undefined
+    }
+
+    return (
+      `File is too large to read without a bounded line window ` +
+      `(${fileSize} bytes > ${this.LARGE_READ_FILE_SIZE_BYTES} bytes). ` +
+      `Re-run with start_line and end_line, or use grep_search first to locate the relevant section.`
+    )
+  }
+
+  private hasBoundedReadWindow(input: Record<string, unknown>): boolean {
+    const explicitLimit = this.pickFirstNumber(input, ["limit", "Limit"])
+    if (explicitLimit != null && explicitLimit > 0) {
+      return true
+    }
+
+    const startLine = this.pickFirstNumber(input, [
+      "start_line",
+      "startLine",
+      "StartLine",
+    ])
+    const endLine = this.pickFirstNumber(input, [
+      "end_line",
+      "endLine",
+      "EndLine",
+    ])
+    return (
+      startLine != null &&
+      endLine != null &&
+      Number.isFinite(startLine) &&
+      Number.isFinite(endLine) &&
+      endLine >= startLine
+    )
+  }
+
   private serializeTodoItemForTool(
     todo: SessionTodoItem
   ): Record<string, unknown> {
     return {
       id: todo.id,
       content: todo.content,
+      status: todo.status,
+      createdAt: String(todo.createdAt),
+      updatedAt: String(todo.updatedAt),
+      dependencies: todo.dependencies,
+    }
+  }
+
+  private serializeTodoItemForCreatePlan(
+    todo: SessionTodoItem
+  ): Record<string, unknown> {
+    return {
+      id: todo.id,
+      content: todo.content,
       status: this.todoStatusToProtocolEnum(todo.status),
-      createdAt: todo.createdAt,
-      updatedAt: todo.updatedAt,
+      createdAt: BigInt(todo.createdAt),
+      updatedAt: BigInt(todo.updatedAt),
       dependencies: todo.dependencies,
     }
   }
@@ -6384,7 +6917,9 @@ ${raw}
   ): Array<Record<string, unknown>> {
     const session = this.sessionManager.getSession(conversationId)
     if (!session || session.todos.length === 0) return []
-    return session.todos.map((todo) => this.serializeTodoItemForTool(todo))
+    return session.todos.map((todo) =>
+      this.serializeTodoItemForCreatePlan(todo)
+    )
   }
 
   /**
@@ -6395,6 +6930,7 @@ ${raw}
   ): Array<{ name: string; todos: Array<Record<string, unknown>> }> {
     const rawPhases = input.phases
     if (!Array.isArray(rawPhases)) return []
+    const nowTs = Date.now()
     return rawPhases
       .filter(
         (entry): entry is Record<string, unknown> =>
@@ -6413,21 +6949,29 @@ ${raw}
                 (t): t is Record<string, unknown> =>
                   !!t && typeof t === "object"
               )
-              .map((t) => ({
-                id: typeof t.id === "string" ? t.id : "",
-                content:
-                  typeof t.content === "string"
-                    ? t.content
-                    : typeof t.text === "string"
-                      ? t.text
-                      : "",
-                status: t.status ?? 1,
-                dependencies: Array.isArray(t.dependencies)
-                  ? t.dependencies.filter(
-                      (d): d is string => typeof d === "string"
-                    )
-                  : [],
-              }))
+              .map((t, index) => {
+                const createdAtRaw =
+                  this.pickFirstNumber(t, ["createdAt", "created_at"]) ?? nowTs
+                const updatedAtRaw =
+                  this.pickFirstNumber(t, ["updatedAt", "updated_at"]) ?? nowTs
+                return {
+                  id:
+                    this.pickFirstString(t, ["id", "todo_id", "todoId"]) ||
+                    `phase_todo_${nowTs}_${index}`,
+                  content:
+                    this.pickFirstString(t, ["content", "text", "title"]) || "",
+                  status: this.todoStatusToProtocolEnum(
+                    this.normalizeTodoStatus(t.status)
+                  ),
+                  createdAt: BigInt(Math.floor(createdAtRaw)),
+                  updatedAt: BigInt(Math.floor(updatedAtRaw)),
+                  dependencies: Array.isArray(t.dependencies)
+                    ? t.dependencies.filter(
+                        (d): d is string => typeof d === "string"
+                      )
+                    : [],
+                }
+              })
           : [],
       }))
   }
@@ -7844,10 +8388,8 @@ ${raw}
     const serializedTodos = filteredTodos.map((todo) =>
       this.serializeTodoItemForTool(todo)
     )
-    input.status_filter = statusFilter.map((status) =>
-      this.todoStatusToProtocolEnum(status)
-    )
-    input.statusFilter = input.status_filter
+    input.status_filter = statusFilter
+    input.statusFilter = statusFilter
     input.id_filter = idFilter
     input.idFilter = idFilter
     input.todos = serializedTodos
@@ -7972,6 +8514,66 @@ ${raw}
         preview,
       state: { status: "success" },
     }
+  }
+
+  /**
+   * After an inline todo_write, emit a createPlanRequestQuery so that
+   * Cursor IDE renders the TODO panel.  This bridges the gap between
+   * agent-vibes' inline execution model and Cursor's expectation that
+   * update_todos is a client-side tool whose UI side-effects happen
+   * locally.
+   */
+  private *emitCreatePlanQueryForTodoWrite(
+    conversationId: string,
+    toolCallId: string,
+    input: Record<string, unknown>
+  ): Generator<Buffer> {
+    const todos = this.sessionTodosToCreatePlanTodos(conversationId)
+    if (!todos || todos.length === 0) {
+      return
+    }
+
+    // Keep the plan body brief and non-duplicative. The actual checklist
+    // belongs in `todos`, which Cursor renders in the lower section.
+    const plan =
+      this.pickFirstString(input, ["plan", "overview", "description"]) ||
+      this.pickFirstString(input, ["title", "name"]) ||
+      "Task Plan"
+
+    const { id: interactionQueryId } =
+      this.sessionManager.registerInteractionQuery(
+        conversationId,
+        "deferred_tool",
+        {
+          kind: "deferred_tool",
+          family: "create_plan",
+          toolCallId,
+          toolName: "create_plan",
+          toolInput: input,
+        }
+      )
+
+    this.logger.debug(
+      `Emitting createPlanRequestQuery after todo_write (${todos.length} todos, queryId=${interactionQueryId})`
+    )
+
+    yield this.grpcService.createInteractionQueryResponse(
+      interactionQueryId,
+      "createPlanRequestQuery",
+      {
+        args: {
+          plan,
+          todos,
+          overview: "",
+          name:
+            this.pickFirstString(input, ["title", "name", "plan"]) ||
+            "Task Plan",
+          isProject: false,
+          phases: this.parsePhasesFromInput(input),
+        },
+        toolCallId,
+      }
+    )
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -8269,8 +8871,6 @@ ${raw}
       file_search: "file_search",
       grep_search: "semantic_search",
       codebase_search: "semantic_search",
-      todo_read: "todo_read",
-      todo_write: "todo_write",
     }
     return DEFERRED_TOOL_MAP[toolName] || null
   }
@@ -9730,7 +10330,8 @@ ${raw}
     state: { status: ToolResultStatus; message?: string },
     inlineProjection?: ParsedToolResult["inlineProjection"],
     resultCase = "inline_tool_result",
-    inlineExtraData?: ParsedToolResult["inlineExtraData"]
+    inlineExtraData?: ParsedToolResult["inlineExtraData"],
+    options: HandleToolResultOptions = {}
   ): AsyncGenerator<Buffer> {
     const syntheticRequest = this.buildSyntheticInlineToolRequest(
       toolCallId,
@@ -9740,7 +10341,7 @@ ${raw}
       resultCase,
       inlineExtraData
     )
-    yield* this.handleToolResult(conversationId, syntheticRequest)
+    yield* this.handleToolResult(conversationId, syntheticRequest, options)
   }
 
   private async *failPendingToolCallsWithProtocolError(
@@ -9926,7 +10527,11 @@ ${raw}
           conversationId,
           toolCallId,
           `[create_plan success]${uriLine}`,
-          { status: "success" }
+          { status: "success" },
+          undefined,
+          "inline_tool_result",
+          undefined,
+          { continueGeneration: false }
         )
       } else {
         const message = this.extractInteractionErrorMessage(rawResponse)
@@ -9934,7 +10539,11 @@ ${raw}
           conversationId,
           toolCallId,
           `[create_plan error] ${message}`,
-          { status: "error", message }
+          { status: "error", message },
+          undefined,
+          "inline_tool_result",
+          undefined,
+          { continueGeneration: false }
         )
       }
       return true
@@ -10091,16 +10700,13 @@ ${raw}
         .map((s: unknown) => (typeof s === "string" ? s.trim() : ""))
         .filter((s: string) => s.length > 0)
 
-      // Build plan text: prefer explicit plan/overview, then compose from steps as markdown
+      // Build plan text: prefer explicit narrative fields only.
+      // Do not mirror steps/todos into `plan`, otherwise Cursor's plan page
+      // shows the same content twice: once in the plan body and again in todos.
       let plan =
         this.pickFirstString(input, ["plan", "overview"]) ||
         this.pickFirstString(input, ["description"]) ||
         ""
-      if (!plan && stepsStrings.length > 0) {
-        plan = stepsStrings
-          .map((s: string, i: number) => `${i + 1}. ${s}`)
-          .join("\n")
-      }
       if (!plan) {
         plan = title || "Plan"
       }
@@ -10398,6 +11004,7 @@ ${raw}
         result.state,
         result.projection
       )
+
       return true
     }
 
@@ -10452,23 +11059,10 @@ ${raw}
   }
 
   private shouldSuppressTodoLifecycleStarted(
-    toolName: string,
-    deferredToolFamily?: DeferredToolFamily
+    _toolName: string,
+    _deferredToolFamily?: DeferredToolFamily
   ): boolean {
-    if (
-      deferredToolFamily === "todo_read" ||
-      deferredToolFamily === "todo_write"
-    ) {
-      return true
-    }
-
-    const normalizedToolName = toolName.trim().toLowerCase()
-    return (
-      normalizedToolName === "read_todos" ||
-      normalizedToolName === "update_todos" ||
-      normalizedToolName === "todo_read" ||
-      normalizedToolName === "todo_write"
-    )
+    return false
   }
 
   private shouldEmitToolCallStarted(
@@ -10476,9 +11070,6 @@ ${raw}
     deferredToolFamily: DeferredToolFamily | undefined,
     _canDispatchExec: boolean
   ): boolean {
-    // Cursor currently renders todo lifecycle started/completed updates as two
-    // separate generic [Tool: readTodosToolCall] / [Tool: updateTodosToolCall]
-    // bubbles instead of reconciling them. Emit completion-only for todos.
     return !this.shouldSuppressTodoLifecycleStarted(
       toolName,
       deferredToolFamily
@@ -10543,7 +11134,7 @@ ${raw}
     toolCall: ActiveToolCall
   ): PreparedToolInvocation {
     const rawInput = this.parseToolInputJson(toolCall.inputJson)
-    const canonicalInvocation = this.enforceOfficialViewFileFirstReadWindow(
+    const canonicalInvocation = this.normalizeOfficialViewFileInvocation(
       session,
       this.canonicalizeToolInvocation(toolCall.name, rawInput)
     )
@@ -10966,7 +11557,7 @@ ${raw}
       case "list_directory":
       case "read_lints":
       case "fetch_rules":
-      case "update_todos":
+      case "read_todos":
       case "glob_search":
       case "web_search":
       case "web_fetch":
@@ -11304,11 +11895,6 @@ ${raw}
     if (preparedTool.deferredToolFamily === "glob_search") {
       this.primeGlobDeferredInputForProtocol(
         conversationId,
-        preparedTool.protocolToolInput
-      )
-    }
-    if (preparedTool.deferredToolFamily === "todo_write") {
-      this.primeTodoWriteDeferredInputForProtocol(
         preparedTool.protocolToolInput
       )
     }

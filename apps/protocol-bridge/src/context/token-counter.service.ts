@@ -43,6 +43,35 @@ export class TokenCounterService implements OnModuleInit {
   private readonly TOKENS_PER_TOOL_CALL = 20
   private readonly TOKENS_PER_TOOL_RESULT = 10
 
+  private safeJsonStringify(value: unknown): string {
+    const seen = new WeakSet<object>()
+
+    try {
+      return (
+        JSON.stringify(value, (_key, currentValue) => {
+          if (typeof currentValue === "bigint") {
+            return currentValue.toString()
+          }
+          if (typeof currentValue === "symbol") {
+            return currentValue.toString()
+          }
+          if (typeof currentValue === "function") {
+            return `[Function ${(currentValue as { name?: string }).name || "anonymous"}]`
+          }
+          if (currentValue && typeof currentValue === "object") {
+            if (seen.has(currentValue as object)) {
+              return "[Circular]"
+            }
+            seen.add(currentValue as object)
+          }
+          return currentValue as unknown
+        }) || ""
+      )
+    } catch {
+      return ""
+    }
+  }
+
   onModuleInit() {
     try {
       this.encoder = getTokenizer()
@@ -99,13 +128,18 @@ export class TokenCounterService implements OnModuleInit {
     } else if (isToolResultBlock(block)) {
       // Tool use ID + content
       tokens = this.countText(block.tool_use_id, false)
+      let resultTokens = 0
       if (typeof block.content === "string") {
-        tokens += this.countText(block.content, false)
+        resultTokens += this.countText(block.content, false)
       } else if (Array.isArray(block.content)) {
         for (const innerBlock of block.content) {
-          tokens += this.countContentBlock(innerBlock, false)
+          resultTokens += this.countContentBlock(innerBlock, false)
         }
       }
+      const structuredTokens = block.structuredContent
+        ? this.countJsonValue(block.structuredContent, false)
+        : 0
+      tokens += Math.max(resultTokens, structuredTokens)
       tokens += this.TOKENS_PER_TOOL_RESULT
     } else if (isImageBlock(block)) {
       tokens = this.TOKENS_PER_IMAGE
@@ -278,12 +312,8 @@ export class TokenCounterService implements OnModuleInit {
    * Useful for tool definitions, function call args, etc.
    */
   countJsonValue(value: unknown, applyCorrection = true): number {
-    try {
-      const json = JSON.stringify(value)
-      return this.countText(json, applyCorrection)
-    } catch {
-      return 0
-    }
+    const json = this.safeJsonStringify(value)
+    return json ? this.countText(json, applyCorrection) : 0
   }
 
   /**
@@ -345,7 +375,7 @@ export class TokenCounterService implements OnModuleInit {
             }
             if (fc.name) rawTokens += this.countText(fc.name, false)
             if (fc.args) {
-              rawTokens += this.countText(JSON.stringify(fc.args), false)
+              rawTokens += this.countJsonValue(fc.args, false)
             }
             rawTokens += this.TOKENS_PER_TOOL_CALL
           }
@@ -356,7 +386,7 @@ export class TokenCounterService implements OnModuleInit {
             }
             if (fr.name) rawTokens += this.countText(fr.name, false)
             if (fr.response) {
-              rawTokens += this.countText(JSON.stringify(fr.response), false)
+              rawTokens += this.countJsonValue(fr.response, false)
             }
             rawTokens += this.TOKENS_PER_TOOL_RESULT
           }
@@ -370,7 +400,7 @@ export class TokenCounterService implements OnModuleInit {
 
     // 3. tools (tool declarations)
     if (request.tools) {
-      rawTokens += this.countText(JSON.stringify(request.tools), false)
+      rawTokens += this.countJsonValue(request.tools, false)
     }
 
     // Claude tokenizer: exact count, no correction needed

@@ -26,6 +26,7 @@ type ToolResultReference = {
   size: number
   roundIndex: number
   eligibleForCompaction: boolean
+  existingReplacement?: string
 }
 
 type ApiRound = {
@@ -60,6 +61,8 @@ export class ToolResultCompactionService {
   private readonly MAX_INPUT_SUMMARY_CHARS = 220
   private readonly COMPACTABLE_TOOLS = new Set<string>([
     "read_file",
+    "read_file_v2",
+    "view_file",
     "run_terminal_command",
     "grep_search",
     "glob_search",
@@ -67,6 +70,9 @@ export class ToolResultCompactionService {
     "web_fetch",
     "edit_file",
     "edit_file_v2",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "write_to_file",
   ])
 
   constructor(private readonly tokenCounter: TokenCounterService) {}
@@ -293,10 +299,11 @@ export class ToolResultCompactionService {
           toolUseId: block.tool_use_id,
           toolName: metadata.name,
           toolInput: metadata.input,
-          outputPreview: this.extractOutputPreview(block.content),
-          size: this.getResultSize(block.content),
+          outputPreview: this.extractOutputPreview(block),
+          size: this.getResultSize(block),
           roundIndex: current!.roundIndex,
           eligibleForCompaction: this.isEligibleResultBlock(block),
+          existingReplacement: this.getExistingReplacement(block),
         })
       })
     })
@@ -326,7 +333,7 @@ export class ToolResultCompactionService {
       }
       replacementTextByToolUseId.set(
         result.toolUseId,
-        this.buildCompactedContent(result)
+        result.existingReplacement || this.buildCompactedContent(result)
       )
       changed = true
     }
@@ -406,8 +413,9 @@ export class ToolResultCompactionService {
           return block
         }
         touched = true
+        const { structuredContent: _structuredContent, ...rest } = block
         return {
-          ...block,
+          ...rest,
           content: replacement,
         }
       })
@@ -461,7 +469,9 @@ export class ToolResultCompactionService {
     }
 
     pushString("path", "path")
+    pushString("AbsolutePath", "path")
     pushString("target_file", "file")
+    pushString("TargetFile", "file")
     pushString("command", "command", 140)
     pushString("query", "query")
     pushString("pattern", "pattern")
@@ -479,8 +489,14 @@ export class ToolResultCompactionService {
       )
     }
 
-    const startLine = this.readNumericField(input, "start_line")
-    const endLine = this.readNumericField(input, "end_line")
+    const startLine =
+      this.readNumericField(input, "start_line") ??
+      this.readNumericField(input, "startLine") ??
+      this.readNumericField(input, "StartLine")
+    const endLine =
+      this.readNumericField(input, "end_line") ??
+      this.readNumericField(input, "endLine") ??
+      this.readNumericField(input, "EndLine")
     if (startLine != null || endLine != null) {
       parts.push(`lines=${startLine ?? "?"}-${endLine ?? "?"}`)
     }
@@ -519,10 +535,18 @@ export class ToolResultCompactionService {
 
     if (
       toolName === "read_file" ||
+      toolName === "read_file_v2" ||
+      toolName === "view_file" ||
       toolName === "edit_file" ||
-      toolName === "edit_file_v2"
+      toolName === "edit_file_v2" ||
+      toolName === "replace_file_content" ||
+      toolName === "multi_replace_file_content" ||
+      toolName === "write_to_file"
     ) {
-      const path = this.readStringField(toolInput, "path")
+      const path =
+        this.readStringField(toolInput, "path") ||
+        this.readStringField(toolInput, "AbsolutePath") ||
+        this.readStringField(toolInput, "TargetFile")
       if (path) {
         hints.push(`worked on ${path}`)
       }
@@ -549,22 +573,57 @@ export class ToolResultCompactionService {
     return this.truncateInline(hints.join(", "), this.MAX_OUTPUT_SUMMARY_CHARS)
   }
 
-  private extractOutputPreview(content: ToolResultBlock["content"]): string {
-    const text =
-      typeof content === "string"
-        ? content
-        : content
-            .filter(
-              (block): block is Extract<ContentBlock, { type: "text" }> =>
-                block.type === "text"
-            )
-            .map((block) => block.text)
-            .join("\n")
+  private extractOutputPreview(block: ToolResultBlock): string {
+    const textContent = this.extractTextContent(block.content)
+    const structuredPreview = this.extractStructuredPreview(
+      block.structuredContent
+    )
+    const preferredPreview =
+      (this.isAlreadyCompacted(block.content) && structuredPreview) ||
+      textContent ||
+      structuredPreview
 
     return this.truncateInline(
-      text.replace(/\s+/g, " ").trim(),
+      preferredPreview.replace(/\s+/g, " ").trim(),
       this.MAX_OUTPUT_SUMMARY_CHARS
     )
+  }
+
+  private extractTextContent(content: ToolResultBlock["content"]): string {
+    if (typeof content === "string") {
+      return content
+    }
+
+    return content
+      .filter(
+        (block): block is Extract<ContentBlock, { type: "text" }> =>
+          block.type === "text"
+      )
+      .map((block) => block.text)
+      .join("\n")
+  }
+
+  private extractStructuredPreview(
+    structuredContent: ToolResultBlock["structuredContent"]
+  ): string {
+    if (!structuredContent) {
+      return ""
+    }
+
+    const output = structuredContent.output
+    if (typeof output === "string") {
+      return output
+    }
+
+    return this.safeStringify(structuredContent)
+  }
+
+  private safeStringify(value: unknown): string {
+    try {
+      return JSON.stringify(value) || ""
+    } catch {
+      return ""
+    }
   }
 
   private readNumericField(
@@ -595,10 +654,10 @@ export class ToolResultCompactionService {
   }
 
   private isEligibleResultBlock(block: ToolResultBlock): boolean {
-    if (this.isAlreadyCompacted(block.content)) {
+    if (this.isFullyCompacted(block)) {
       return false
     }
-    if (this.isContentEmpty(block.content)) {
+    if (this.isResultEmpty(block)) {
       return false
     }
     if (Array.isArray(block.content)) {
@@ -613,11 +672,25 @@ export class ToolResultCompactionService {
     return true
   }
 
+  private isFullyCompacted(block: ToolResultBlock): boolean {
+    return (
+      this.isAlreadyCompacted(block.content) &&
+      !this.hasStructuredContent(block.structuredContent)
+    )
+  }
+
   private isAlreadyCompacted(content: ToolResultBlock["content"]): boolean {
     return (
       typeof content === "string" &&
       (content === this.CLEARED_MESSAGE ||
         content.startsWith(this.COMPACTED_PREFIX))
+    )
+  }
+
+  private isResultEmpty(block: ToolResultBlock): boolean {
+    return (
+      this.isContentEmpty(block.content) &&
+      !this.hasStructuredContent(block.structuredContent)
     )
   }
 
@@ -638,7 +711,30 @@ export class ToolResultCompactionService {
     return block.type === "text" && block.text.trim().length === 0
   }
 
-  private getResultSize(content: ToolResultBlock["content"]): number {
+  private hasStructuredContent(
+    structuredContent: ToolResultBlock["structuredContent"]
+  ): boolean {
+    return Boolean(
+      structuredContent && Object.keys(structuredContent).length > 0
+    )
+  }
+
+  private getExistingReplacement(block: ToolResultBlock): string | undefined {
+    return typeof block.content === "string" &&
+      this.isAlreadyCompacted(block.content)
+      ? block.content
+      : undefined
+  }
+
+  private getResultSize(block: ToolResultBlock): number {
+    const contentSize = this.getContentSize(block.content)
+    const structuredSize = this.getStructuredContentSize(
+      block.structuredContent
+    )
+    return Math.max(contentSize, structuredSize)
+  }
+
+  private getContentSize(content: ToolResultBlock["content"]): number {
     if (typeof content === "string") {
       return content.length
     }
@@ -648,6 +744,16 @@ export class ToolResultCompactionService {
       }
       return sum
     }, 0)
+  }
+
+  private getStructuredContentSize(
+    structuredContent: ToolResultBlock["structuredContent"]
+  ): number {
+    if (!structuredContent) {
+      return 0
+    }
+
+    return this.safeStringify(structuredContent).length
   }
 
   private countRecordTokens(
