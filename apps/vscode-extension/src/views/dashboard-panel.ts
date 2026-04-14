@@ -10,6 +10,7 @@ import { startCodexOAuthFlow } from "../services/codex-oauth-service"
 import { ConfigManager } from "../services/config-manager"
 import { NetworkManager } from "../services/network-manager"
 import { startOAuthFlow } from "../services/oauth-service"
+import { detectCurrentAntigravityVersion } from "../utils/antigravity-version"
 import { detectCurrentCursorVersion } from "../utils/cursor-version"
 import { logger } from "../utils/logger"
 
@@ -45,6 +46,7 @@ type DashboardOverviewPayload = {
 
 type DashboardVersionPayload = {
   extensionVersion: string
+  currentAntigravityVersion: string
   currentCursorVersion: string
   compatibleCursorVersion: string
 }
@@ -271,7 +273,7 @@ export class DashboardPanel {
         break
 
       case "getGoogleQuota":
-        void this.sendGoogleQuotaStatus()
+        void this.sendGoogleQuotaStatus(Boolean(msg.data?.force))
         break
 
       case "getCodexQuota":
@@ -405,7 +407,7 @@ export class DashboardPanel {
     }
   }
 
-  private async sendGoogleQuotaStatus(): Promise<void> {
+  private async sendGoogleQuotaStatus(force = false): Promise<void> {
     if (this.bridge.state !== "running") {
       this.panel.webview.postMessage({
         type: "googleQuotaUpdate",
@@ -418,12 +420,13 @@ export class DashboardPanel {
       const https = require("https") as typeof import("https")
       const caCert = this.config.caCertPath
       const caData = fs.existsSync(caCert) ? fs.readFileSync(caCert) : undefined
+      const quotaPath = force ? "/quota/google?force=1" : "/quota/google"
 
       const data = await new Promise<string>((resolve, reject) => {
         const options: import("https").RequestOptions = {
           hostname: "localhost",
           port: this.config.port,
-          path: "/quota/google",
+          path: quotaPath,
           method: "GET",
           ca: caData,
           rejectUnauthorized: !!caData,
@@ -2020,11 +2023,14 @@ export class DashboardPanel {
         parsed.agentVibes.cursorVersion.trim().length > 0
           ? parsed.agentVibes.cursorVersion.trim()
           : "unknown"
+      const currentAntigravityVersion =
+        detectCurrentAntigravityVersion() || "unknown"
       const currentCursorVersion =
         detectCurrentCursorVersion() || compatibleCursorVersion
 
       return {
         extensionVersion,
+        currentAntigravityVersion,
         currentCursorVersion,
         compatibleCursorVersion,
       }
@@ -2034,6 +2040,7 @@ export class DashboardPanel {
       )
       return {
         extensionVersion: "unknown",
+        currentAntigravityVersion: "unknown",
         currentCursorVersion: "unknown",
         compatibleCursorVersion: "unknown",
       }

@@ -466,6 +466,9 @@ interface ToolCompletedExtraData {
     totalLines?: number
     fileSize?: bigint | number
     truncated?: boolean
+    rangeApplied?: boolean
+    relatedCursorRulePaths?: string[]
+    relatedCursorRules?: Array<Record<string, unknown>>
   }
   shellResult?: {
     stdout?: string
@@ -4698,6 +4701,61 @@ ${raw}
     const compact = value.replace(/\s+/g, " ").trim()
     if (compact.length <= maxChars) return compact
     return `${compact.slice(0, Math.max(maxChars - 3, 0))}...`
+  }
+
+  private isOfficialEditHistoryToolName(toolName?: string): boolean {
+    const normalized = (toolName || "").trim().toLowerCase()
+    return (
+      normalized === "replace_file_content" ||
+      normalized === "multi_replace_file_content" ||
+      normalized === "write_to_file"
+    )
+  }
+
+  private summarizeEditInvocationForLogs(
+    toolInput: ToolInputWithPath,
+    options?: {
+      historyToolName?: string
+      protocolToolName?: string
+      failureContext?: EditFailureContext
+    }
+  ): string {
+    const parts: string[] = []
+    const historyToolName = options?.historyToolName?.trim()
+    const protocolToolName = options?.protocolToolName?.trim()
+    const failureContext = options?.failureContext
+
+    if (historyToolName) {
+      parts.push(`history_tool=${historyToolName}`)
+      parts.push(
+        `tool_origin=${this.isOfficialEditHistoryToolName(historyToolName) ? "official_antigravity" : "internal_edit"}`
+      )
+    } else if (protocolToolName) {
+      parts.push(
+        `tool_origin=${this.isEditToolInvocation(protocolToolName) ? "internal_edit" : "unknown"}`
+      )
+    }
+
+    if (protocolToolName) {
+      parts.push(`protocol_tool=${protocolToolName}`)
+    }
+
+    if (failureContext) {
+      parts.push(`failure_reason=${failureContext.reason}`)
+      if (typeof failureContext.chunkIndex === "number") {
+        parts.push(`chunk_index=${failureContext.chunkIndex + 1}`)
+      }
+      if (typeof failureContext.matchCountInFile === "number") {
+        parts.push(`target_matches_in_file=${failureContext.matchCountInFile}`)
+      }
+    }
+
+    const inputSummary = this.summarizeEditToolInputForLogs(toolInput)
+    if (inputSummary) {
+      parts.push(inputSummary)
+    }
+
+    return parts.join(" | ")
   }
 
   private summarizeEditToolInputForLogs(toolInput: ToolInputWithPath): string {
@@ -11912,6 +11970,20 @@ ${raw}
       preparedTool.historyToolInput
     )
 
+    if (this.isEditToolInvocation(preparedTool.protocolToolName)) {
+      const editInvocationSummary = this.summarizeEditInvocationForLogs(
+        preparedTool.protocolToolInput as ToolInputWithPath,
+        {
+          historyToolName: preparedTool.historyToolName,
+          protocolToolName: preparedTool.protocolToolName,
+        }
+      )
+      this.logger.debug(
+        `Registered edit tool call: ${activeToolCall.id}` +
+          (editInvocationSummary ? ` | ${editInvocationSummary}` : "")
+      )
+    }
+
     const stepId = this.sessionManager.incrementStepId(conversationId)
     yield this.grpcService.createStepStartedResponse(stepId)
 
@@ -14061,8 +14133,14 @@ ${raw}
           }
 
           if (computedEdit.warning) {
-            const editInputSummary =
-              this.summarizeEditToolInputForLogs(typedInput)
+            const editInputSummary = this.summarizeEditInvocationForLogs(
+              typedInput,
+              {
+                historyToolName: editPending.historyToolName,
+                protocolToolName: editPending.toolName,
+                failureContext: editPending.editFailureContext,
+              }
+            )
             this.logger.warn(
               `Edit apply warning for ${editPending.toolCallId}: ${computedEdit.warning}` +
                 (editInputSummary ? ` | ${editInputSummary}` : "")
@@ -14451,6 +14529,19 @@ ${raw}
                 totalLines: readResult.value.totalLines,
                 fileSize: readResult.value.fileSize,
                 truncated: readResult.value.truncated,
+                rangeApplied: readResult.value.rangeApplied,
+                relatedCursorRulePaths: Array.isArray(
+                  readResult.value.relatedCursorRulePaths
+                )
+                  ? readResult.value.relatedCursorRulePaths
+                  : undefined,
+                relatedCursorRules: Array.isArray(
+                  readResult.value.relatedCursorRules
+                )
+                  ? (readResult.value.relatedCursorRules as Array<
+                      Record<string, unknown>
+                    >)
+                  : undefined,
               },
             }
           }

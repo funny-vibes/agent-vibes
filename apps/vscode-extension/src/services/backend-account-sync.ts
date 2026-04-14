@@ -86,11 +86,15 @@ function loadAccountsFile(destPath: string): { accounts: JsonObject[] } {
     return { accounts: [] }
   }
 
-  const parsed = readJsonFile(destPath)
-  return {
-    accounts: Array.isArray(parsed.accounts)
-      ? (parsed.accounts as JsonObject[])
-      : [],
+  try {
+    const parsed = readJsonFile(destPath)
+    return {
+      accounts: Array.isArray(parsed.accounts)
+        ? (parsed.accounts as JsonObject[])
+        : [],
+    }
+  } catch {
+    return { accounts: [] }
   }
 }
 
@@ -237,6 +241,142 @@ export function syncCodexAccount(config: ConfigManager): SyncResult {
   return {
     destinationPath: config.codexAccountsPath,
     summary: `Codex account synced${account.email ? ` for ${account.email}` : ""}`,
+  }
+}
+
+export function importCodexCpaJsonDirectory(
+  config: ConfigManager,
+  sourceDir: string
+): SyncResult {
+  const normalizedSourceDir = sourceDir.trim()
+  if (!normalizedSourceDir) {
+    throw new Error("Source directory is required")
+  }
+
+  if (!fs.existsSync(normalizedSourceDir)) {
+    throw new Error(`CPA JSON directory not found: ${normalizedSourceDir}`)
+  }
+
+  const stat = fs.statSync(normalizedSourceDir)
+  if (!stat.isDirectory()) {
+    throw new Error(`CPA JSON path is not a directory: ${normalizedSourceDir}`)
+  }
+
+  const entries = fs
+    .readdirSync(normalizedSourceDir, { withFileTypes: true })
+    .filter(
+      (entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json")
+    )
+
+  if (entries.length === 0) {
+    throw new Error("No JSON files found in the selected directory")
+  }
+
+  const destinationPath = config.codexAccountsPath
+  const existing = loadAccountsFile(destinationPath)
+  const merged = [...existing.accounts]
+  let imported = 0
+  let skipped = 0
+
+  for (const entry of entries) {
+    const filePath = path.join(normalizedSourceDir, entry.name)
+    let parsed: JsonObject
+    try {
+      parsed = readJsonFile(filePath)
+    } catch {
+      skipped++
+      continue
+    }
+
+    const accessToken = pickString(parsed.access_token, parsed.accessToken)
+    const refreshToken = pickString(parsed.refresh_token, parsed.refreshToken)
+    const idToken = pickString(parsed.id_token, parsed.idToken)
+
+    if (!accessToken && !refreshToken && !idToken) {
+      skipped++
+      continue
+    }
+
+    const claims = idToken ? parseJwtClaims(idToken) : null
+    const authClaims =
+      claims &&
+      typeof claims["https://api.openai.com/auth"] === "object" &&
+      claims["https://api.openai.com/auth"] !== null
+        ? (claims["https://api.openai.com/auth"] as JsonObject)
+        : null
+
+    const meta =
+      parsed.meta && typeof parsed.meta === "object"
+        ? (parsed.meta as JsonObject)
+        : null
+
+    const email = pickString(
+      parsed.email,
+      claims?.email,
+      meta?.gpt_account,
+      meta?.mailbox_email
+    )
+    const accountId = pickString(
+      parsed.account_id,
+      parsed.accountId,
+      authClaims?.chatgpt_account_id
+    )
+    const workspaceId = extractDefaultWorkspaceId(claims)
+    const planType = pickString(parsed.planType, authClaims?.chatgpt_plan_type)
+    const expire = pickString(
+      parsed.expired,
+      parsed.expire,
+      inferTokenExpiry(accessToken, idToken)
+    )
+
+    const account: JsonObject = {
+      ...(email ? { email } : {}),
+      ...(accessToken ? { accessToken } : {}),
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(idToken ? { idToken } : {}),
+      ...(accountId ? { accountId } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(planType ? { planType } : {}),
+      ...(expire ? { expire } : {}),
+    }
+
+    if (Object.keys(account).length === 0) {
+      skipped++
+      continue
+    }
+
+    const matchIndex = merged.findIndex((candidate) => {
+      return (
+        (email &&
+          candidate.email === email &&
+          (candidate.accountId || "") === accountId) ||
+        (refreshToken && candidate.refreshToken === refreshToken) ||
+        (accessToken && candidate.accessToken === accessToken)
+      )
+    })
+
+    if (matchIndex >= 0) {
+      merged[matchIndex] = {
+        ...merged[matchIndex],
+        ...account,
+      }
+    } else {
+      merged.push(account)
+    }
+    imported++
+  }
+
+  if (imported === 0) {
+    throw new Error(
+      "No valid Codex CPA JSON accounts found in the selected directory"
+    )
+  }
+
+  saveAccountsFile(destinationPath, merged)
+
+  return {
+    destinationPath,
+    summary: `Imported ${imported} Codex CPA JSON account(s)${skipped ? ` (${skipped} skipped)` : ""}`,
   }
 }
 

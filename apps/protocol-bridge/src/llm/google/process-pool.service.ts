@@ -14,12 +14,12 @@ import * as path from "path"
 import * as readline from "readline"
 import { getAntigravityAccountsConfigPathCandidates } from "../../shared/protocol-bridge-paths"
 import { UsageStatsService } from "../../usage"
+import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import {
   BackendPoolEntryState,
   BackendPoolModelCooldownReason,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
-import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 
 /**
  * Account configuration for a native worker process
@@ -263,11 +263,17 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   private readonly WORKER_BUSY_RETRY_HINT_MS = 1000
   private readonly GOOGLE_QUOTA_SNAPSHOT_CACHE_TTL_MS = 60_000
   /**
-   * Google quota snapshots report the protected floor as 20% remaining; in
-   * practice that floor is already a model hold / exhausted state for both
-   * Gemini and Claude, so keep those accounts out of scheduling until reset.
+   * Google quota snapshots report a protected floor around 20% remaining; keep
+   * an extra 1% buffer so near-boundary accounts are filtered before they
+   * start failing in active scheduling.
    */
-  private readonly GOOGLE_QUOTA_EXHAUSTED_REMAINING_FRACTION = 0.2
+  private readonly GOOGLE_QUOTA_EXHAUSTED_REMAINING_FRACTION = 0.21
+  /**
+   * When quota snapshots omit an explicit reset boundary, keep exhausted
+   * models out of rotation for a conservative fallback window.
+   */
+  private readonly GOOGLE_QUOTA_EXHAUSTED_FALLBACK_COOLDOWN_MS =
+    4.5 * 60 * 60 * 1000
   /** Timeout for non-streaming generation (deep thinking models may take long) */
   private readonly GENERATE_TIMEOUT_MS = 3_600_000 // 1 hour
   private antigravityGoBinary: string | null = null
@@ -312,7 +318,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       `Process pool initialized: ${this.workers.length} worker(s)`
     )
 
-    await this.preflightQuotaCheck()
+    // Start only local workers during bootstrap to avoid probing Google upstream
+    // during cold start. Defer bootstrap / availability checks until the first
+    // real request or an explicit health check.
     this.startAccountsWatcher()
   }
 
@@ -2075,13 +2083,14 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       const resetAt = this.parseGoogleQuotaResetAt(snapshot.resetTime)
       const exhaustedBySnapshot =
         typeof remainingFraction === "number" &&
-        remainingFraction <= this.GOOGLE_QUOTA_EXHAUSTED_REMAINING_FRACTION &&
-        resetAt != null &&
-        resetAt > now
+        remainingFraction <= this.GOOGLE_QUOTA_EXHAUSTED_REMAINING_FRACTION
 
       if (exhaustedBySnapshot) {
         worker.modelStates.set(modelName, {
-          cooldownUntil: resetAt,
+          cooldownUntil:
+            resetAt != null && resetAt > now
+              ? resetAt
+              : now + this.GOOGLE_QUOTA_EXHAUSTED_FALLBACK_COOLDOWN_MS,
           quotaExhausted: true,
           reason: "quota_exhausted",
         })
@@ -2096,15 +2105,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         continue
       }
 
-      const snapshotStillExhaustedWithoutResetBoundary =
-        typeof remainingFraction === "number" &&
-        remainingFraction <= this.GOOGLE_QUOTA_EXHAUSTED_REMAINING_FRACTION &&
-        resetAt == null &&
-        existing.cooldownUntil > now
-
-      if (!snapshotStillExhaustedWithoutResetBoundary) {
-        worker.modelStates.delete(modelName)
-      }
+      worker.modelStates.delete(modelName)
     }
 
     for (const [modelName, state] of Array.from(worker.modelStates.entries())) {
@@ -2119,13 +2120,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   async fetchGoogleQuotaSnapshots(
     forceRefresh: boolean = false
   ): Promise<GoogleQuotaAccountSnapshot[]> {
-    const now = Date.now()
-    if (
-      !forceRefresh &&
-      this.googleQuotaSnapshotCache.length > 0 &&
-      now - this.googleQuotaSnapshotFetchedAt <=
-        this.GOOGLE_QUOTA_SNAPSHOT_CACHE_TTL_MS
-    ) {
+    if (!forceRefresh) {
       return this.getCachedGoogleQuotaSnapshots()
     }
 
@@ -2140,6 +2135,24 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       ...snapshot,
       models: snapshot.models.map((model) => ({ ...model })),
     }))
+  }
+
+  getGoogleQuotaSnapshotCacheMetadata(now: number = Date.now()): {
+    hasCache: boolean
+    fetchedAt: number | null
+    cacheAgeMs: number | null
+  } {
+    const hasCache = this.googleQuotaSnapshotCache.length > 0
+    const fetchedAt =
+      hasCache && this.googleQuotaSnapshotFetchedAt > 0
+        ? this.googleQuotaSnapshotFetchedAt
+        : null
+
+    return {
+      hasCache,
+      fetchedAt,
+      cacheAgeMs: fetchedAt != null ? Math.max(0, now - fetchedAt) : null,
+    }
   }
 
   private async collectGoogleQuotaSnapshots(): Promise<

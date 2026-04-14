@@ -1014,8 +1014,7 @@ function buildLegacySingleVariantModel(
     idAliases: model.idAliases || [],
     namedModelSectionIndex,
     tagline: clientDisplayName,
-    visibleInRoutedModelView:
-      model.visibleInRoutedModelView ?? model.family !== "gpt",
+    visibleInRoutedModelView: model.visibleInRoutedModelView ?? false,
   })
 }
 
@@ -1213,8 +1212,7 @@ export function buildCursorAvailableModel(
     idAliases: model.idAliases || [],
     namedModelSectionIndex,
     tagline: projectedTagline,
-    visibleInRoutedModelView:
-      model.visibleInRoutedModelView ?? model.family !== "gpt",
+    visibleInRoutedModelView: model.visibleInRoutedModelView ?? false,
   })
 }
 

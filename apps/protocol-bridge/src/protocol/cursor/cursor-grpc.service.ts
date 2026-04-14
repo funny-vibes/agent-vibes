@@ -57,6 +57,7 @@ import {
   CreatePlanToolCallSchema,
   // PR Management
   CreatePrActionSchema,
+  CursorRuleSchema,
   DeleteArgsSchema,
   DeleteErrorSchema,
   DeleteFileBusySchema,
@@ -180,6 +181,7 @@ import {
   ReadMcpResourceRejectedSchema,
   ReadMcpResourceSuccessSchema,
   ReadMcpResourceToolCallSchema,
+  ReadRangeSchema,
   ReadTodosArgsSchema,
   ReadTodosErrorSchema,
   ReadTodosResultSchema,
@@ -822,6 +824,9 @@ interface ToolCompletionExtraData {
     totalLines?: number
     fileSize?: bigint | number
     truncated?: boolean
+    rangeApplied?: boolean
+    relatedCursorRulePaths?: string[]
+    relatedCursorRules?: Array<Record<string, unknown>>
   }
   shellResult?: {
     stdout?: string
@@ -4832,6 +4837,32 @@ export class CursorGrpcService {
         0xffffffff
       )
       const truncated = this.parseBooleanFlag(readSuccess?.truncated)
+      const readRange =
+        normalizedReadArgs.offset !== undefined ||
+        normalizedReadArgs.limit !== undefined
+          ? create(ReadRangeSchema, {
+              startLine:
+                normalizedReadArgs.offset !== undefined
+                  ? normalizedReadArgs.offset + 1
+                  : 1,
+              endLine:
+                normalizedReadArgs.limit !== undefined
+                  ? (normalizedReadArgs.offset ?? 0) + normalizedReadArgs.limit
+                  : totalLines,
+            })
+          : undefined
+      const relatedCursorRulePaths = Array.isArray(
+        readSuccess?.relatedCursorRulePaths
+      )
+        ? readSuccess.relatedCursorRulePaths
+            .map((entry) => safeString(entry).trim())
+            .filter((entry) => entry.length > 0)
+        : []
+      const relatedCursorRules = Array.isArray(readSuccess?.relatedCursorRules)
+        ? readSuccess.relatedCursorRules
+            .filter((entry) => !!entry && typeof entry === "object")
+            .map((entry) => create(CursorRuleSchema, entry))
+        : []
       const readResultOneOf =
         status === "success"
           ? {
@@ -4855,7 +4886,10 @@ export class CursorGrpcService {
                     ? successData.length === 0
                     : successContent.length === 0,
                 exceededLimit: truncated,
+                readRange,
                 includeLineNumbers: normalizedReadArgs.includeLineNumbers,
+                relatedCursorRulePaths,
+                relatedCursorRules,
               }),
             }
           : {

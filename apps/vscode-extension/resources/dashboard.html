@@ -310,11 +310,10 @@
     .acct-sidebar { width: 160px; flex-shrink: 0; border-right: 1px solid var(--line); overflow-y: auto; background: var(--bg); }
     .acct-detail-panel { flex: 1; padding: var(--sp-5); overflow-y: auto; }
     .acct-group-title {
-      display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3);
+      padding: var(--sp-3) var(--sp-3) var(--sp-1);
       font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
-      color: var(--fg-3); border-bottom: 1px solid var(--line); background: var(--card);
+      color: var(--fg-3);
     }
-    .acct-group-title .ch-bar { width: 3px; height: 12px; border-radius: 2px; }
     .acct-group-add {
       margin-left: auto; font-size: 14px; font-weight: 700; cursor: pointer; border: none;
       background: none; color: var(--fg-2); padding: 0 4px; line-height: 1;
@@ -607,7 +606,7 @@
         <div class="section-head">
           <span class="section-title">Accounts</span>
           <div style="display:flex;gap:var(--sp-2);align-items:center">
-            <button id="accounts-refresh-btn" class="btn btn-ghost" onclick="refreshPoolStatus(true)" title="Refresh Status">Refresh</button>
+            <button id="accounts-refresh-btn" class="btn btn-ghost" onclick="refreshPoolStatus(true, true)" title="Refresh Status">Refresh</button>
           </div>
         </div>
         <div id="pool-summary" style="margin-bottom:var(--sp-4)"></div>
@@ -733,7 +732,7 @@
 
     const CH = {
       antigravity: {
-        label: 'Antigravity', barCls: 'ch-bar-ag', beCls: 'be-ag', color: '#34d399',
+        label: 'Antigravity IDE', barCls: 'ch-bar-ag', beCls: 'be-ag', color: '#34d399',
         mode: 'sync',
         sync: [
           { label: 'Sync Antigravity IDE', cmd: 'agentVibes.syncAntigravityIDE' },
@@ -744,9 +743,12 @@
         info: a => { const t = a.accessToken || a.token?.access_token || ''; return t ? t.slice(0, 24) + '...' : 'No token'; },
       },
       codex: {
-        label: 'Codex (OpenAI)', barCls: 'ch-bar-cx', beCls: 'be-cx', color: '#fbbf24',
+        label: 'Codex CLI', barCls: 'ch-bar-cx', beCls: 'be-cx', color: '#fbbf24',
         mode: 'codex-oauth',
-        sync: [{ label: 'Sync Codex', cmd: 'agentVibes.syncCodex' }],
+        sync: [
+          { label: 'Sync Codex CLI', cmd: 'agentVibes.syncCodex' },
+          { label: 'Sync CPA', cmd: 'agentVibes.importCodexCpaJsons' }
+        ],
         fields: [],
         name: a => {
           var base = a.email || a.accountId || 'Unknown';
@@ -769,7 +771,7 @@
         info: a => a.baseUrl || '',
       },
       'claude-api': {
-        label: 'Claude API', barCls: 'ch-bar-cl', beCls: 'be-cl', color: '#f87171',
+        label: 'Claude Code CLI', barCls: 'ch-bar-cl', beCls: 'be-cl', color: '#f87171',
         mode: 'form',
         sync: [{ label: 'Sync Claude', cmd: 'agentVibes.syncClaude' }],
         fields: [
@@ -795,6 +797,23 @@
       };
     }
 
+    function hasUsageSummaryCache() {
+      return usageSummaryData != null;
+    }
+
+    function hasDailyUsageCache() {
+      return dailyUsageData != null;
+    }
+
+    function hasAnalyticsCache() {
+      return hasUsageSummaryCache() && hasDailyUsageCache();
+    }
+
+    function isAnalyticsPaneActive() {
+      var analyticsPane = document.getElementById('pane-analytics');
+      return !!(analyticsPane && analyticsPane.classList.contains('active'));
+    }
+
     function restoreAnalyticsCache() {
       try {
         var state = vscode.getState() || {};
@@ -806,7 +825,7 @@
           dailyUsageData = state.dailyUsageData;
           renderTokenHeatmap(state.dailyUsageData);
         }
-        analyticsHydrated = !!(state.usageSummaryData || state.dailyUsageData);
+        analyticsHydrated = hasAnalyticsCache();
       } catch (err) {
         analyticsHydrated = false;
       }
@@ -822,6 +841,17 @@
         }
       } catch (err) {
         codexQuotaData = null;
+      }
+    }
+
+    function restoreGoogleQuotaCache() {
+      try {
+        var state = vscode.getState() || {};
+        if (state.googleQuotaData && state.googleQuotaData.accounts) {
+          googleQuotaData = state.googleQuotaData;
+        }
+      } catch (err) {
+        googleQuotaData = null;
       }
     }
 
@@ -849,8 +879,20 @@
       }
     }
 
+    function persistGoogleQuotaCache() {
+      try {
+        var prev = vscode.getState() || {};
+        vscode.setState(Object.assign({}, prev, {
+          googleQuotaData: googleQuotaData,
+        }));
+      } catch (err) {
+        // ignore cache persistence failures
+      }
+    }
+
     restoreAnalyticsCache();
     restoreCodexQuotaCache();
+    restoreGoogleQuotaCache();
 
     // ── Tabs ──
     document.querySelectorAll('.tab').forEach(t => {
@@ -861,10 +903,10 @@
         const pane = document.getElementById('pane-' + t.dataset.tab);
         pane.classList.add('active');
         if (t.dataset.tab === 'logs') refreshLogs();
-        if (t.dataset.tab === 'accounts') { refreshPoolStatus(false); }
+        if (t.dataset.tab === 'accounts') { refreshPoolStatus(false, false); }
         if (t.dataset.tab === 'analytics') {
-          if (!analyticsHydrated) restoreAnalyticsCache();
-          if (!analyticsHydrated) refreshUsageSummary();
+          if (!hasAnalyticsCache()) restoreAnalyticsCache();
+          refreshUsageSummary();
         }
       });
     });
@@ -876,6 +918,9 @@
         lastStatusData = m.data;
         reconcilePendingCommand(m.data);
         renderStatus(m.data);
+        if (isAnalyticsPaneActive()) {
+          refreshUsageSummary();
+        }
       }
       if (m.type === 'accountsUpdate') { allData = m.data; renderAccounts(m.data); renderBackendSummary(m.data); }
       if (m.type === 'settingsUpdate') renderSettings(m.data);
@@ -892,13 +937,13 @@
       if (m.type === 'codexQuotaUpdate') renderCodexQuota(m.data);
       if (m.type === 'usageSummaryUpdate') {
         usageSummaryData = m.data;
-        analyticsHydrated = true;
+        analyticsHydrated = hasAnalyticsCache();
         renderUsageSummary(m.data);
         persistAnalyticsCache();
       }
       if (m.type === 'dailyUsageUpdate') {
         dailyUsageData = m.data;
-        analyticsHydrated = true;
+        analyticsHydrated = hasAnalyticsCache();
         renderTokenHeatmap(m.data);
         persistAnalyticsCache();
       }
@@ -917,7 +962,7 @@
 
     // Fetch initial pool status once on load
     setTimeout(function() {
-      refreshPoolStatus();
+      refreshPoolStatus(false, false);
     }, 0);
 
     var lastStatusData = null;
@@ -969,20 +1014,6 @@
       }
 
       return Math.round(num).toLocaleString();
-    }
-
-    function formatKUnitNumber(value) {
-      var num = Number(value || 0);
-      if (!isFinite(num)) return '--';
-      var abs = Math.abs(num);
-      if (abs < 1000) return Math.round(num).toLocaleString();
-      var scaled = num / 1000;
-      var digits = Math.abs(scaled) >= 100 ? 0 : 1;
-      var text = scaled.toLocaleString(undefined, {
-        minimumFractionDigits: 0,
-        maximumFractionDigits: digits,
-      }).replace(/\.0$/, '');
-      return text + 'k';
     }
 
     function formatPercent(value) {
@@ -1201,6 +1232,9 @@
       if (versions.extensionVersion) {
         metaCards.push({ label: 'Extension', value: normalizeVersionLabel(versions.extensionVersion) });
       }
+      if (versions.currentAntigravityVersion) {
+        metaCards.push({ label: 'Antigravity', value: normalizeVersionLabel(versions.currentAntigravityVersion) });
+      }
       if (versions.currentCursorVersion) {
         metaCards.push({ label: 'Cursor', value: normalizeVersionLabel(versions.currentCursorVersion) });
       }
@@ -1312,6 +1346,35 @@
     var emailPrivacy = false;
     var codexSubView = 'accounts';
     var antigravityDraft = { proxyUrl: '' };
+    var ACCT_PROVIDER_GROUPS = [
+      { key: 'google', label: 'Google', barCls: 'ch-bar-ag', channels: ['antigravity'] },
+      { key: 'openai', label: 'OpenAI', barCls: 'ch-bar-cx', channels: ['codex', 'openai-compat'] },
+      { key: 'anthropic', label: 'Anthropic', barCls: 'ch-bar-cl', channels: ['claude-api'] },
+    ];
+
+    function getAccountSidebarGroups() {
+      return ACCT_PROVIDER_GROUPS.map(function(group) {
+        return {
+          key: group.key,
+          label: group.label,
+          barCls: group.barCls,
+          channels: group.channels.filter(function(channel) { return !!CH[channel]; })
+        };
+      }).filter(function(group) {
+        return group.channels.length > 0;
+      });
+    }
+
+    function getDefaultSelectedChannel() {
+      if (selectedChannel && CH[selectedChannel]) return selectedChannel;
+      var groups = getAccountSidebarGroups();
+      for (var gi = 0; gi < groups.length; gi++) {
+        if (groups[gi].channels.length > 0) {
+          return groups[gi].channels[0];
+        }
+      }
+      return 'antigravity';
+    }
 
     function maskEmail(email) {
       if (!emailPrivacy || !email) return email;
@@ -1327,37 +1390,37 @@
 
     function renderAccounts(data) {
       const sidebar = document.getElementById('acct-sidebar');
+      const groups = getAccountSidebarGroups();
+      selectedChannel = getDefaultSelectedChannel();
       let h = '';
 
-      for (const [k, d] of Object.entries(CH)) {
-        const state = getChannelState(data, k);
-        const list = state.accounts;
-        const sel = selectedChannel === k;
+      groups.forEach(function(group) {
+        h += '<div class="acct-group-title">' + esc(group.label) + '</div>';
 
-        h += '<div class="acct-item' + (sel ? ' selected' : '') + '" onclick="selectChannel(\'' + k + '\')">';
-        h += '<span class="ch-bar ' + d.barCls + '"></span>';
-        h += '<span class="acct-item-name">' + esc(d.label) + '</span>';
-        h += '<span style="font-size:var(--text-xs);color:var(--fg-3)">' + list.length + '</span>';
-        h += '</div>';
-      }
+        group.channels.forEach(function(channel) {
+          const d = CH[channel];
+          const state = getChannelState(data, channel);
+          const list = state.accounts;
+          const sel = selectedChannel === channel;
+
+          h += '<div class="acct-item' + (sel ? ' selected' : '') + '" onclick="selectChannel(\'' + channel + '\')">';
+          h += '<span class="ch-bar ' + d.barCls + '"></span>';
+          h += '<span class="acct-item-name">' + esc(d.label) + '</span>';
+          h += '<span style="font-size:var(--text-xs);color:var(--fg-3)">' + list.length + '</span>';
+          h += '</div>';
+        });
+      });
+
       sidebar.innerHTML = h;
       renderChannelDetail();
     }
 
     function selectChannel(channel) {
-      selectedChannel = channel;
+      selectedChannel = CH[channel] ? channel : getDefaultSelectedChannel();
       codexSubView = 'accounts';
       acctPage = 0;
-      // Update sidebar highlight
-      document.querySelectorAll('#acct-sidebar .acct-item').forEach(function(el) { el.classList.remove('selected'); });
-      var items = document.querySelectorAll('#acct-sidebar .acct-item');
-      var idx = 0;
-      for (var k in CH) {
-        if (k === channel && items[idx]) items[idx].classList.add('selected');
-        idx++;
-      }
-      renderChannelDetail();
-      if (channel === 'codex' && codexQuotaData && codexQuotaData.accounts && codexQuotaData.accounts.length) {
+      renderAccounts(allData || {});
+      if (selectedChannel === 'codex' && codexQuotaData && codexQuotaData.accounts && codexQuotaData.accounts.length) {
         setTimeout(function() {
           refreshCodexQuota(false);
         }, 0);
@@ -1407,8 +1470,11 @@
 
     function getQuotaAccount(email) {
       if (!googleQuotaData || !googleQuotaData.accounts) return null;
+      var normalizedEmail = email ? String(email).trim().toLowerCase() : '';
       for (var i = 0; i < googleQuotaData.accounts.length; i++) {
-        if (googleQuotaData.accounts[i].email === email) return googleQuotaData.accounts[i];
+        var item = googleQuotaData.accounts[i];
+        var itemEmail = item && item.email ? String(item.email).trim().toLowerCase() : '';
+        if (normalizedEmail && itemEmail === normalizedEmail) return item;
       }
       return null;
     }
@@ -1429,6 +1495,74 @@
         if (poolLabel && item && item.label === poolLabel) return item;
       }
       return (poolEntry && poolEntry.rateLimits) ? poolEntry : null;
+    }
+
+    function getEffectiveCodexPoolEntry(acct, poolEntry) {
+      var quotaEntry = getCodexQuotaAccount(acct, poolEntry);
+      if (!poolEntry) {
+        if (!quotaEntry) return null;
+        return {
+          ...quotaEntry,
+          cooldownUntil: quotaEntry && quotaEntry.cooldownUntil ? quotaEntry.cooldownUntil : 0,
+          cooldownRemainingMs: quotaEntry && typeof quotaEntry.cooldownRemainingMs === 'number' ? quotaEntry.cooldownRemainingMs : 0,
+          modelCooldowns: quotaEntry && Array.isArray(quotaEntry.modelCooldowns) ? quotaEntry.modelCooldowns : []
+        };
+      }
+      if (!quotaEntry) return poolEntry;
+      return {
+        ...poolEntry,
+        state: quotaEntry.state || poolEntry.state,
+        cooldownUntil: quotaEntry.cooldownUntil || poolEntry.cooldownUntil || 0,
+        cooldownRemainingMs: typeof quotaEntry.cooldownRemainingMs === 'number'
+          ? quotaEntry.cooldownRemainingMs
+          : (typeof poolEntry.cooldownRemainingMs === 'number' ? poolEntry.cooldownRemainingMs : 0),
+        planType: quotaEntry.planType || poolEntry.planType,
+        modelCooldowns: Array.isArray(quotaEntry.modelCooldowns) ? quotaEntry.modelCooldowns : (Array.isArray(poolEntry.modelCooldowns) ? poolEntry.modelCooldowns : []),
+        rateLimits: quotaEntry.rateLimits || poolEntry.rateLimits || null
+      };
+    }
+
+    function getEffectivePoolEntry(channel, acct, poolEntry) {
+      if (channel === 'codex') {
+        return getEffectiveCodexPoolEntry(acct, poolEntry);
+      }
+      return poolEntry;
+    }
+
+    function getEffectiveBackendEntries(backendKey, entries) {
+      if (!Array.isArray(entries)) return [];
+      if (backendKey !== 'codex') return entries;
+      return entries.map(function(entry) {
+        return getEffectiveCodexPoolEntry(null, entry) || entry;
+      });
+    }
+
+    function getBackendStateCounts(backendKey, backend) {
+      if (!backend) {
+        return { total: 0, ready: 0, cooling: 0, modelCooldown: 0, disabled: 0, unavailable: 0 };
+      }
+      var entries = getEffectiveBackendEntries(backendKey, backend.entries);
+      if (backendKey !== 'codex' || !entries.length) {
+        return {
+          total: backend.total || 0,
+          ready: backend.ready || 0,
+          cooling: backend.cooling || 0,
+          modelCooldown: backend.modelCooldown || 0,
+          disabled: backend.disabled || 0,
+          unavailable: backend.unavailable || 0
+        };
+      }
+
+      var counts = { total: entries.length, ready: 0, cooling: 0, modelCooldown: 0, disabled: 0, unavailable: 0 };
+      entries.forEach(function(entry) {
+        if (!entry) return;
+        if (entry.state === 'ready') counts.ready += 1;
+        else if (entry.state === 'cooldown') counts.cooling += 1;
+        else if (entry.state === 'model_cooldown') counts.modelCooldown += 1;
+        else if (entry.state === 'disabled') counts.disabled += 1;
+        else if (entry.state === 'unavailable') counts.unavailable += 1;
+      });
+      return counts;
     }
 
     var codexQuotaStatus = {
@@ -1568,7 +1702,8 @@
         var idx = Number(node.getAttribute('data-codex-quota-index'));
         var acct = state.accounts[idx];
         var poolEntry = getPoolEntry('codex', idx);
-        var codexQuotaAcct = acct ? getCodexQuotaAccount(acct, poolEntry) : null;
+        var effectivePoolEntry = getEffectivePoolEntry('codex', acct, poolEntry);
+        var codexQuotaAcct = acct ? getCodexQuotaAccount(acct, effectivePoolEntry) : null;
         node.innerHTML = renderCodexRateLimitRows(codexQuotaAcct);
       });
       updateCodexQuotaRefreshHint();
@@ -1595,13 +1730,17 @@
 
     function renderChannelDetail() {
       var panel = document.getElementById('acct-detail');
-      if (!selectedChannel || !allData) {
+      if (!allData) {
         panel.innerHTML = '<div class="detail-empty">Select a channel</div>';
         return;
       }
 
+      selectedChannel = getDefaultSelectedChannel();
       var d = CH[selectedChannel];
-      if (!d) return;
+      if (!d) {
+        panel.innerHTML = '<div class="detail-empty">Select a channel</div>';
+        return;
+      }
       var state = getChannelState(allData, selectedChannel);
       var list = state.accounts;
 
@@ -1662,8 +1801,9 @@
           var i = sortedIndices[si2];
           var acct = list[i];
           var poolEntry = getPoolEntry(selectedChannel, i);
+          var effectivePoolEntry = getEffectivePoolEntry(selectedChannel, acct, poolEntry);
           var quotaAcct = (selectedChannel === 'antigravity' && acct.email) ? getQuotaAccount(acct.email) : null;
-          var codexQuotaAcct = (selectedChannel === 'codex') ? getCodexQuotaAccount(acct, poolEntry) : null;
+          var codexQuotaAcct = (selectedChannel === 'codex') ? getCodexQuotaAccount(acct, effectivePoolEntry) : null;
 
           h += '<div style="padding:var(--sp-3) 0">';
           h += '<div data-codex-account-index="' + i + '">';
@@ -1671,14 +1811,14 @@
           // Account row: left=info, right=remove
           h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)">';
           h += '<div style="display:flex;align-items:center;gap:var(--sp-2);min-width:0;flex:1">';
-          if (poolEntry) {
-            h += '<span class="dot ' + stateDotCls(poolEntry.state) + '"></span>';
+          if (effectivePoolEntry) {
+            h += '<span class="dot ' + stateDotCls(effectivePoolEntry.state) + '"></span>';
           }
           h += '<span style="font-weight:600;font-size:var(--text-base)">' + esc(maskEmail(d.name(acct))) + '</span>';
           // Badges
-          if (poolEntry && poolEntry.planType) {
-            var planLabel = poolEntry.planType.charAt(0).toUpperCase() + poolEntry.planType.slice(1).toLowerCase();
-            h += '<span class="setting-badge ' + planBadgeCls(poolEntry.planType) + '">' + esc(planLabel) + '</span>';
+          if (effectivePoolEntry && effectivePoolEntry.planType) {
+            var planLabel = effectivePoolEntry.planType.charAt(0).toUpperCase() + effectivePoolEntry.planType.slice(1).toLowerCase();
+            h += '<span class="setting-badge ' + planBadgeCls(effectivePoolEntry.planType) + '">' + esc(planLabel) + '</span>';
           }
           if (quotaAcct && quotaAcct.tier) {
             var tierRaw = String(quotaAcct.tier).replace(/^google\s*ai\s*/i, '');
@@ -1686,8 +1826,13 @@
             var tierLabel = tierRaw.charAt(0).toUpperCase() + tierRaw.slice(1).toLowerCase();
             h += '<span class="setting-badge ' + (tier === 'ULTRA' || tier.indexOf('ULTRA') >= 0 ? 'setting-badge-ok' : tier === 'PRO' || tier.indexOf('PRO') >= 0 ? 'setting-badge-warn' : '') + '">' + esc(tierLabel) + '</span>';
           }
-          if (poolEntry) {
-            h += '<span style="font-size:var(--text-xs);color:var(--fg-2)">' + esc(stateLabel(poolEntry.state)) + '</span>';
+          if (effectivePoolEntry) {
+            var rowCooldownInfo = '';
+            var rowCooldownUntil = parseDateValue(effectivePoolEntry.cooldownUntil);
+            if (rowCooldownUntil && rowCooldownUntil.getTime() > Date.now()) {
+              rowCooldownInfo = ' · ' + formatRelativeTime(rowCooldownUntil.toISOString());
+            }
+            h += '<span style="font-size:var(--text-xs);color:var(--fg-2)">' + esc(stateLabel(effectivePoolEntry.state, effectivePoolEntry) + rowCooldownInfo) + '</span>';
           }
           h += '</div>';
           h += '<div class="account-actions">';
@@ -2315,11 +2460,11 @@
       vscode.postMessage({ type: 'getCodexQuota', data: { force: !!force } });
     }
 
-    function refreshPoolStatus(forceCodexQuota) {
+    function refreshPoolStatus(forceCodexQuota, forceGoogleQuota) {
       var btn = document.getElementById('accounts-refresh-btn');
       if (btn) { btn.disabled = true; btn.textContent = 'Refreshing...'; }
       vscode.postMessage({ type: 'getPoolStatus' });
-      vscode.postMessage({ type: 'getGoogleQuota' });
+      vscode.postMessage({ type: 'getGoogleQuota', data: { force: forceGoogleQuota === true } });
       refreshCodexQuota(!!forceCodexQuota);
     }
 
@@ -2433,13 +2578,14 @@
     function parseDateValue(value) {
       if (value == null) return null;
       if (typeof value === 'number' && isFinite(value)) {
-        return new Date(value * 1000);
+        return value > 1e12 ? new Date(value) : new Date(value * 1000);
       }
       if (typeof value === 'string') {
         var trimmed = value.trim();
         if (!trimmed) return null;
         if (/^\d+$/.test(trimmed)) {
-          return new Date(Number(trimmed) * 1000);
+          var numeric = Number(trimmed);
+          return new Date(numeric > 1e12 ? numeric : numeric * 1000);
         }
         var parsed = Date.parse(trimmed);
         if (!isNaN(parsed)) return new Date(parsed);
@@ -2464,8 +2610,8 @@
     let googleQuotaData = null;
     let codexQuotaData = null;
 
-    function refreshGoogleQuota() {
-      vscode.postMessage({ type: 'getGoogleQuota' });
+    function refreshGoogleQuota(force) {
+      vscode.postMessage({ type: 'getGoogleQuota', data: { force: force === true } });
     }
 
     function renderCodexQuota(data) {
@@ -2484,13 +2630,22 @@
     }
 
     function refreshUsageSummary(force) {
-      if (force !== true && analyticsHydrated && usageSummaryData && dailyUsageData) {
+      if (usageSummaryData) {
         renderUsageSummary(usageSummaryData);
+      }
+      if (dailyUsageData) {
         renderTokenHeatmap(dailyUsageData);
+      }
+      analyticsHydrated = hasAnalyticsCache();
+      if (force !== true && analyticsHydrated) {
         return;
       }
-      vscode.postMessage({ type: 'getUsageSummary' });
-      vscode.postMessage({ type: 'getDailyUsage' });
+      if (force === true || !hasUsageSummaryCache()) {
+        vscode.postMessage({ type: 'getUsageSummary' });
+      }
+      if (force === true || !hasDailyUsageCache()) {
+        vscode.postMessage({ type: 'getDailyUsage' });
+      }
     }
 
     function renderTokenHeatmap(data) {
@@ -2662,10 +2817,10 @@
       }
 
       var backendMeta = {
-        codex: { label: 'Codex', cls: 'be-cx' },
-        google: { label: 'Antigravity', cls: 'be-ag' },
+        codex: { label: 'Codex CLI', cls: 'be-cx' },
+        google: { label: 'Antigravity IDE', cls: 'be-ag' },
         'openai-compat': { label: 'OpenAI-Compatible', cls: 'be-oai' },
-        'claude-api': { label: 'Claude API', cls: 'be-cl' },
+        'claude-api': { label: 'Claude Code CLI', cls: 'be-cl' },
       };
 
       function routeLabel(backend, transport) {
@@ -2820,13 +2975,13 @@
         '</div>';
 
       var cards = [
-        { label: 'Requests', value: formatKUnitNumber(totals.requests) },
-        { label: 'Context', value: formatKUnitNumber(totals.totalContextTokens) },
-        { label: 'Input', value: formatKUnitNumber(totals.inputTokens) },
-        { label: 'Cache Read', value: formatKUnitNumber(totals.cachedInputTokens) },
-        { label: 'Cache Write', value: formatKUnitNumber(totals.cacheCreationInputTokens) },
-        { label: 'Output', value: formatKUnitNumber(totals.outputTokens) },
-        { label: 'Web Search', value: formatKUnitNumber(totals.webSearchRequests) },
+        { label: 'Requests', value: formatCompactNumber(totals.requests) },
+        { label: 'Context', value: formatCompactNumber(totals.totalContextTokens) },
+        { label: 'Input', value: formatCompactNumber(totals.inputTokens) },
+        { label: 'Cache Read', value: formatCompactNumber(totals.cachedInputTokens) },
+        { label: 'Cache Write', value: formatCompactNumber(totals.cacheCreationInputTokens) },
+        { label: 'Output', value: formatCompactNumber(totals.outputTokens) },
+        { label: 'Web Search', value: formatCompactNumber(totals.webSearchRequests) },
         { label: 'Avg Duration', value: formatDurationMs(totals.avgDurationMs) },
       ];
 
@@ -2931,27 +3086,30 @@
       var container = document.getElementById('codex-summary-panel');
       if (!container) return;
       var backend = data && data.backends ? data.backends.codex : null;
-      if (!backend || !Array.isArray(backend.entries) || backend.entries.length === 0) {
+      var entries = getEffectiveBackendEntries('codex', backend && backend.entries);
+      if (!backend || !entries.length) {
         container.innerHTML = '';
         return;
       }
 
       var h = '<div style="margin-top:var(--sp-3);padding-top:var(--sp-2);border-top:1px solid var(--line)">';
       h += '<div class="section-title" style="margin-bottom:var(--sp-2)">Codex Availability</div>';
+      var counts = getBackendStateCounts('codex', backend);
       h += '<div class="status-grid" style="grid-template-columns:repeat(5,1fr);margin-bottom:var(--sp-3)">' +
-        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Total</div><div class="status-card-value">' + esc(backend.total ?? 0) + '</div></div></div>' +
-        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Ready</div><div class="status-card-value">' + esc(backend.ready ?? 0) + '</div></div></div>' +
-        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Model Hold</div><div class="status-card-value">' + esc(backend.modelCooldown ?? 0) + '</div></div></div>' +
-        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Cooling</div><div class="status-card-value">' + esc(backend.cooling ?? 0) + '</div></div></div>' +
-        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Disabled</div><div class="status-card-value">' + esc(backend.disabled ?? 0) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Total</div><div class="status-card-value">' + esc(counts.total) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Ready</div><div class="status-card-value">' + esc(counts.ready) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Model Hold</div><div class="status-card-value">' + esc(counts.modelCooldown) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Cooling</div><div class="status-card-value">' + esc(counts.cooling) + '</div></div></div>' +
+        '<div class="status-card"><div class="status-card-body"><div class="status-card-label">Disabled</div><div class="status-card-value">' + esc(counts.disabled + counts.unavailable) + '</div></div></div>' +
       '</div>';
 
-      for (var i = 0; i < backend.entries.length; i++) {
-        var entry = backend.entries[i];
+      for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i];
         var dotCls = stateDotCls(entry.state);
         var cooldownInfo = '';
-        if (entry.cooldownUntil && entry.cooldownUntil > Date.now()) {
-          cooldownInfo = ' · ' + formatRelativeTime(entry.cooldownUntil);
+        var cooldownUntil = parseDateValue(entry.cooldownUntil);
+        if (cooldownUntil && cooldownUntil.getTime() > Date.now()) {
+          cooldownInfo = ' · ' + formatRelativeTime(cooldownUntil.toISOString());
         }
         var activeModelCooldowns = getActiveModelCooldowns(entry);
         var modelCdCount = activeModelCooldowns.length;
@@ -2997,12 +3155,12 @@
       // Summary cards
       var totalReady = 0, totalCooling = 0, totalModelCooldown = 0, totalDisabled = 0, totalEntries = 0;
       for (var bk in data.backends) {
-        var b = data.backends[bk];
-        totalReady += (b.ready || 0);
-        totalCooling += (b.cooling || 0);
-        totalModelCooldown += (b.modelCooldown || 0);
-        totalDisabled += (b.disabled || 0) + (b.unavailable || 0);
-        totalEntries += (b.total || 0);
+        var counts = getBackendStateCounts(bk, data.backends[bk]);
+        totalReady += counts.ready;
+        totalCooling += counts.cooling;
+        totalModelCooldown += counts.modelCooldown;
+        totalDisabled += counts.disabled + counts.unavailable;
+        totalEntries += counts.total;
       }
 
       summaryEl.innerHTML =
@@ -3022,7 +3180,10 @@
     }
 
     function renderGoogleQuota(data) {
-      googleQuotaData = data;
+      if (data && data.accounts) {
+        googleQuotaData = data;
+        persistGoogleQuotaCache();
+      }
       // Refresh detail panel with new quota data
       renderChannelDetail();
       renderOverviewHealth();

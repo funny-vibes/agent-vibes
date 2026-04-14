@@ -104,6 +104,11 @@
         "category": "Agent Vibes"
       },
       {
+        "command": "agentVibes.importCodexCpaJsons",
+        "title": "Import Codex CPA JSONs",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.openOpenAICompatAccounts",
         "title": "Open OpenAI-Compatible Accounts JSON",
         "category": "Agent Vibes"

@@ -99,10 +99,7 @@ const ENABLED_CURSOR_FEATURES = new Set<string>([
  * GPT-5.4 variants (High Fast, Extra high Fast, etc.) must be enabled
  * manually in Cursor UI because defaultOn only works at the model level.
  */
-const DEFAULT_ON_MODELS = new Set<string>([
-  "claude-opus-4-6-thinking",
-  "gemini-3.1-pro-high",
-])
+const DEFAULT_ON_MODELS = new Set<string>(["gemini-3.1-pro-high"])
 
 function buildStatsigBootstrapConfig(
   featureGates: Iterable<string>,
@@ -124,9 +121,9 @@ function buildStatsigBootstrapConfig(
     }
   > = {}
 
-  for (const name of featureGates) {
+  const registerFeatureGate = (name: string, value: boolean) => {
     const entry = {
-      value: true,
+      value,
       rule_id: "protocol-bridge",
       id_type: "userID",
       name,
@@ -135,6 +132,10 @@ function buildStatsigBootstrapConfig(
     statsigFeatureGates[name] = entry
     // DJB2 hash key（statsig SDK 的 fallback 查找路径）
     statsigFeatureGates[djb2Hash(name)] = entry
+  }
+
+  for (const name of featureGates) {
+    registerFeatureGate(name, true)
   }
 
   const payloadBody = {
@@ -497,6 +498,7 @@ export class AiserverMockController {
           AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
           {
             hideSearchBar: false,
+            hideRoutedModelView: true,
             routedModelViewToNamedViewToggle: create(
               AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
               {

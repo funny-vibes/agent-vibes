@@ -111,7 +111,8 @@ export class HealthController {
   async getGoogleQuotaStatus(
     @Query("model") model?: string,
     @Query("limit") limit?: string,
-    @Query("sortBy") sortBy?: string
+    @Query("sortBy") sortBy?: string,
+    @Query("force") force?: string
   ) {
     await this.processPool.reloadAccounts()
     const normalizedModel = typeof model === "string" ? model.trim() : ""
@@ -121,7 +122,15 @@ export class HealthController {
       : 10
 
     const normalizedSortBy = this.normalizeGoogleQuotaSortBy(sortBy)
-    const accounts = await this.processPool.fetchGoogleQuotaSnapshots(true)
+    const forceRefresh = force === "1" || force === "true"
+    const quotaCache = this.processPool.getGoogleQuotaSnapshotCacheMetadata()
+    const shouldProbe = forceRefresh || !quotaCache.hasCache
+    const accounts =
+      await this.processPool.fetchGoogleQuotaSnapshots(shouldProbe)
+    const effectiveQuotaCache =
+      shouldProbe && !forceRefresh
+        ? this.processPool.getGoogleQuotaSnapshotCacheMetadata()
+        : quotaCache
     const filteredAccounts = this.filterGoogleQuotaAccounts(
       accounts,
       normalizedModel,
@@ -140,6 +149,13 @@ export class HealthController {
 
     return {
       timestamp: new Date().toISOString(),
+      source: shouldProbe ? "probe" : "cache",
+      cacheHit: quotaCache.hasCache,
+      fetchedAt:
+        effectiveQuotaCache.fetchedAt != null
+          ? new Date(effectiveQuotaCache.fetchedAt).toISOString()
+          : null,
+      cacheAgeMs: effectiveQuotaCache.cacheAgeMs,
       model: normalizedModel || null,
       limit: effectiveLimit,
       sortBy: normalizedSortBy,
@@ -229,6 +245,7 @@ export class HealthController {
 
     // Re-fetch after probe
     const freshStatus = this.codexService.getPoolStatus()
+    const now = Date.now()
     const accounts = freshStatus.entries.map((entry, index) => {
       const rateLimits = entry.rateLimits
       const effective = rateLimits?.effective
@@ -255,8 +272,18 @@ export class HealthController {
         accountId: entry.accountId || null,
         workspaceId: entry.workspaceId || null,
         state: entry.state,
+        cooldownUntil: entry.cooldownUntil
+          ? new Date(entry.cooldownUntil).toISOString()
+          : null,
+        cooldownRemainingMs: Math.max(0, entry.cooldownUntil - now),
         planType: entry.planType || null,
-        modelCooldowns: entry.modelCooldowns,
+        modelCooldowns: entry.modelCooldowns.map((modelCooldown) => ({
+          ...modelCooldown,
+          cooldownUntil: modelCooldown.cooldownUntil
+            ? new Date(modelCooldown.cooldownUntil).toISOString()
+            : null,
+          remainingMs: Math.max(0, modelCooldown.cooldownUntil - now),
+        })),
         rateLimits: rateLimits
           ? {
               effective: effective

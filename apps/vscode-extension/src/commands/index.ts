@@ -3,6 +3,7 @@ import * as vscode from "vscode"
 import { CMD } from "../constants"
 import { AccountSyncService } from "../services/account-sync"
 import {
+  importCodexCpaJsonDirectory,
   syncClaudeAccount,
   syncCodexAccount,
 } from "../services/backend-account-sync"
@@ -340,6 +341,45 @@ export function registerCommands(
         logger.error("Failed to sync Codex credentials", err)
         vscode.window.showErrorMessage(
           `Codex sync failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.IMPORT_CODEX_CPA_JSONS, async () => {
+      try {
+        const fs = await import("fs")
+
+        const selected = await vscode.window.showOpenDialog({
+          canSelectFiles: true,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: "Import CPA JSONs",
+          filters: {
+            JSON: ["json"],
+          },
+        })
+
+        const selectedPath = selected?.[0]?.fsPath?.trim()
+        if (!selectedPath) {
+          return
+        }
+
+        const sourceStat = fs.statSync(selectedPath)
+        const sourceDir = sourceStat.isDirectory()
+          ? selectedPath
+          : path.dirname(selectedPath)
+
+        const result = importCodexCpaJsonDirectory(config, sourceDir)
+        logger.info(result.summary)
+        vscode.window.showInformationMessage(
+          `${result.summary} → ${path.basename(result.destinationPath)}`
+        )
+      } catch (err) {
+        logger.error("Failed to import Codex CPA JSON directory", err)
+        vscode.window.showErrorMessage(
+          `Codex CPA import failed: ${err instanceof Error ? err.message : String(err)}`
         )
       }
     })

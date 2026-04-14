@@ -712,8 +712,13 @@ export class CodexService implements OnModuleInit {
       slot.workspaceId ||
       this.authService.getWorkspaceIdFromIdToken(tokenData.idToken)
     slot.email = tokenData.email || slot.email
-    slot.planType =
-      this.authService.getPlanTypeFromTokenData(tokenData) || slot.planType
+
+    // 与 CLIProxyAPI 的管理面板保持一致：
+    // 如果账号文件里已经明确声明了 planType，就不要再被 token claim 覆盖。
+    // 某些账号会出现 token 里仍然是 free，但实际账号/面板展示应保持 plus 的情况。
+    if (!slot.planType) {
+      slot.planType = this.authService.getPlanTypeFromTokenData(tokenData)
+    }
   }
 
   private getSlotPlanType(slot: CodexAccountSlot): CodexModelTier | null {

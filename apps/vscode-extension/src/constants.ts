@@ -21,6 +21,7 @@ export const CMD = {
   SYNC_ANTIGRAVITY_TOOLS: "agentVibes.syncAntigravityTools",
   SYNC_CLAUDE: "agentVibes.syncClaude",
   SYNC_CODEX: "agentVibes.syncCodex",
+  IMPORT_CODEX_CPA_JSONS: "agentVibes.importCodexCpaJsons",
   OPEN_OPENAI_COMPAT_ACCOUNTS: "agentVibes.openOpenAICompatAccounts",
   OPEN_CLAUDE_API_ACCOUNTS: "agentVibes.openClaudeApiAccounts",
   GENERATE_CERT: "agentVibes.generateCert",
