@@ -17,6 +17,7 @@ import {
   ModelParameterDefinition_ModelParameterTypeSchema,
   ModelParameterDefinitionSchema,
   type AvailableModelsResponse_AvailableModel,
+  type AvailableModelsResponse_ModelVariantConfig,
   type GetModelLabelsResponse_ModelLabel,
 } from "../../gen/aiserver/v1_pb"
 import {
@@ -26,6 +27,7 @@ import {
   type CursorDisplayModel,
 } from "../../llm/shared/model-registry"
 import { parseModelRequest } from "../../llm/shared/model-request"
+export { BASE_CODEX_CURSOR_DISPLAY_MODELS } from "../../llm/shared/model-registry"
 
 export const CURSOR_REASONING_PARAMETER_ID = "thinking"
 export const CURSOR_LEGACY_REASONING_PARAMETER_ID = "reasoning_effort"
@@ -48,8 +50,8 @@ const CURSOR_LEGACY_VARIANT_SUFFIXES = [
   "-medium",
 ] as const
 const STANDARD_EFFORT_ORDER = [
-  "medium",
   "low",
+  "medium",
   "minimal",
   "none",
   "high",
@@ -506,13 +508,41 @@ function buildFastModeParameterDefinition(model: CursorDisplayModel) {
   ]
 }
 
+/**
+ * 构建 Cursor 官方格式的变体 displayName。
+ *
+ * Cursor 前端通过 variant displayName / displayNameOutsidePicker 中的
+ * HTML `<span>` + `:icon-brain:` 标记来渲染设置页和聊天界面里的变体效果
+ * 图标和副文案。格式参考官方日志中的实际响应：
+ *
+ *   Composer 2 <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain: Fast</span>
+ *   Grok 4.20 <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain:</span>
+ */
+function buildVariantRichDisplayName(
+  baseDisplayName: string,
+  effort: string | null,
+  fastMode: boolean
+): string {
+  const labelParts: string[] = []
+
+  if (effort) {
+    labelParts.push(getEffortDisplayName(effort))
+  }
+  if (fastMode) {
+    labelParts.push("Fast")
+  }
+
+  const suffix = labelParts.length > 0 ? ` ${labelParts.join(" ")}` : ""
+
+  return `${baseDisplayName} <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain:${suffix}</span>`
+}
+
 function buildVariant(
   modelName: string,
   effort: string | null,
   options: {
     displayName: string
     displayNameOutsidePicker?: string
-    includeEffortInDisplayName?: boolean
     fastMode?: boolean
     isMaxMode: boolean
     isDefaultMaxConfig?: boolean
@@ -521,14 +551,16 @@ function buildVariant(
 ) {
   const fastMode = options.fastMode === true
   const cursorEffort = effort ? toCursorReasoningValue(effort) : null
-  const displayNameParts = [options.displayName]
-  if (options.includeEffortInDisplayName && effort) {
-    displayNameParts.push(getEffortDisplayName(effort))
-  }
-  if (fastMode) {
-    displayNameParts.push("Fast")
-  }
-  const displayName = displayNameParts.join(" ")
+  const richDisplayName = buildVariantRichDisplayName(
+    options.displayName,
+    effort,
+    fastMode
+  )
+  const richOutsidePicker = buildVariantRichDisplayName(
+    options.displayNameOutsidePicker || options.displayName,
+    effort,
+    fastMode
+  )
   const parameterValues = [
     effort
       ? create(RequestedModel_ModelParameterValueSchema, {
@@ -559,16 +591,69 @@ function buildVariant(
 
   return create(AvailableModelsResponse_ModelVariantConfigSchema, {
     parameterValues,
-    displayName,
+    displayName: richDisplayName,
     isMaxMode: options.isMaxMode,
     isDefaultMaxConfig: options.isDefaultMaxConfig,
     isDefaultNonMaxConfig: options.isDefaultNonMaxConfig,
     tagline,
-    displayNameOutsidePicker: fastMode
-      ? `${options.displayNameOutsidePicker || options.displayName} Fast`
-      : options.displayNameOutsidePicker || options.displayName,
+    displayNameOutsidePicker: richOutsidePicker,
     variantStringRepresentation: `${baseModelName}(${variantSegments.join(",")})`,
   })
+}
+
+function buildSimpleThinkingVariant(
+  model: CursorDisplayModel,
+  options: {
+    isMaxMode: boolean
+    isDefaultMaxConfig?: boolean
+    isDefaultNonMaxConfig?: boolean
+  }
+): AvailableModelsResponse_ModelVariantConfig {
+  return create(AvailableModelsResponse_ModelVariantConfigSchema, {
+    parameterValues: [
+      create(RequestedModel_ModelParameterValueSchema, {
+        id: CURSOR_FAST_PARAMETER_ID,
+        value: CURSOR_FAST_MODE_DISABLED,
+      }),
+    ],
+    displayName: model.displayName,
+    displayNameOutsidePicker: model.shortName,
+    isMaxMode: options.isMaxMode,
+    isDefaultMaxConfig: options.isDefaultMaxConfig,
+    isDefaultNonMaxConfig: options.isDefaultNonMaxConfig,
+    // Claude / Gemini 这类布尔 thinking 模型不使用 GPT 风格 reasoning tagline
+    //（Low / Medium / High）。保持空即可，避免设置页和聊天 picker
+    // 错误显示 “Thinking Low / Medium”。
+    tagline: undefined,
+    variantStringRepresentation: `${parseModelRequest(model.name).baseModel}(max=${options.isMaxMode ? "true" : "false"})`,
+  })
+}
+
+function buildSimpleThinkingVariants(
+  model: CursorDisplayModel,
+  options: {
+    supportsCursorMaxMode: boolean
+  }
+): AvailableModelsResponse_ModelVariantConfig[] {
+  if (!options.supportsCursorMaxMode) {
+    return [
+      buildSimpleThinkingVariant(model, {
+        isMaxMode: false,
+        isDefaultNonMaxConfig: true,
+      }),
+    ]
+  }
+
+  return [
+    buildSimpleThinkingVariant(model, {
+      isMaxMode: false,
+      isDefaultNonMaxConfig: true,
+    }),
+    buildSimpleThinkingVariant(model, {
+      isMaxMode: true,
+      isDefaultMaxConfig: true,
+    }),
+  ]
 }
 
 function buildReasoningVariants(
@@ -578,7 +663,6 @@ function buildReasoningVariants(
     maxNamedModel: boolean
     supportsCursorMaxMode: boolean
     supportsCursorFastMode: boolean
-    includeEffortInDisplayName: boolean
     standardEffort: string | null
     defaultMaxEffort: string | null
   }
@@ -592,7 +676,6 @@ function buildReasoningVariants(
         buildVariant(model.name, effort, {
           displayName: model.displayName,
           displayNameOutsidePicker: model.shortName,
-          includeEffortInDisplayName: options.includeEffortInDisplayName,
           fastMode,
           isMaxMode: true,
           isDefaultMaxConfig:
@@ -608,7 +691,6 @@ function buildReasoningVariants(
         buildVariant(model.name, effort, {
           displayName: model.displayName,
           displayNameOutsidePicker: model.shortName,
-          includeEffortInDisplayName: options.includeEffortInDisplayName,
           fastMode,
           isMaxMode: false,
           isDefaultNonMaxConfig:
@@ -623,7 +705,6 @@ function buildReasoningVariants(
       buildVariant(model.name, effort, {
         displayName: model.displayName,
         displayNameOutsidePicker: model.shortName,
-        includeEffortInDisplayName: options.includeEffortInDisplayName,
         fastMode,
         isMaxMode: false,
         isDefaultNonMaxConfig:
@@ -632,7 +713,6 @@ function buildReasoningVariants(
       buildVariant(model.name, effort, {
         displayName: model.displayName,
         displayNameOutsidePicker: model.shortName,
-        includeEffortInDisplayName: options.includeEffortInDisplayName,
         fastMode,
         isMaxMode: true,
         isDefaultMaxConfig:
@@ -642,12 +722,7 @@ function buildReasoningVariants(
   )
 }
 
-function resolveAvailableModelMode(
-  model: CursorDisplayModel,
-  options?: {
-    includeEffortInDisplayName?: boolean
-  }
-): {
+function resolveAvailableModelMode(model: CursorDisplayModel): {
   supportsThinking: boolean
   supportsMaxMode: boolean
   supportsNonMaxMode: boolean
@@ -696,25 +771,18 @@ function resolveAvailableModelMode(
         maxNamedModel: true,
         supportsCursorMaxMode: true,
         supportsCursorFastMode: supportsFastMode,
-        includeEffortInDisplayName:
-          options?.includeEffortInDisplayName === true,
         standardEffort,
         defaultMaxEffort,
       }),
     }
   }
 
-  // For thinking models without explicit effort levels (e.g. Claude Opus
-  // Thinking, Gemini 3.1 Pro High), generate simple max/non-max variants so
-  // that the Cursor UI MAX Mode toggle is enabled.
+  // For boolean thinking models without explicit effort levels (e.g. Claude
+  // Opus Thinking, Gemini 3.1 Pro High), Cursor 官方只表现为 thinking on/off
+  // 或 non-max/max，不应错误投影为 GPT 风格的 Low/Medium/High effort。
   if (!supportsThinking && model.isThinking) {
-    const simpleVariants = buildReasoningVariants(model, [], {
-      maxNamedModel: false,
+    const simpleVariants = buildSimpleThinkingVariants(model, {
       supportsCursorMaxMode: true,
-      supportsCursorFastMode: supportsFastMode,
-      includeEffortInDisplayName: options?.includeEffortInDisplayName === true,
-      standardEffort: null,
-      defaultMaxEffort: null,
     })
 
     return {
@@ -730,7 +798,6 @@ function resolveAvailableModelMode(
     maxNamedModel: false,
     supportsCursorMaxMode,
     supportsCursorFastMode: supportsFastMode,
-    includeEffortInDisplayName: options?.includeEffortInDisplayName === true,
     standardEffort,
     defaultMaxEffort,
   })
@@ -743,6 +810,41 @@ function resolveAvailableModelMode(
     parameterDefinitions,
     variants,
   }
+}
+
+function selectDefaultDisplayVariant(
+  variants: readonly ReturnType<typeof buildVariant>[]
+): ReturnType<typeof buildVariant> | null {
+  return (
+    variants.find((variant) => variant.isDefaultNonMaxConfig) ||
+    variants.find((variant) => variant.isDefaultMaxConfig) ||
+    variants[0] ||
+    null
+  )
+}
+
+function extractVariantSuffix(
+  fullDisplayName: string | undefined,
+  baseDisplayName: string
+): string | undefined {
+  if (!fullDisplayName) {
+    return undefined
+  }
+
+  const trimmed = fullDisplayName.trim()
+  if (!trimmed) {
+    return undefined
+  }
+
+  if (trimmed === baseDisplayName) {
+    return undefined
+  }
+
+  if (trimmed.startsWith(`${baseDisplayName} `)) {
+    return trimmed.slice(baseDisplayName.length + 1).trim() || undefined
+  }
+
+  return trimmed
 }
 
 function getLegacyTopLevelEffortValues(modelName: string): string[] {
@@ -813,23 +915,11 @@ function buildLegacyVariantDisplayName(
   }
 ): string {
   const effort = options.effort || "medium"
-  const labelParts: string[] = []
-
-  if (effort !== "medium") {
-    labelParts.push(getEffortDisplayName(effort))
-  }
-  if (options.fastMode === true) {
-    labelParts.push("Fast")
-  }
-
-  const suffix =
-    labelParts.length > 0
-      ? ` ${labelParts.join(" ")}`
-      : options.fastMode
-        ? " Fast"
-        : ""
-
-  return `${model.displayName} <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain:${suffix}</span>`
+  return buildVariantRichDisplayName(
+    model.displayName,
+    effort,
+    options.fastMode === true
+  )
 }
 
 function buildLegacySingleVariantModel(
@@ -942,7 +1032,8 @@ export function buildLegacyCursorAvailableModels(
   if (model.family !== "gpt") {
     return [
       buildCursorAvailableModel(model, namedModelSectionIndex, {
-        parameterized: false,
+        includeParameterDefinitions: false,
+        includeVariants: true,
         defaultOn: options?.defaultOn,
       }),
     ]
@@ -1059,17 +1150,29 @@ export function buildCursorAvailableModel(
   model: CursorDisplayModel,
   namedModelSectionIndex: number,
   options?: {
-    parameterized?: boolean
+    includeParameterDefinitions?: boolean
+    includeVariants?: boolean
     defaultOn?: boolean
-    includeEffortInDisplayName?: boolean
   }
 ): AvailableModelsResponse_AvailableModel {
-  const capability = resolveAvailableModelMode(model, {
-    includeEffortInDisplayName: options?.includeEffortInDisplayName,
-  })
+  const capability = resolveAvailableModelMode(model)
   const contextTokenLimit =
     model.contextTokenLimit || (model.family === "gemini" ? 1_000_000 : 200_000)
-  const parameterized = options?.parameterized ?? true
+  const includeParameterDefinitions =
+    options?.includeParameterDefinitions ?? true
+  const includeVariants = options?.includeVariants ?? true
+  const projectedVariants = includeVariants ? capability.variants : []
+  const defaultDisplayVariant = selectDefaultDisplayVariant(projectedVariants)
+  const shouldSuppressProjectedTagline =
+    model.isThinking && model.family !== "gpt"
+  const projectedTagline = shouldSuppressProjectedTagline
+    ? model.displayName
+    : defaultDisplayVariant?.tagline ||
+      extractVariantSuffix(
+        defaultDisplayVariant?.displayName,
+        model.displayName
+      ) ||
+      model.displayName
 
   return create(AvailableModelsResponse_AvailableModelSchema, {
     name: model.name,
@@ -1095,18 +1198,21 @@ export function buildCursorAvailableModel(
     isRecommendedForBackgroundComposer:
       model.isRecommendedForBackgroundComposer ?? false,
     isUserAdded: model.isUserAdded || undefined,
-    parameterDefinitions: parameterized ? capability.parameterDefinitions : [],
-    variants: parameterized ? capability.variants : [],
-    cloudAgentEffortMode: parameterized
-      ? capability.cloudAgentEffortMode
-      : undefined,
+    parameterDefinitions: includeParameterDefinitions
+      ? capability.parameterDefinitions
+      : [],
+    variants: projectedVariants,
+    cloudAgentEffortMode:
+      includeParameterDefinitions || includeVariants
+        ? capability.cloudAgentEffortMode
+        : undefined,
     cloudMigrateToModel: model.cloudMigrateToModel,
     upgradeModelId: model.upgradeModelId,
     isHidden: model.isHidden || undefined,
     legacySlugs: model.legacySlugs || [],
     idAliases: model.idAliases || [],
     namedModelSectionIndex,
-    tagline: model.displayName,
+    tagline: projectedTagline,
     visibleInRoutedModelView:
       model.visibleInRoutedModelView ?? model.family !== "gpt",
   })
@@ -1189,10 +1295,21 @@ export function resolveCursorDefaultSelection(
 export function buildCursorModelLabel(
   model: CursorDisplayModel
 ): GetModelLabelsResponse_ModelLabel {
+  const capability = resolveAvailableModelMode(model)
+  const defaultDisplayVariant = selectDefaultDisplayVariant(capability.variants)
+  const projectedShortLabel =
+    defaultDisplayVariant?.tagline ||
+    extractVariantSuffix(
+      defaultDisplayVariant?.displayNameOutsidePicker ||
+        defaultDisplayVariant?.displayName,
+      model.displayName
+    ) ||
+    model.shortName
+
   return create(GetModelLabelsResponse_ModelLabelSchema, {
     name: model.name,
     label: model.displayName,
-    shortLabel: model.shortName,
+    shortLabel: projectedShortLabel,
     supportsAgent: true,
   })
 }

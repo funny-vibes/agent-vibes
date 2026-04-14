@@ -1,15 +1,15 @@
 import { HttpException, Injectable, Logger } from "@nestjs/common"
 import {
+  BackendAccountPoolUnavailableError,
+  BackendApiError,
+} from "./backend-errors"
+import {
   canPublicClaudeModelUseGoogle,
   detectModelFamily,
   doesModelSupportThinking,
   isOpusModel,
   resolveCloudCodeModel,
 } from "./model-registry"
-import {
-  BackendAccountPoolUnavailableError,
-  BackendApiError,
-} from "./backend-errors"
 
 /**
  * Backend types for routing.
@@ -300,20 +300,26 @@ export class ModelRouterService {
       })
     }
 
-    if (this.googleAvailable) {
+    if (this.googleAvailable && canPublicClaudeModelUseGoogle(normalized)) {
       if (isOpus) {
         // Opus models always route through google-claude
-        if (canPublicClaudeModelUseGoogle(normalized)) {
-          const opusCloudCodeId =
-            entry?.family === "claude"
-              ? entry.cloudCodeId
-              : "claude-opus-4-6-thinking"
-          candidates.push({
-            backend: "google-claude",
-            model: opusCloudCodeId,
-            isThinking: true,
-          })
-        }
+        const opusCloudCodeId =
+          entry?.family === "claude"
+            ? entry.cloudCodeId
+            : "claude-opus-4-6-thinking"
+        candidates.push({
+          backend: "google-claude",
+          model: opusCloudCodeId,
+          isThinking: true,
+        })
+      }
+
+      if (entry?.family === "claude" && normalized.includes("sonnet")) {
+        candidates.push({
+          backend: "google-claude",
+          model: entry.cloudCodeId,
+          isThinking: entry.isThinking,
+        })
       }
     }
 
@@ -494,6 +500,13 @@ export class ModelRouterService {
             `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
           )
           return route
+        }
+
+        if (normalized.includes("haiku")) {
+          throw new Error(
+            `Model ${cursorModel} is not available through Google Cloud Code. ` +
+              `To use this Haiku model, configure a Claude API backend that supports it, or switch to a supported Claude Sonnet/Opus model.`
+          )
         }
 
         throw new Error(

@@ -104,6 +104,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
     token: string,
     isApiKey: boolean,
     accountId?: string,
+    workspaceId?: string,
     cacheHeaders?: Record<string, string>,
     forwardHeaders?: CodexForwardHeaders,
     omitAccountId: boolean = false
@@ -112,6 +113,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
       token,
       isApiKey,
       accountId,
+      workspaceId,
       cacheHeaders,
       forwardHeaders,
       omitAccountId,

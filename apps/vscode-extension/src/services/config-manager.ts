@@ -77,7 +77,7 @@ export class ConfigManager {
     return (
       vscode.workspace
         .getConfiguration("agentVibes")
-        .get<boolean>("thinkingBudgetAuto") ?? false
+        .get<boolean>("thinkingBudgetAuto") ?? true
     )
   }
 
@@ -86,6 +86,14 @@ export class ConfigManager {
       vscode.workspace
         .getConfiguration("agentVibes")
         .get<boolean>("antigravitySystemPrompt") ?? true
+    )
+  }
+
+  get antigravityOfficialTools(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<boolean>("antigravityOfficialTools") ?? true
     )
   }
 
@@ -231,6 +239,26 @@ export class ConfigManager {
     if (index >= 0 && index < accounts.length) {
       accounts.splice(index, 1)
       this.writeAccounts(filePath, accounts)
+    }
+  }
+
+  /** Remove a Codex account by accountId */
+  removeCodexAccount(filePath: string, accountId: string): void {
+    const normalizedAccountId = accountId.trim()
+    if (!normalizedAccountId) {
+      return
+    }
+
+    const accounts = this.readAccounts(filePath)
+    const nextAccounts = accounts.filter((account) => {
+      const rowAccountId = String(
+        account.accountId || account.account_id || ""
+      ).trim()
+      return rowAccountId !== normalizedAccountId
+    })
+
+    if (nextAccounts.length !== accounts.length) {
+      this.writeAccounts(filePath, nextAccounts)
     }
   }
 

@@ -23,10 +23,10 @@ import { HttpException, Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
 import * as fs from "fs"
-import * as os from "os"
-import * as path from "path"
 import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
+import * as os from "os"
+import * as path from "path"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import type WebSocket from "ws"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
@@ -35,32 +35,37 @@ import {
   getAccountConfigPathCandidates,
   resolveDefaultAccountConfigPath,
 } from "../../shared/protocol-bridge-paths"
-import {
-  CodexModelTier,
-  isChatGptCodexModelSupported,
-  normalizeCodexModelTier,
-  supportsCodexModelForTier,
-} from "../shared/model-registry"
-import {
-  type CooldownableAccount,
-  isAccountDisabled,
-  isAccountAvailableForModel,
-  markAccountCooldown,
-  markAccountSuccess,
-  getEarliestRecovery,
-} from "../shared/account-cooldown"
-import {
-  BackendPoolEntryState,
-  BackendPoolStatus,
-  type CodexRateLimitSnapshot,
-  type CodexRateLimitWindow,
-} from "../shared/backend-pool-status"
+import { UsageStatsService } from "../../usage"
 import {
   createAbortPromise,
   createAbortSignalWithTimeout,
   toUpstreamRequestAbortedError,
   UpstreamRequestAbortedError,
 } from "../shared/abort-signal"
+import {
+  type CooldownableAccount,
+  isAccountAvailableForModel,
+  isAccountDisabled,
+  markAccountCooldown,
+  markAccountSuccess,
+} from "../shared/account-cooldown"
+import {
+  BackendPoolEntryState,
+  BackendPoolStatus,
+  type CodexRateLimitAccountSummary,
+  type CodexRateLimitModelSummary,
+  type CodexRateLimitSnapshot,
+  type CodexRateLimitSource,
+  type CodexRateLimitWindow,
+} from "../shared/backend-pool-status"
+import {
+  CodexModelTier,
+  getCodexModelIdsForTier,
+  getPublicModelMetadata,
+  isChatGptCodexModelSupported,
+  normalizeCodexModelTier,
+  supportsCodexModelForTier,
+} from "../shared/model-registry"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
 import {
@@ -73,12 +78,11 @@ import {
   translateCodexSseEvent,
   translateCodexToClaudeNonStream,
 } from "./codex-response-translator"
-import { buildReverseMapFromClaudeTools } from "./tool-name-shortener"
 import {
   CodexWebSocketService,
   CodexWebSocketUpgradeError,
 } from "./codex-websocket.service"
-import { UsageStatsService } from "../../usage"
+import { buildReverseMapFromClaudeTools } from "./tool-name-shortener"
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -90,6 +94,7 @@ const CODEX_ACCOUNTS_DEFAULT_PATH = resolveDefaultAccountConfigPath(
   "codex-accounts.json"
 )
 const CODEX_MODEL_TIER_ORDER: CodexModelTier[] = ["free", "plus", "team", "pro"]
+const DEFAULT_CODEX_RATE_LIMIT_MODEL = "gpt-5.4"
 
 export class CodexApiError extends HttpException {
   constructor(
@@ -159,8 +164,11 @@ interface CodexAccountSlot extends CooldownableAccount {
     accessToken?: string
     refreshToken?: string
   }
-  /** Rate limit snapshot from x-codex-* response headers */
-  rateLimits?: CodexRateLimitSnapshot
+  /** Rate limit snapshots from x-codex-* response headers, keyed by model */
+  rateLimitSnapshots: Map<
+    string,
+    Partial<Record<CodexRateLimitSource, CodexRateLimitSnapshot>>
+  >
 }
 
 interface ConversationSlotBinding {
@@ -191,6 +199,7 @@ export class CodexService implements OnModuleInit {
   private useWebSocket: boolean = false
 
   private readonly CONVERSATION_SLOT_TTL_MS = 60 * 60 * 1000
+  private rateLimitProbePromise: Promise<number> | null = null
 
   constructor(
     private readonly configService: ConfigService,
@@ -250,6 +259,7 @@ export class CodexService implements OnModuleInit {
         tokenData: null,
         cooldownUntil: 0,
         modelStates: new Map(),
+        rateLimitSnapshots: new Map(),
       }
 
       if (persisted?.refreshToken) {
@@ -302,6 +312,7 @@ export class CodexService implements OnModuleInit {
         tokenData: null,
         cooldownUntil: 0,
         modelStates: new Map(),
+        rateLimitSnapshots: new Map(),
         persistedMatch: {
           apiKey: fa.apiKey || undefined,
           email: fa.email || undefined,
@@ -359,7 +370,8 @@ export class CodexService implements OnModuleInit {
 
   /**
    * Hot-reload accounts from config file.
-   * Adds new accounts without disturbing existing account state (tokens, cooldown, etc.).
+   * Reconciles file-backed slots against the latest account file, preserving
+   * runtime state only for matching live slots and removing stale file slots.
    * Returns the number of newly added accounts.
    */
   reloadAccounts(): number {
@@ -372,76 +384,66 @@ export class CodexService implements OnModuleInit {
       .get<string>("CODEX_PROXY_URL", "")
       .trim()
 
-    // Build a fingerprint set from existing accounts for dedup
-    const existingFingerprints = new Set(
-      this.accounts.map((a) =>
-        [a.apiKey || "", a.email || "", a.accountId || "", a.baseUrl].join("\0")
-      )
-    )
+    const existingFileSlots = new Map<string, CodexAccountSlot>()
+    for (const slot of this.accounts) {
+      if (slot.source !== "file") {
+        continue
+      }
+      existingFileSlots.set(this.getFileSlotReloadKey(slot), slot)
+    }
 
+    const nextAccounts = this.accounts.filter((slot) => slot.source !== "file")
+    const seenReloadKeys = new Set<string>()
     let added = 0
-    for (const fa of freshRecords) {
-      const fingerprint = [
-        fa.apiKey || "",
-        fa.email || "",
-        fa.accountId || "",
-        fa.baseUrl || envBaseUrl,
-      ].join("\0")
 
-      if (existingFingerprints.has(fingerprint)) continue
-
-      const slot: CodexAccountSlot = {
-        label: fa.label || fa.email || undefined,
-        apiKey: fa.apiKey || undefined,
-        accessToken: fa.accessToken || undefined,
-        refreshToken: fa.refreshToken || undefined,
-        accountId: fa.accountId || undefined,
-        workspaceId: fa.workspaceId || undefined,
-        email: fa.email || undefined,
-        planType: normalizeCodexModelTier(fa.planType) || undefined,
-        baseUrl: fa.baseUrl || envBaseUrl,
-        proxyUrl: fa.proxyUrl || envProxyUrl || undefined,
-        configPath: fa.configPath,
-        source: "file",
-        tokenData: null,
-        cooldownUntil: 0,
-        modelStates: new Map(),
-        persistedMatch: {
-          apiKey: fa.apiKey || undefined,
-          email: fa.email || undefined,
-          accountId: fa.accountId || undefined,
-          accessToken: fa.accessToken || undefined,
-          refreshToken: fa.refreshToken || undefined,
-        },
+    freshRecords.forEach((record, index) => {
+      const reloadKey = this.getLoadedRecordReloadKey(record, envBaseUrl, index)
+      if (seenReloadKeys.has(reloadKey)) {
+        return
       }
+      seenReloadKeys.add(reloadKey)
 
-      if (fa.accessToken || fa.refreshToken || fa.idToken) {
-        this.applyTokenDataToSlot(
-          slot,
-          this.hydrateTokenData({
-            idToken: fa.idToken || "",
-            accessToken: fa.accessToken || "",
-            refreshToken: fa.refreshToken || "",
-            accountId: fa.accountId || "",
-            workspaceId: fa.workspaceId || "",
-            email: fa.email || "",
-            expire: fa.expire || "",
-          })
+      const existingSlot = existingFileSlots.get(reloadKey)
+      if (existingSlot) {
+        this.refreshFileSlotFromRecord(
+          existingSlot,
+          record,
+          envBaseUrl,
+          envProxyUrl
         )
+        nextAccounts.push(existingSlot)
+        existingFileSlots.delete(reloadKey)
+        return
       }
 
-      this.accounts.push(slot)
-      existingFingerprints.add(fingerprint)
+      const slot = this.createFileSlotFromLoadedRecord(
+        record,
+        envBaseUrl,
+        envProxyUrl
+      )
+      nextAccounts.push(slot)
       added++
       this.logger.log(
-        `[Hot-reload] Added new Codex account: ${slot.label || slot.email || "unnamed"}`
+        `[Hot-reload] Added new Codex account: ${this.getAccountLabel(slot)}`
+      )
+    })
+
+    const removedSlots = Array.from(existingFileSlots.values())
+    if (removedSlots.length > 0) {
+      this.pruneConversationBindingsForSlots(removedSlots)
+      this.logger.log(
+        `[Hot-reload] Codex: removed ${removedSlots.length} stale file account(s)`
       )
     }
 
-    if (added > 0) {
-      this.configuredModelTier = this.resolveConfiguredModelTier()
+    this.accounts = nextAccounts
+    this.accountIndex =
+      this.accounts.length > 0 ? this.accountIndex % this.accounts.length : 0
+    this.configuredModelTier = this.resolveConfiguredModelTier()
+
+    if (added > 0 || removedSlots.length > 0) {
       this.logger.log(
-        `[Hot-reload] Codex: ${added} new account(s) added, total=${this.accounts.length}`
+        `[Hot-reload] Codex: +${added} / -${removedSlots.length}, total=${this.accounts.length}`
       )
     }
 
@@ -474,7 +476,7 @@ export class CodexService implements OnModuleInit {
         accountId: account.accountId,
         workspaceId: account.workspaceId,
         modelCooldowns,
-        rateLimits: account.rateLimits,
+        rateLimits: this.getRateLimitAccountSummary(account),
       }
     })
 
@@ -511,11 +513,7 @@ export class CodexService implements OnModuleInit {
       return false
     }
 
-    return this.accounts.some(
-      (slot) =>
-        !isAccountDisabled(slot) &&
-        this.isModelSupportedBySlot(slot, normalized)
-    )
+    return this.hasSupportingAccount(normalized)
   }
 
   private resolveConfiguredModelTier(): CodexModelTier | null {
@@ -858,7 +856,7 @@ export class CodexService implements OnModuleInit {
     if (
       !slot ||
       !this.isModelSupportedBySlot(slot, normalizedModelName) ||
-      !isAccountAvailableForModel(slot, normalizedModelName, now)
+      !this.isSlotAvailableForModel(slot, normalizedModelName, now)
     ) {
       this.conversationSlotBindings.delete(normalizedConversationId)
       return null
@@ -904,13 +902,501 @@ export class CodexService implements OnModuleInit {
       return false
     }
 
-    return this.accounts.some((slot) =>
-      this.isModelSupportedBySlot(slot, normalized)
+    return this.accounts.some(
+      (slot) =>
+        !isAccountDisabled(slot) &&
+        this.isModelSupportedBySlot(slot, normalized)
     )
   }
 
   private getAccountLabel(slot: CodexAccountSlot): string {
-    return slot.label || slot.email || "slot"
+    const base = slot.label || slot.email || slot.accountId || "slot"
+    const details: string[] = []
+
+    if (slot.accountId) {
+      details.push(slot.accountId.slice(0, 8))
+    } else if (slot.workspaceId) {
+      details.push(`ws:${slot.workspaceId.slice(0, 8)}`)
+    } else {
+      details.push(slot.source)
+    }
+
+    if (slot.planType) {
+      details.push(slot.planType)
+    }
+
+    return `${base} (${details.join(", ")})`
+  }
+
+  private getLoadedRecordReloadKey(
+    account: LoadedCodexAccountRecord,
+    fallbackBaseUrl: string,
+    index: number
+  ): string {
+    const baseUrl =
+      (account.baseUrl || fallbackBaseUrl).trim() || DEFAULT_BASE_URL
+    return this.getNormalizedReloadKey({
+      apiKey: account.apiKey,
+      email: account.email,
+      accountId: account.accountId,
+      refreshToken: account.refreshToken,
+      accessToken: account.accessToken,
+      baseUrl,
+      configPath: account.configPath,
+      index,
+    })
+  }
+
+  private getFileSlotReloadKey(slot: CodexAccountSlot): string {
+    return this.getNormalizedReloadKey({
+      apiKey: slot.apiKey,
+      email: slot.email,
+      accountId: slot.accountId,
+      refreshToken: slot.refreshToken || slot.tokenData?.refreshToken,
+      accessToken: slot.accessToken || slot.tokenData?.accessToken,
+      baseUrl: slot.baseUrl,
+      configPath: slot.configPath,
+      index: 0,
+    })
+  }
+
+  private getNormalizedReloadKey(identity: {
+    apiKey?: string
+    email?: string
+    accountId?: string
+    refreshToken?: string
+    accessToken?: string
+    baseUrl?: string
+    configPath?: string
+    index: number
+  }): string {
+    const baseUrl = identity.baseUrl?.trim() || DEFAULT_BASE_URL
+    const email = identity.email?.trim().toLowerCase() || ""
+    const accountId = identity.accountId?.trim() || ""
+    const apiKey = identity.apiKey?.trim() || ""
+    const refreshToken = identity.refreshToken?.trim() || ""
+    const accessToken = identity.accessToken?.trim() || ""
+
+    if (email && accountId) {
+      return `email:${email}:${accountId}\0base:${baseUrl}`
+    }
+    if (email && refreshToken) {
+      return `email_refresh:${email}:${this.hashIdentityPart(refreshToken)}\0base:${baseUrl}`
+    }
+    if (email && accessToken) {
+      return `email_access:${email}:${this.hashIdentityPart(accessToken)}\0base:${baseUrl}`
+    }
+    if (email) {
+      return `email:${email}\0base:${baseUrl}`
+    }
+    if (apiKey) {
+      return `api_key:${apiKey}\0base:${baseUrl}`
+    }
+    if (refreshToken) {
+      return `refresh:${this.hashIdentityPart(refreshToken)}\0base:${baseUrl}`
+    }
+    if (accessToken) {
+      return `access:${this.hashIdentityPart(accessToken)}\0base:${baseUrl}`
+    }
+    if (accountId) {
+      return `account_id:${accountId}\0base:${baseUrl}`
+    }
+
+    return `path:${identity.configPath || ""}:${identity.index}\0base:${baseUrl}`
+  }
+
+  private createFileSlotFromLoadedRecord(
+    record: LoadedCodexAccountRecord,
+    fallbackBaseUrl: string,
+    fallbackProxyUrl: string
+  ): CodexAccountSlot {
+    const slot: CodexAccountSlot = {
+      label: record.label || record.email || undefined,
+      apiKey: record.apiKey || undefined,
+      accessToken: record.accessToken || undefined,
+      refreshToken: record.refreshToken || undefined,
+      accountId: record.accountId || undefined,
+      workspaceId: record.workspaceId || undefined,
+      email: record.email || undefined,
+      planType: normalizeCodexModelTier(record.planType) || undefined,
+      baseUrl: record.baseUrl || fallbackBaseUrl,
+      proxyUrl: record.proxyUrl || fallbackProxyUrl || undefined,
+      configPath: record.configPath,
+      source: "file",
+      tokenData: null,
+      cooldownUntil: 0,
+      modelStates: new Map(),
+      rateLimitSnapshots: new Map(),
+      persistedMatch: {
+        apiKey: record.apiKey || undefined,
+        email: record.email || undefined,
+        accountId: record.accountId || undefined,
+        accessToken: record.accessToken || undefined,
+        refreshToken: record.refreshToken || undefined,
+      },
+    }
+
+    if (record.accessToken || record.refreshToken || record.idToken) {
+      this.applyTokenDataToSlot(
+        slot,
+        this.hydrateTokenData({
+          idToken: record.idToken || "",
+          accessToken: record.accessToken || "",
+          refreshToken: record.refreshToken || "",
+          accountId: record.accountId || "",
+          workspaceId: record.workspaceId || "",
+          email: record.email || "",
+          expire: record.expire || "",
+        })
+      )
+    }
+
+    return slot
+  }
+
+  private refreshFileSlotFromRecord(
+    slot: CodexAccountSlot,
+    record: LoadedCodexAccountRecord,
+    fallbackBaseUrl: string,
+    fallbackProxyUrl: string
+  ): void {
+    slot.label = record.label || record.email || undefined
+    slot.apiKey = record.apiKey || undefined
+    slot.accountId = record.accountId || undefined
+    slot.workspaceId = record.workspaceId || undefined
+    slot.email = record.email || undefined
+    slot.planType = normalizeCodexModelTier(record.planType) || undefined
+    slot.baseUrl = record.baseUrl || fallbackBaseUrl
+    slot.proxyUrl = record.proxyUrl || fallbackProxyUrl || undefined
+    slot.configPath = record.configPath
+    slot.persistedMatch = {
+      apiKey: record.apiKey || undefined,
+      email: record.email || undefined,
+      accountId: record.accountId || undefined,
+      accessToken: record.accessToken || undefined,
+      refreshToken: record.refreshToken || undefined,
+    }
+
+    if (record.accessToken || record.refreshToken || record.idToken) {
+      this.applyTokenDataToSlot(
+        slot,
+        this.hydrateTokenData({
+          idToken: record.idToken || "",
+          accessToken: record.accessToken || "",
+          refreshToken: record.refreshToken || "",
+          accountId: record.accountId || "",
+          workspaceId: record.workspaceId || "",
+          email: record.email || "",
+          expire: record.expire || "",
+        })
+      )
+      return
+    }
+
+    slot.accessToken = undefined
+    slot.refreshToken = undefined
+    slot.tokenData = null
+    slot.refreshPromise = undefined
+  }
+
+  private pruneConversationBindingsForSlots(slots: CodexAccountSlot[]): void {
+    if (slots.length === 0 || this.conversationSlotBindings.size === 0) {
+      return
+    }
+
+    const staleKeys = new Set(slots.map((slot) => this.getSlotStickyKey(slot)))
+    for (const [conversationId, binding] of this.conversationSlotBindings) {
+      if (staleKeys.has(binding.slotKey)) {
+        this.conversationSlotBindings.delete(conversationId)
+      }
+    }
+  }
+
+  private normalizeCodexModelName(modelName: string): string {
+    return modelName.toLowerCase().trim()
+  }
+
+  private getCodexDisplayModel(modelName: string): string {
+    const normalized = this.normalizeCodexModelName(modelName)
+    return getPublicModelMetadata(normalized)?.displayName || normalized
+  }
+
+  private hasRateLimitData(account: CodexAccountSlot): boolean {
+    for (const snapshots of account.rateLimitSnapshots.values()) {
+      if (snapshots.request || snapshots.probe) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private getEffectiveRateLimitSnapshot(
+    snapshots?: Partial<Record<CodexRateLimitSource, CodexRateLimitSnapshot>>
+  ): CodexRateLimitSnapshot | null {
+    if (!snapshots) {
+      return null
+    }
+
+    if (snapshots.request) {
+      return snapshots.request
+    }
+
+    return snapshots.probe || null
+  }
+
+  private getRateLimitModelSummary(
+    account: CodexAccountSlot,
+    modelName: string
+  ): CodexRateLimitModelSummary | null {
+    const normalized = this.normalizeCodexModelName(modelName)
+    const snapshots = account.rateLimitSnapshots.get(normalized)
+    const effective = this.getEffectiveRateLimitSnapshot(snapshots)
+
+    if (!snapshots && !effective) {
+      return null
+    }
+
+    const request = snapshots?.request
+    const probe = snapshots?.probe
+    const updatedAt = Math.max(
+      request?.updatedAt || 0,
+      probe?.updatedAt || 0,
+      effective?.updatedAt || 0
+    )
+
+    return {
+      model: normalized,
+      displayModel: this.getCodexDisplayModel(normalized),
+      effective,
+      request,
+      probe,
+      updatedAt,
+    }
+  }
+
+  private getRateLimitAccountSummary(
+    account: CodexAccountSlot
+  ): CodexRateLimitAccountSummary | undefined {
+    const models = Array.from(account.rateLimitSnapshots.keys())
+      .map((modelName) => this.getRateLimitModelSummary(account, modelName))
+      .filter(
+        (summary): summary is CodexRateLimitModelSummary => summary != null
+      )
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+
+    if (models.length === 0) {
+      return undefined
+    }
+
+    const preferred =
+      models.find(
+        (summary) => summary.model === DEFAULT_CODEX_RATE_LIMIT_MODEL
+      ) || null
+    const effective = preferred?.effective || models[0]?.effective || null
+    const updatedAt = preferred?.updatedAt || models[0]?.updatedAt || null
+    return {
+      effective,
+      models,
+      updatedAt,
+    }
+  }
+
+  private setRateLimitSnapshot(
+    slot: CodexAccountSlot,
+    snapshot: CodexRateLimitSnapshot
+  ): void {
+    const normalized = this.normalizeCodexModelName(snapshot.model)
+    const existing = slot.rateLimitSnapshots.get(normalized) || {}
+    existing[snapshot.source] = {
+      ...snapshot,
+      model: normalized,
+      displayModel: this.getCodexDisplayModel(normalized),
+    }
+    slot.rateLimitSnapshots.set(normalized, existing)
+  }
+
+  private getQuotaRemainingPercent(
+    account: CodexAccountSlot,
+    tier: "primary" | "secondary",
+    modelName: string
+  ): number | null {
+    const effective = this.getRateLimitModelSummary(
+      account,
+      modelName
+    )?.effective
+    const usedPercent = effective?.[tier]?.usedPercent
+    if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) {
+      return null
+    }
+
+    return Math.max(0, 100 - usedPercent)
+  }
+
+  private getQuotaCooldownUntil(
+    account: CodexAccountSlot,
+    tier: "primary" | "secondary",
+    modelName: string
+  ): number {
+    const effective = this.getRateLimitModelSummary(
+      account,
+      modelName
+    )?.effective
+    const remainingPercent = this.getQuotaRemainingPercent(
+      account,
+      tier,
+      modelName
+    )
+    const resetsAt = effective?.[tier]?.resetsAt
+
+    if (
+      remainingPercent === null ||
+      remainingPercent >= 1 ||
+      typeof resetsAt !== "number" ||
+      !Number.isFinite(resetsAt)
+    ) {
+      return 0
+    }
+
+    return resetsAt * 1000
+  }
+
+  private getWeeklyQuotaCooldownUntil(
+    account: CodexAccountSlot,
+    modelName: string
+  ): number {
+    return this.getQuotaCooldownUntil(account, "secondary", modelName)
+  }
+
+  private getPrimaryQuotaCooldownUntil(
+    account: CodexAccountSlot,
+    modelName: string
+  ): number {
+    return this.getQuotaCooldownUntil(account, "primary", modelName)
+  }
+
+  private getRateLimitQuotaCooldownUntil(
+    snapshot: CodexRateLimitSnapshot | null,
+    now: number
+  ): number {
+    if (!snapshot) {
+      return 0
+    }
+
+    const windows = [snapshot.primary, snapshot.secondary]
+    const activeResets = windows
+      .map((window) => {
+        if (!window) {
+          return 0
+        }
+        const remainingPercent = Math.max(0, 100 - window.usedPercent)
+        if (
+          remainingPercent >= 1 ||
+          typeof window.resetsAt !== "number" ||
+          !Number.isFinite(window.resetsAt)
+        ) {
+          return 0
+        }
+        return window.resetsAt * 1000
+      })
+      .filter((cooldownUntil) => cooldownUntil > now)
+
+    return activeResets.length > 0 ? Math.max(...activeResets) : 0
+  }
+
+  private isRateLimitExhaustedForModel(
+    slot: CodexAccountSlot,
+    model: string
+  ): boolean {
+    const primaryRemaining = this.getQuotaRemainingPercent(
+      slot,
+      "primary",
+      model
+    )
+    if (primaryRemaining != null && primaryRemaining < 1) {
+      return true
+    }
+
+    const secondaryRemaining = this.getQuotaRemainingPercent(
+      slot,
+      "secondary",
+      model
+    )
+    if (secondaryRemaining != null && secondaryRemaining < 1) {
+      return true
+    }
+
+    return false
+  }
+
+  private isSlotAvailableForModel(
+    slot: CodexAccountSlot,
+    model: string,
+    now: number
+  ): boolean {
+    if (this.isRateLimitExhaustedForModel(slot, model)) {
+      return false
+    }
+
+    const weeklyQuotaCooldownUntil = this.getWeeklyQuotaCooldownUntil(
+      slot,
+      model
+    )
+    if (weeklyQuotaCooldownUntil > now) {
+      return false
+    }
+
+    const primaryQuotaCooldownUntil = this.getPrimaryQuotaCooldownUntil(
+      slot,
+      model
+    )
+    if (primaryQuotaCooldownUntil > now) {
+      return false
+    }
+
+    return isAccountAvailableForModel(slot, model, now)
+  }
+
+  private getSlotRecoveryTimeForModel(
+    slot: CodexAccountSlot,
+    model: string,
+    now: number
+  ): number | null {
+    if (isAccountDisabled(slot) || !this.isModelSupportedBySlot(slot, model)) {
+      return null
+    }
+
+    const recoveryCandidates: number[] = []
+
+    if (slot.cooldownUntil > now) {
+      recoveryCandidates.push(slot.cooldownUntil)
+    }
+
+    const modelState = slot.modelStates.get(model)
+    if (modelState?.cooldownUntil && modelState.cooldownUntil > now) {
+      recoveryCandidates.push(modelState.cooldownUntil)
+    }
+
+    const primaryQuotaCooldownUntil = this.getPrimaryQuotaCooldownUntil(
+      slot,
+      model
+    )
+    if (primaryQuotaCooldownUntil > now) {
+      recoveryCandidates.push(primaryQuotaCooldownUntil)
+    }
+
+    const weeklyQuotaCooldownUntil = this.getWeeklyQuotaCooldownUntil(
+      slot,
+      model
+    )
+    if (weeklyQuotaCooldownUntil > now) {
+      recoveryCandidates.push(weeklyQuotaCooldownUntil)
+    }
+
+    if (recoveryCandidates.length === 0) {
+      return null
+    }
+
+    return Math.max(...recoveryCandidates)
   }
 
   private getActiveModelCooldowns(
@@ -936,6 +1422,23 @@ export class CodexService implements OnModuleInit {
     if (isAccountDisabled(account)) {
       return "disabled"
     }
+
+    const activeQuotaCooldowns = Array.from(account.rateLimitSnapshots.values())
+      .map((snapshots) =>
+        this.getRateLimitQuotaCooldownUntil(
+          this.getEffectiveRateLimitSnapshot(snapshots),
+          now
+        )
+      )
+      .filter((cooldownUntil) => cooldownUntil > now)
+
+    if (activeQuotaCooldowns.length > 0) {
+      account.cooldownUntil = Math.max(
+        account.cooldownUntil,
+        ...activeQuotaCooldowns
+      )
+    }
+
     if (account.cooldownUntil > now) {
       return "cooldown"
     }
@@ -963,7 +1466,7 @@ export class CodexService implements OnModuleInit {
         continue
       }
 
-      if (isAccountAvailableForModel(slot, normalized, now)) {
+      if (this.isSlotAvailableForModel(slot, normalized, now)) {
         this.accountIndex = (index + 1) % this.accounts.length
         return slot
       }
@@ -1208,6 +1711,7 @@ export class CodexService implements OnModuleInit {
       token,
       isApiKey: this.isApiKeyMode(slot),
       accountId: this.getSlotAccountId(slot),
+      workspaceId: slot.workspaceId,
       stream,
       cacheHeaders,
       forwardHeaders: options?.forwardHeaders,
@@ -1470,8 +1974,25 @@ export class CodexService implements OnModuleInit {
   }
 
   private createAllAccountsRateLimitedError(modelName: string): CodexApiError {
-    const info = getEarliestRecovery(this.accounts, modelName)
-    const retrySeconds = info ? Math.ceil(info.retryAfterMs / 1000) : 60
+    const now = Date.now()
+    const normalizedModelName = modelName.toLowerCase().trim()
+    let earliestRecovery = Infinity
+
+    for (const slot of this.accounts) {
+      const slotRecovery = this.getSlotRecoveryTimeForModel(
+        slot,
+        normalizedModelName,
+        now
+      )
+      if (slotRecovery != null) {
+        earliestRecovery = Math.min(earliestRecovery, slotRecovery)
+      }
+    }
+
+    const retryAfterMs = Number.isFinite(earliestRecovery)
+      ? Math.max(0, earliestRecovery - now)
+      : 0
+    const retrySeconds = retryAfterMs > 0 ? Math.ceil(retryAfterMs / 1000) : 60
     return new CodexApiError(
       429,
       `All Codex accounts are rate-limited for model ${modelName}. ` +
@@ -1689,6 +2210,9 @@ export class CodexService implements OnModuleInit {
     })
 
     this.logger.log(
+      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=http omitAccountId=${omitAccountId} accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(headers["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(headers["Chatgpt-Account-Id"] || null)}`
+    )
+    this.logger.log(
       `[Codex] Non-stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify((codexRequest as { reasoning?: unknown }).reasoning ?? null)}, service_tier=${JSON.stringify((codexRequest as { service_tier?: unknown }).service_tier ?? null)}`
     )
 
@@ -1736,7 +2260,12 @@ export class CodexService implements OnModuleInit {
     }
 
     // Read the full SSE stream and find response.completed
-    this.captureCodexRateLimitHeaders(response.headers, slot)
+    this.captureCodexRateLimitHeaders(
+      response.headers,
+      slot,
+      modelName,
+      "request"
+    )
     const fullBody = await response.text()
     const lines = fullBody.split("\n")
 
@@ -1795,12 +2324,16 @@ export class CodexService implements OnModuleInit {
       token,
       this.isApiKeyMode(slot),
       this.getSlotAccountId(slot),
+      slot.workspaceId,
       cacheHeaders,
       forwardHeaders
     )
     const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
     const sessionId = this.getExecutionSessionId(dto)
 
+    this.logger.log(
+      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=websocket omitAccountId=false accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(wsHeaders["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(wsHeaders["Chatgpt-Account-Id"] || null)}`
+    )
     this.logger.log(
       `[Codex] WebSocket non-stream request: model=${modelName}, url=${wsUrl}`
     )
@@ -2095,6 +2628,9 @@ export class CodexService implements OnModuleInit {
     })
 
     this.logger.log(
+      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=http-stream omitAccountId=${omitAccountId} accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(headers["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(headers["Chatgpt-Account-Id"] || null)}`
+    )
+    this.logger.log(
       `[Codex] Stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify((codexRequest as { reasoning?: unknown }).reasoning ?? null)}, service_tier=${JSON.stringify((codexRequest as { service_tier?: unknown }).service_tier ?? null)}`
     )
 
@@ -2152,7 +2688,12 @@ export class CodexService implements OnModuleInit {
       }
 
       // Capture rate-limit headers from successful response
-      this.captureCodexRateLimitHeaders(response.headers, slot)
+      this.captureCodexRateLimitHeaders(
+        response.headers,
+        slot,
+        modelName,
+        "request"
+      )
 
       // Stream SSE events
       const reader = response.body.getReader()
@@ -2274,11 +2815,15 @@ export class CodexService implements OnModuleInit {
       token,
       this.isApiKeyMode(slot),
       this.getSlotAccountId(slot),
+      slot.workspaceId,
       cacheHeaders,
       forwardHeaders
     )
     const sessionId = this.getExecutionSessionId(dto)
 
+    this.logger.log(
+      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=websocket-stream omitAccountId=false accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(wsHeaders["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(wsHeaders["Chatgpt-Account-Id"] || null)}`
+    )
     this.logger.log(
       `[Codex] WebSocket stream request: model=${modelName}, url=${wsUrl}`
     )
@@ -2440,7 +2985,9 @@ export class CodexService implements OnModuleInit {
    */
   private captureCodexRateLimitHeaders(
     headers: Headers,
-    slot: CodexAccountSlot
+    slot: CodexAccountSlot,
+    modelName: string,
+    source: CodexRateLimitSource
   ): void {
     try {
       const primary = this.parseRateLimitWindow(headers, "primary")
@@ -2450,7 +2997,11 @@ export class CodexService implements OnModuleInit {
         return
       }
 
+      const normalizedModel = this.normalizeCodexModelName(modelName)
       const snapshot: CodexRateLimitSnapshot = {
+        model: normalizedModel,
+        displayModel: this.getCodexDisplayModel(normalizedModel),
+        source,
         updatedAt: Date.now(),
       }
       if (primary) {
@@ -2460,22 +3011,48 @@ export class CodexService implements OnModuleInit {
         snapshot.secondary = secondary
       }
 
-      slot.rateLimits = snapshot
+      this.setRateLimitSnapshot(slot, snapshot)
 
       const label = this.getAccountLabel(slot)
       const parts: string[] = []
       if (primary) {
-        const left = Math.max(0, 100 - primary.usedPercent).toFixed(0)
-        parts.push(`5h=${left}% left`)
+        parts.push(this.formatRateLimitWindow("primary", primary))
       }
       if (secondary) {
-        const left = Math.max(0, 100 - secondary.usedPercent).toFixed(0)
-        parts.push(`weekly=${left}% left`)
+        parts.push(this.formatRateLimitWindow("secondary", secondary))
       }
-      this.logger.log(`[Codex][RateLimit] ${label}: ${parts.join(", ")}`)
+      const sourceLabel = source === "request" ? "live" : "healthcheck"
+      const message = `[Codex][RateLimit] ${label}: model=${normalizedModel}, source=${sourceLabel}, ${parts.join(", ")}`
+      if (
+        source === "request" ||
+        (source === "probe" &&
+          normalizedModel === DEFAULT_CODEX_RATE_LIMIT_MODEL)
+      ) {
+        this.logger.log(message)
+      } else {
+        this.logger.debug(message)
+      }
     } catch {
       // Non-critical: silently ignore parse failures
     }
+  }
+
+  private formatRateLimitWindow(
+    tier: "primary" | "secondary",
+    window: CodexRateLimitWindow
+  ): string {
+    const left = Math.max(0, 100 - window.usedPercent).toFixed(0)
+    const windowMinutes =
+      typeof window.windowMinutes === "number" &&
+      Number.isFinite(window.windowMinutes)
+        ? `${window.windowMinutes}m`
+        : "unknown"
+    const resetAt =
+      typeof window.resetsAt === "number" && Number.isFinite(window.resetsAt)
+        ? new Date(window.resetsAt * 1000).toISOString()
+        : "unknown"
+
+    return `${tier}=${left}% left (window=${windowMinutes}, resetAt=${resetAt})`
   }
 
   private parseRateLimitWindow(
@@ -2527,8 +3104,28 @@ export class CodexService implements OnModuleInit {
    * immediately aborts the stream to capture x-codex-* rate limit headers.
    */
   async probeRateLimits(force = false): Promise<number> {
+    if (this.rateLimitProbePromise) {
+      return this.rateLimitProbePromise
+    }
+
+    this.rateLimitProbePromise = this.runRateLimitProbe(force)
+    try {
+      return await this.rateLimitProbePromise
+    } finally {
+      this.rateLimitProbePromise = null
+    }
+  }
+
+  private async runRateLimitProbe(force = false): Promise<number> {
+    const supportedModels = new Set(
+      getCodexModelIdsForTier(this.getModelTier())
+    )
+    const probeModels = supportedModels.has(DEFAULT_CODEX_RATE_LIMIT_MODEL)
+      ? [DEFAULT_CODEX_RATE_LIMIT_MODEL]
+      : Array.from(supportedModels)
     const slotsToProbe = this.accounts.filter(
-      (slot) => (force || !slot.rateLimits) && !isAccountDisabled(slot)
+      (slot) =>
+        (force || !this.hasRateLimitData(slot)) && !isAccountDisabled(slot)
     )
 
     if (slotsToProbe.length === 0) {
@@ -2536,7 +3133,7 @@ export class CodexService implements OnModuleInit {
     }
 
     this.logger.log(
-      `[Codex] Probing rate limits for ${slotsToProbe.length} account(s)...`
+      `[Codex] Probing rate limits for ${slotsToProbe.length} account(s) across ${probeModels.length} model(s)...`
     )
 
     let probed = 0
@@ -2559,7 +3156,10 @@ export class CodexService implements OnModuleInit {
         // Abort immediately after headers are captured to avoid spending quota.
         const agent = this.buildProxyAgent(slot)
 
-        const doProbe = async (bearerToken: string): Promise<Response> => {
+        const doProbe = async (
+          bearerToken: string,
+          probeModel: string
+        ): Promise<Response> => {
           const abortController = new AbortController()
           const timeout = setTimeout(() => abortController.abort(), 15_000)
           const url = this.buildUrl(slot, "responses")
@@ -2568,7 +3168,7 @@ export class CodexService implements OnModuleInit {
             method: "POST",
             headers,
             body: JSON.stringify({
-              model: "gpt-5-codex-mini",
+              model: probeModel,
               instructions: "",
               input: [
                 {
@@ -2589,49 +3189,58 @@ export class CodexService implements OnModuleInit {
           }
           const resp = await fetch(url, fetchOptions)
           // Capture rate limit headers BEFORE aborting the stream
-          this.captureCodexRateLimitHeaders(resp.headers, slot)
+          this.captureCodexRateLimitHeaders(
+            resp.headers,
+            slot,
+            probeModel,
+            "probe"
+          )
           // Now abort the stream to avoid generating output
           abortController.abort()
           clearTimeout(timeout)
           return resp
         }
 
-        const response = await doProbe(token)
+        for (const probeModel of probeModels) {
+          const response = await doProbe(token, probeModel)
 
-        // If 401/403, force token refresh and retry once
-        if (
-          (response.status === 401 || response.status === 403) &&
-          slot.tokenData?.refreshToken
-        ) {
-          this.logger.log(
-            `[Codex] Probe ${label}: forcing token refresh after HTTP ${response.status}`
-          )
-          try {
-            const refreshed = await this.authService.refreshTokensWithRetry(
-              slot.tokenData.refreshToken,
-              2,
-              { persist: false, updateState: false }
+          // If 401/403, force token refresh and retry once
+          if (
+            (response.status === 401 || response.status === 403) &&
+            slot.tokenData?.refreshToken
+          ) {
+            this.logger.log(
+              `[Codex] Probe ${label}: forcing token refresh after HTTP ${response.status}`
             )
-            this.applyTokenDataToSlot(slot, refreshed)
-            this.persistSlotTokens(slot)
-            if (refreshed.accessToken) {
-              token = refreshed.accessToken
-              await doProbe(token)
+            try {
+              const refreshed = await this.authService.refreshTokensWithRetry(
+                slot.tokenData.refreshToken,
+                2,
+                { persist: false, updateState: false }
+              )
+              this.applyTokenDataToSlot(slot, refreshed)
+              this.persistSlotTokens(slot)
+              if (refreshed.accessToken) {
+                token = refreshed.accessToken
+                await doProbe(token, probeModel)
+              }
+            } catch (refreshErr) {
+              this.logger.warn(
+                `[Codex] Probe ${label}: token refresh failed: ${(refreshErr as Error).message}`
+              )
             }
-          } catch (refreshErr) {
+          }
+
+          const summary = this.getRateLimitModelSummary(slot, probeModel)
+          if (summary?.probe) {
+            this.logger.log(
+              `[Codex] Probe ${label}: rate limits captured for model=${probeModel}`
+            )
+          } else {
             this.logger.warn(
-              `[Codex] Probe ${label}: token refresh failed: ${(refreshErr as Error).message}`
+              `[Codex] Probe ${label}: no x-codex-* headers in response for model=${probeModel} (HTTP ${response.status})`
             )
           }
-        }
-
-        // Headers were already captured inside doProbe before abort
-        if (slot.rateLimits) {
-          this.logger.log(`[Codex] Probe ${label}: rate limits captured`)
-        } else {
-          this.logger.warn(
-            `[Codex] Probe ${label}: no x-codex-* headers in response (HTTP ${response.status})`
-          )
         }
         probed++
       } catch (err) {

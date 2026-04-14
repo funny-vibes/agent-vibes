@@ -80,29 +80,6 @@ export function modelPrefersAdaptiveThinking(model: string): boolean {
   return isClaudeFamily && is46Family
 }
 
-function convertLegacyEffortToBudget(
-  effort: ThinkingIntentEffort,
-  thinkingLevel: number
-): number {
-  // Budget tiers aligned with Vertex AI migration guide:
-  //   LOW ≤1,024; MEDIUM 1,024–8,192; HIGH >8,192
-  switch (effort) {
-    case "minimal":
-    case "low":
-      return 1024
-    case "medium":
-      return 4096
-    case "high":
-      return 8192
-    case "xhigh":
-      return thinkingLevel >= 2 ? 32768 : 10240
-    case "max":
-      return 32768
-    default:
-      return 1024
-  }
-}
-
 export function buildThinkingIntentFromCursorRequest(params: {
   model: string
   thinkingLevel: number
@@ -133,13 +110,12 @@ export function buildThinkingIntentFromCursorRequest(params: {
   }
 
   if (normalizedEffort && normalizedEffort !== "auto") {
-    return {
-      mode: "explicit_budget",
-      budgetTokens: convertLegacyEffortToBudget(
-        normalizedEffort,
-        params.thinkingLevel
-      ),
-    }
+    return modelPrefersAdaptiveThinking(params.model)
+      ? { mode: "adaptive", effort: normalizedEffort }
+      : {
+          mode: "explicit_effort",
+          effort: normalizedEffort,
+        }
   }
 
   return {
@@ -167,7 +143,11 @@ export function applyThinkingIntentToDto(
       return
     case "adaptive":
       dto.thinking = { type: "adaptive" }
-      dto.output_config = undefined
+      dto.output_config = intent.effort ? { effort: intent.effort } : undefined
+      return
+    case "explicit_effort":
+      dto.thinking = { type: "adaptive" }
+      dto.output_config = { effort: intent.effort }
       return
     case "explicit_budget":
       dto.thinking = {
@@ -197,6 +177,12 @@ function normalizeInternalThinkingIntent(
         ? record.effort
         : undefined
       return effort ? { mode: "adaptive", effort } : { mode: "adaptive" }
+    }
+    case "explicit_effort": {
+      const effort = isThinkingIntentEffort(record.effort)
+        ? record.effort
+        : undefined
+      return effort ? { mode: "explicit_effort", effort } : null
     }
     case "explicit_budget": {
       const budgetTokens =
@@ -268,9 +254,10 @@ export function resolveThinkingIntentFromDto(
     case "adaptive":
     case "auto": {
       const effort = normalizeRequestedThinkingEffort(dto.output_config?.effort)
-      return effort && effort !== "none" && effort !== "auto"
-        ? { mode: "adaptive", effort }
-        : { mode: "adaptive" }
+      if (effort && effort !== "none" && effort !== "auto") {
+        return { mode: "explicit_effort", effort }
+      }
+      return { mode: "adaptive" }
     }
     default:
       return null

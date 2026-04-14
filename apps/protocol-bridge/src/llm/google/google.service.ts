@@ -12,22 +12,105 @@ import {
   fromOfficialAntigravityToolName as fromOfficialAntigravityToolNameFromContract,
   toOfficialAntigravityToolName as toOfficialAntigravityToolNameFromContract,
 } from "../../shared/official-antigravity-tools"
+import { UsageStatsService } from "../../usage"
+import { UpstreamRequestAbortedError } from "../shared/abort-signal"
+import { BackendApiError } from "../shared/backend-errors"
 import {
   DEFAULT_CLAUDE_MODEL,
   doesModelSupportThinking,
   resolveCloudCodeModel,
 } from "../shared/model-registry"
+import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
+import { findPendingToolUseIdsInMessages } from "../shared/tool-continuation-policy"
+import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
+import { CURSOR_SYSTEM_PROMPT } from "./cursor-system-prompt"
+import { GoogleModelCacheService } from "./google-model-cache.service"
 import {
   ProcessPoolService,
   WorkerPoolCooldownError,
 } from "./process-pool.service"
-import { UpstreamRequestAbortedError } from "../shared/abort-signal"
-import { BackendApiError } from "../shared/backend-errors"
-import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
-import { findPendingToolUseIdsInMessages } from "../shared/tool-continuation-policy"
-import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
-import { GoogleModelCacheService } from "./google-model-cache.service"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
+
+/**
+ * Adapt the official Antigravity system prompt for the Cursor IDE environment.
+ *
+ * The raw prompt (captured from Cloud Code traffic) contains sections that
+ * assume the Antigravity desktop app's file-system artifact model
+ * (<appDataDir>/brain/<conversation-id>/).  In Cursor those paths do not
+ * exist, and the Cursor client exposes its own plan/todo UI tools instead.
+ *
+ * This function:
+ *   1. Strips  <artifacts>, <planning_mode>, <planning_mode_artifacts>,
+ *      and <persistent_context>  XML sections (including content).
+ *   2. Injects a compact Cursor-native adaptation block that redirects
+ *      plan/task/walkthrough behaviour into the conversation response.
+ */
+function adaptAntigravityPromptForCursor(raw: string): string {
+  // Remove Antigravity-only XML sections (greedy within each tag pair).
+  const sectionsToStrip = [
+    "artifacts",
+    "planning_mode_artifacts",
+    "planning_mode",
+    "persistent_context",
+  ]
+  let adapted = raw
+  for (const tag of sectionsToStrip) {
+    // Match <tag> ... </tag> including newlines around the block.
+    const pattern = new RegExp(`\\n?<${tag}>[\\s\\S]*?</${tag}>\\n?`, "g")
+    adapted = adapted.replace(pattern, "\n")
+  }
+
+  // Inject Cursor-native adaptation guidance.
+  const cursorAdaptation = `<cursor_adaptation>
+# Cursor IDE Adaptation
+
+You are running inside the Cursor IDE, not the Antigravity desktop app.
+The artifact file-system (<appDataDir>/brain/…) does NOT exist here.
+
+Follow these rules instead:
+
+## Planning
+- Do NOT create implementation_plan.md, task.md, or walkthrough.md files.
+- Present implementation plans directly in the conversation response.
+- Use markdown headings and checklists for task tracking inline.
+
+## Artifacts
+- Do NOT write artifacts to <appDataDir>/brain/… paths.
+- When you need to present structured reports, tables, or analysis,
+  include them directly in your response as markdown.
+
+## Task Tracking
+- To create or display a task plan / TODO list, use the \`create_plan\` tool.
+  It renders an interactive TODO panel in the Cursor IDE UI.
+- Do NOT use \`update_todos\` to create an initial plan; always use \`create_plan\`.
+- Use \`update_todos\` only to change the status of existing TODO items
+  (e.g. mark a step as completed or in-progress).
+- If neither \`create_plan\` nor \`update_todos\` appears in your tool list,
+  fall back to markdown checklists in your response.
+
+## Knowledge Items / Conversation Logs
+- The KI system and conversation log filesystem are not available.
+- Skip any instructions about checking KI summaries or reading
+  conversation logs from disk.
+</cursor_adaptation>`
+
+  // Insert the adaptation block right before </identity> so it has
+  // high priority but stays after the core identity definition.
+  const identityCloseIdx = adapted.indexOf("</identity>")
+  if (identityCloseIdx !== -1) {
+    adapted =
+      adapted.slice(0, identityCloseIdx) +
+      "\n" +
+      cursorAdaptation +
+      "\n" +
+      adapted.slice(identityCloseIdx)
+  } else {
+    // Fallback: prepend
+    adapted = cursorAdaptation + "\n" + adapted
+  }
+
+  return adapted
+}
 
 class FatalCloudCodeRequestError extends Error {
   constructor(message: string) {
@@ -49,12 +132,22 @@ export class GoogleService {
   private readonly logger = new Logger(GoogleService.name)
   private readonly ANTIGRAVITY_IDE_VERSION = "1.22.2"
 
-  // Official Antigravity system prompt baked into source.
-  // Can be disabled via ANTIGRAVITY_SYSTEM_PROMPT=false env var.
+  // System prompt injected into Cloud Code requests.
+  // ANTIGRAVITY_SYSTEM_PROMPT=false → Cursor prompt (no Antigravity sections);
+  // otherwise → Antigravity prompt adapted for Cursor IDE (artifact/planning
+  // sections stripped, Cursor-native behaviour injected).
   private readonly officialSystemPrompt =
     process.env.ANTIGRAVITY_SYSTEM_PROMPT === "false"
-      ? ""
-      : ANTIGRAVITY_SYSTEM_PROMPT
+      ? CURSOR_SYSTEM_PROMPT
+      : adaptAntigravityPromptForCursor(ANTIGRAVITY_SYSTEM_PROMPT)
+  private readonly systemPromptMode =
+    process.env.ANTIGRAVITY_SYSTEM_PROMPT === "false" ? "cursor" : "google"
+
+  // Whether to use official Antigravity tool declarations for Claude models.
+  // When false, Claude via Cloud Code uses direct Cursor tool passthrough
+  // (same path as Gemini models). Controlled via ANTIGRAVITY_OFFICIAL_TOOLS=false env var.
+  private readonly useOfficialAntigravityTools =
+    process.env.ANTIGRAVITY_OFFICIAL_TOOLS !== "false"
 
   // Per-conversation source request ID tracking.
   // ProcessPoolService rewrites these into per-worker lineages before send so
@@ -142,6 +235,25 @@ export class GoogleService {
     }
     if (!matched) return null
     return Math.round(totalMs)
+  }
+
+  private recordGoogleAccountError(
+    accountLabel: string | null | undefined,
+    modelName: string,
+    statusCode: 429 | 503
+  ): void {
+    const label = String(accountLabel || "").trim() || "Antigravity account"
+    this.usageStats.recordGoogleUsage({
+      transport: "native",
+      modelName,
+      accountKey: label,
+      accountLabel: label,
+      inputTokens: 0,
+      outputTokens: 0,
+      error429Count: statusCode === 429 ? 1 : 0,
+      error503Count: statusCode === 503 ? 1 : 0,
+      durationMs: 0,
+    })
   }
 
   private parseRetryAfterMs(errorText: string): number | null {
@@ -1625,14 +1737,16 @@ export class GoogleService {
     private readonly processPool: ProcessPoolService,
     private readonly modelCache: GoogleModelCacheService,
     private readonly signatureStore: ToolThoughtSignatureService,
-    private readonly tokenCounter: TokenCounterService
+    private readonly tokenCounter: TokenCounterService,
+    private readonly usageStats: UsageStatsService
   ) {
-    if (this.officialSystemPrompt) {
-      this.logger.log(
-        `Loaded built-in Antigravity system prompt (${this.officialSystemPrompt.length} chars)`
+    this.logger.log(
+      `System prompt mode: ${this.systemPromptMode} (${this.officialSystemPrompt.length} chars)`
+    )
+    if (!this.useOfficialAntigravityTools) {
+      this.logger.warn(
+        "Official Antigravity tool declarations are DISABLED — Claude will use Cursor tool passthrough"
       )
-    } else {
-      this.logger.warn("Built-in Antigravity system prompt is DISABLED")
     }
   }
 
@@ -2701,19 +2815,26 @@ export class GoogleService {
       }
     }
 
-    if (thinkingIntent.mode === "adaptive") {
-      // Use explicit effort if set (e.g. MAX Mode → "max"),
-      // otherwise auto-estimate from request signals.
+    if (
+      thinkingIntent.mode === "adaptive" ||
+      thinkingIntent.mode === "explicit_effort"
+    ) {
       const effort =
-        thinkingIntent.effort || this.estimateClaudeTaskComplexity(dto)
+        thinkingIntent.mode === "explicit_effort"
+          ? thinkingIntent.effort
+          : thinkingIntent.effort || this.estimateClaudeTaskComplexity(dto)
       const thinkingBudget = this.resolveCloudCodeThinkingBudget(
         resolvedModel,
         undefined,
         effort
       )
       if (effort) {
+        const effortSource =
+          thinkingIntent.mode === "explicit_effort" || thinkingIntent.effort
+            ? "explicit"
+            : "auto-estimated"
         this.logger.debug(
-          `Cloud Code adaptive thinking: effort=${effort} (${thinkingIntent.effort ? "explicit" : "auto-estimated"}) → budget=${thinkingBudget} for ${resolvedModel}`
+          `Cloud Code adaptive thinking: effort=${effort} (${effortSource}) → budget=${thinkingBudget} for ${resolvedModel}`
         )
       }
       return {
@@ -2969,8 +3090,8 @@ export class GoogleService {
     }
 
     // Add tools if present. Claude Cloud Code uses the official
-    // Antigravity-native tool surface; other Google routes can keep the
-    // direct tool names.
+    // Antigravity-native tool surface when useOfficialAntigravityTools is enabled;
+    // otherwise all models (including Claude) use direct tool passthrough.
     if (dto.tools && dto.tools.length > 0) {
       const toolDeclarations = this.buildCloudCodeToolDeclarations(
         dto.tools as Array<{
@@ -2978,7 +3099,7 @@ export class GoogleService {
           description?: unknown
           input_schema?: unknown
         }>,
-        this.isClaudeModel(resolvedModel)
+        this.useOfficialAntigravityTools && this.isClaudeModel(resolvedModel)
       )
       if (toolDeclarations.length > 0) {
         request.tools = toolDeclarations
@@ -3998,6 +4119,11 @@ export class GoogleService {
 
         // 429 — rate limited: precisely cooldown the worker that reported the error
         if (errMsg.includes("429")) {
+          this.recordGoogleAccountError(
+            this.processPool.getLastWorkerEmail(),
+            resolvedModel,
+            429
+          )
           const retryDelayMs = this.parseRetryDelayMs(errMsg)
 
           // Official Antigravity grace retry: if quota reset is imminent,
@@ -4137,6 +4263,14 @@ export class GoogleService {
             : this.getRetryableWorkerFailureCooldownMs(errMsg)
 
           // Capacity exhausted is a backend-wide issue — instant retry same worker
+          if (isModelCapacityExhausted) {
+            this.recordGoogleAccountError(
+              this.processPool.getLastWorkerEmail(),
+              resolvedModel,
+              503
+            )
+          }
+
           if (
             isModelCapacityExhausted &&
             instantRetry503 < this.MAX_INSTANT_RETRIES
@@ -4589,6 +4723,11 @@ export class GoogleService {
           }
 
           if (errMsg.includes("429")) {
+            self.recordGoogleAccountError(
+              self.processPool.getLastWorkerEmail(),
+              resolvedModel,
+              429
+            )
             const retryDelayMs = self.parseRetryDelayMs(errMsg)
 
             // Official Antigravity grace retry: if quota reset is imminent,
@@ -4763,6 +4902,14 @@ export class GoogleService {
               : self.getRetryableWorkerFailureCooldownMs(errMsg)
 
             // Capacity exhausted is a backend-wide issue — instant retry same worker
+            if (isModelCapacityExhausted) {
+              self.recordGoogleAccountError(
+                self.processPool.getLastWorkerEmail(),
+                resolvedModel,
+                503
+              )
+            }
+
             if (
               isModelCapacityExhausted &&
               instantRetry503 < self.MAX_INSTANT_RETRIES

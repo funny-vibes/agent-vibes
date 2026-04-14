@@ -13,18 +13,22 @@ export type UsageTransport = string
 
 type UsageBucketState = {
   requests: number
+  totalAttempts: number
   cachedRequests: number
   inputTokens: number
   cachedInputTokens: number
   cacheCreationInputTokens: number
   outputTokens: number
   webSearchRequests: number
+  error429Count: number
+  error503Count: number
   totalDurationMs: number
   lastSeenAt: number | null
 }
 
 type UsageBucketSummary = {
   requests: number
+  totalAttempts: number
   cachedRequests: number
   inputTokens: number
   cachedInputTokens: number
@@ -33,6 +37,10 @@ type UsageBucketSummary = {
   billableInputTokens: number
   outputTokens: number
   webSearchRequests: number
+  error429Count: number
+  error503Count: number
+  error429Rate: number | null
+  error503Rate: number | null
   totalDurationMs: number
   avgDurationMs: number | null
   cacheHitRate: number | null
@@ -62,6 +70,8 @@ type NormalizedUsageRecord = {
   cacheCreationInputTokens: number
   outputTokens: number
   webSearchRequests: number
+  error429Count: number
+  error503Count: number
   durationMs: number
   recordedAt: number
 }
@@ -77,6 +87,8 @@ type PersistedUsageEventRow = {
   cache_creation_input_tokens: number
   output_tokens: number
   web_search_requests: number
+  error_429_count: number
+  error_503_count: number
   duration_ms: number
   recorded_at: number
 }
@@ -94,6 +106,8 @@ type UsageRecentRecord = {
   billableInputTokens: number
   outputTokens: number
   webSearchRequests: number
+  error429Count: number
+  error503Count: number
   durationMs: number
   recordedAt: string
 }
@@ -171,6 +185,8 @@ export type BackendUsageRecord = {
   cacheCreationInputTokens?: number
   outputTokens: number
   webSearchRequests?: number
+  error429Count?: number
+  error503Count?: number
   durationMs?: number
   recordedAt?: number
 }
@@ -228,6 +244,8 @@ export class UsageStatsService implements OnModuleInit {
       cacheCreationInputTokens: record.cacheCreationInputTokens,
       outputTokens: record.outputTokens,
       webSearchRequests: record.webSearchRequests,
+      error429Count: record.error429Count,
+      error503Count: record.error503Count,
       durationMs: record.durationMs,
       recordedAt: record.recordedAt,
     })
@@ -265,6 +283,75 @@ export class UsageStatsService implements OnModuleInit {
       durationMs: record.durationMs,
       recordedAt: record.recordedAt,
     })
+  }
+
+  getDailyUsage(): {
+    days: Array<{
+      date: string
+      requests: number
+      inputTokens: number
+      cachedInputTokens: number
+      cacheCreationInputTokens: number
+      outputTokens: number
+      totalContextTokens: number
+      webSearchRequests: number
+      error429Count: number
+      error503Count: number
+    }>
+  } {
+    if (!this.persistence?.isReady) {
+      return { days: [] }
+    }
+
+    const rows = this.persistence
+      .prepare(
+        `SELECT
+           date(recorded_at / 1000, 'unixepoch', 'localtime') as day,
+           COUNT(*) as requests,
+           SUM(input_tokens) as input_tokens,
+           SUM(cached_input_tokens) as cached_input_tokens,
+           SUM(cache_creation_input_tokens) as cache_creation_input_tokens,
+           SUM(output_tokens) as output_tokens,
+           SUM(web_search_requests) as web_search_requests,
+           SUM(error_429_count) as error_429_count,
+           SUM(error_503_count) as error_503_count
+         FROM usage_events
+         GROUP BY day
+         ORDER BY day ASC`
+      )
+      .all() as unknown as Array<{
+      day: string
+      requests: number
+      input_tokens: number
+      cached_input_tokens: number
+      cache_creation_input_tokens: number
+      output_tokens: number
+      web_search_requests: number
+      error_429_count: number
+      error_503_count: number
+    }>
+
+    return {
+      days: rows.map((row) => {
+        const input = this.toWholeNumber(row.input_tokens)
+        const cached = this.toWholeNumber(row.cached_input_tokens)
+        const cacheCreation = this.toWholeNumber(
+          row.cache_creation_input_tokens
+        )
+        return {
+          date: row.day,
+          requests: this.toWholeNumber(row.requests),
+          inputTokens: input,
+          cachedInputTokens: cached,
+          cacheCreationInputTokens: cacheCreation,
+          outputTokens: this.toWholeNumber(row.output_tokens),
+          totalContextTokens: input + cached + cacheCreation,
+          webSearchRequests: this.toWholeNumber(row.web_search_requests),
+          error429Count: this.toWholeNumber(row.error_429_count),
+          error503Count: this.toWholeNumber(row.error_503_count),
+        }
+      }),
+    }
   }
 
   getSummary(): UsageSummaryResponse {
@@ -321,6 +408,7 @@ export class UsageStatsService implements OnModuleInit {
       notes: [
         "Usage events persist across bridge restarts.",
         "Input, cache read, and cache write are tracked separately when the upstream backend exposes them.",
+        "Google account 429/503 ratios count failed attempts captured by the bridge.",
         "Duration is measured as end-to-end upstream request time for successful requests only.",
       ],
       totals: this.toSummaryBucket(
@@ -333,6 +421,8 @@ export class UsageStatsService implements OnModuleInit {
           acc.cacheCreationInputTokens += state.totals.cacheCreationInputTokens
           acc.outputTokens += state.totals.outputTokens
           acc.webSearchRequests += state.totals.webSearchRequests
+          acc.error429Count += state.totals.error429Count
+          acc.error503Count += state.totals.error503Count
           acc.totalDurationMs += state.totals.totalDurationMs
           if (
             state.totals.lastSeenAt != null &&
@@ -362,6 +452,8 @@ export class UsageStatsService implements OnModuleInit {
     cacheCreationInputTokens?: number
     outputTokens: number
     webSearchRequests?: number
+    error429Count?: number
+    error503Count?: number
     durationMs?: number
     recordedAt?: number
   }): void {
@@ -386,6 +478,8 @@ export class UsageStatsService implements OnModuleInit {
            cache_creation_input_tokens,
            output_tokens,
            web_search_requests,
+           error_429_count,
+           error_503_count,
            duration_ms,
            recorded_at
          FROM usage_events
@@ -411,6 +505,8 @@ export class UsageStatsService implements OnModuleInit {
           cacheCreationInputTokens: row.cache_creation_input_tokens,
           outputTokens: row.output_tokens,
           webSearchRequests: row.web_search_requests,
+          error429Count: row.error_429_count,
+          error503Count: row.error_503_count,
           durationMs: row.duration_ms,
           recordedAt: row.recorded_at,
         })
@@ -434,9 +530,11 @@ export class UsageStatsService implements OnModuleInit {
            cache_creation_input_tokens,
            output_tokens,
            web_search_requests,
+           error_429_count,
+           error_503_count,
            duration_ms,
            recorded_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.backend,
@@ -449,6 +547,8 @@ export class UsageStatsService implements OnModuleInit {
         record.cacheCreationInputTokens,
         record.outputTokens,
         record.webSearchRequests,
+        record.error429Count,
+        record.error503Count,
         record.durationMs,
         record.recordedAt
       )
@@ -503,6 +603,8 @@ export class UsageStatsService implements OnModuleInit {
     cacheCreationInputTokens?: number
     outputTokens: number
     webSearchRequests?: number
+    error429Count?: number
+    error503Count?: number
     durationMs?: number
     recordedAt?: number
   }): NormalizedUsageRecord {
@@ -527,6 +629,8 @@ export class UsageStatsService implements OnModuleInit {
       ),
       outputTokens: this.toWholeNumber(record.outputTokens),
       webSearchRequests: this.toWholeNumber(record.webSearchRequests ?? 0),
+      error429Count: this.toWholeNumber(record.error429Count ?? 0),
+      error503Count: this.toWholeNumber(record.error503Count ?? 0),
       durationMs: this.toWholeNumber(record.durationMs ?? 0),
       recordedAt,
     }
@@ -566,6 +670,9 @@ export class UsageStatsService implements OnModuleInit {
       cacheCreationInputTokens: 0,
       outputTokens: 0,
       webSearchRequests: 0,
+      totalAttempts: 0,
+      error429Count: 0,
+      error503Count: 0,
       totalDurationMs: 0,
       lastSeenAt: null,
     }
@@ -579,11 +686,14 @@ export class UsageStatsService implements OnModuleInit {
       cacheCreationInputTokens: number
       outputTokens: number
       webSearchRequests: number
+      error429Count: number
+      error503Count: number
       durationMs: number
       recordedAt: number
     }
   ): void {
     bucket.requests += 1
+    bucket.totalAttempts += 1
     if (values.cachedInputTokens > 0) {
       bucket.cachedRequests += 1
     }
@@ -592,6 +702,8 @@ export class UsageStatsService implements OnModuleInit {
     bucket.cacheCreationInputTokens += values.cacheCreationInputTokens
     bucket.outputTokens += values.outputTokens
     bucket.webSearchRequests += values.webSearchRequests
+    bucket.error429Count += values.error429Count
+    bucket.error503Count += values.error503Count
     bucket.totalDurationMs += values.durationMs
     bucket.lastSeenAt = values.recordedAt
   }
@@ -634,6 +746,7 @@ export class UsageStatsService implements OnModuleInit {
     const totalPromptTokens = bucket.inputTokens + bucket.cachedInputTokens
     const totalContextTokens =
       totalPromptTokens + bucket.cacheCreationInputTokens
+    const totalAttempts = bucket.totalAttempts
     const cacheHitRate =
       bucket.requests > 0
         ? this.roundPercentage((bucket.cachedRequests / bucket.requests) * 100)
@@ -647,6 +760,7 @@ export class UsageStatsService implements OnModuleInit {
 
     return {
       requests: bucket.requests,
+      totalAttempts,
       cachedRequests: bucket.cachedRequests,
       inputTokens: bucket.inputTokens,
       cachedInputTokens: bucket.cachedInputTokens,
@@ -655,6 +769,16 @@ export class UsageStatsService implements OnModuleInit {
       billableInputTokens: bucket.inputTokens + bucket.cacheCreationInputTokens,
       outputTokens: bucket.outputTokens,
       webSearchRequests: bucket.webSearchRequests,
+      error429Count: bucket.error429Count,
+      error503Count: bucket.error503Count,
+      error429Rate:
+        totalAttempts > 0
+          ? this.roundPercentage((bucket.error429Count / totalAttempts) * 100)
+          : null,
+      error503Rate:
+        totalAttempts > 0
+          ? this.roundPercentage((bucket.error503Count / totalAttempts) * 100)
+          : null,
       totalDurationMs: bucket.totalDurationMs,
       avgDurationMs:
         bucket.requests > 0
@@ -686,6 +810,8 @@ export class UsageStatsService implements OnModuleInit {
       billableInputTokens: record.inputTokens + record.cacheCreationInputTokens,
       outputTokens: record.outputTokens,
       webSearchRequests: record.webSearchRequests,
+      error429Count: record.error429Count,
+      error503Count: record.error503Count,
       durationMs: record.durationMs,
       recordedAt: new Date(record.recordedAt).toISOString(),
     }

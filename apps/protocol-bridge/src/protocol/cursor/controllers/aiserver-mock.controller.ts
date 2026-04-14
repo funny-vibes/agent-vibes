@@ -8,39 +8,43 @@ import {
 import { Controller, Get, Logger, Post, Req, Res } from "@nestjs/common"
 import { FastifyReply, FastifyRequest } from "fastify"
 import {
+  GetDefaultModelForCliResponseSchema,
+  GetNewChatNudgeLegacyModelPickerResponseSchema,
+  GetNewChatNudgeParameterizedModelPickerResponseSchema,
+  GetUsableModelsRequestSchema,
+  GetUsableModelsResponseSchema,
+} from "../../../gen/agent/v1_pb"
+import {
   AvailableCppModelsResponseSchema,
-  AvailableModelsScope,
   AvailableModelsRequestSchema,
   AvailableModelsResponseSchema,
-  BootstrapStatsigRequestSchema,
-  BootstrapStatsigResponseSchema,
   AvailableModelsResponse_FeatureModelConfigSchema,
   AvailableModelsResponse_ModelPickerDisplayConfigurationSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfigSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_NamedModelsViewConfig_NamedViewToRoutedModelViewToggleSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
-  CheckQueuePositionResponseSchema,
+  AvailableModelsScope,
+  BootstrapStatsigRequestSchema,
+  BootstrapStatsigResponseSchema,
   CheckFeatureStatusRequestSchema,
   CheckFeatureStatusResponseSchema,
   CheckFeaturesStatusRequestSchema,
   CheckFeaturesStatusResponseSchema,
   CheckFeaturesStatusResponse_FeatureStatusSchema,
+  CheckQueuePositionResponseSchema,
   GetCurrentPeriodUsageResponseSchema,
-  GetDefaultModelResponseSchema,
   GetDefaultModelNudgeDataResponseSchema,
-  GetServerConfigResponseSchema,
+  GetDefaultModelResponseSchema,
   GetEmailResponseSchema,
   GetEmailResponse_SignUpType,
   GetLastDefaultModelNudgeResponseSchema,
   GetModelLabelsResponseSchema,
+  GetServerConfigResponseSchema,
   GetUsageLimitPolicyStatusResponseSchema,
   HasSeenAdResponseSchema,
   IsAllowedFreeTrialUsageResponseSchema,
   IsOnNewPricingResponseSchema,
-  NameTabRequestSchema,
-  NameTabResponseSchema,
-  SubmitSpansResponseSchema,
   KnowledgeBaseAddRequestSchema,
   KnowledgeBaseAddResponseSchema,
   KnowledgeBaseGetRequestSchema,
@@ -48,47 +52,45 @@ import {
   KnowledgeBaseGetResponse_ItemSchema,
   KnowledgeBaseListResponseSchema,
   KnowledgeBaseListResponse_ItemSchema,
-  KnowledgeBaseUpdateRequestSchema,
-  KnowledgeBaseUpdateResponseSchema,
   KnowledgeBaseRemoveRequestSchema,
   KnowledgeBaseRemoveResponseSchema,
+  KnowledgeBaseUpdateRequestSchema,
+  KnowledgeBaseUpdateResponseSchema,
+  NameTabRequestSchema,
+  NameTabResponseSchema,
+  SubmitSpansResponseSchema,
 } from "../../../gen/aiserver/v1_pb"
-import {
-  GetDefaultModelForCliResponseSchema,
-  GetNewChatNudgeLegacyModelPickerResponseSchema,
-  GetNewChatNudgeParameterizedModelPickerResponseSchema,
-  GetUsableModelsRequestSchema,
-  GetUsableModelsResponseSchema,
-} from "../../../gen/agent/v1_pb"
-import { CodexService } from "../../../llm/openai/codex.service"
 import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
 import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../../llm/google/google.service"
-import { ModelRouterService } from "../../../llm/shared/model-router.service"
+import { CodexService } from "../../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
-import { KnowledgeBaseService } from "../knowledge-base.service"
 import {
-  canPublicClaudeModelUseGoogle,
   DEFAULT_GEMINI_MODEL,
+  canPublicClaudeModelUseGoogle,
   getCursorDisplayModels,
   resolveCloudCodeModel,
 } from "../../../llm/shared/model-registry"
+import { ModelRouterService } from "../../../llm/shared/model-router.service"
 import {
   appendRequestedCursorModels,
   buildCursorAvailableModel,
-  buildLegacyCursorAvailableModels,
   buildCursorModelLabel,
   buildCursorUsableModel,
-  doesCursorModelUseParameters,
+  buildLegacyCursorAvailableModels,
   resolveCursorDefaultSelection,
   selectPreferredCursorModelName,
 } from "../cursor-model-protocol"
+import { KnowledgeBaseService } from "../knowledge-base.service"
 
 const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
   "compact_terminal",
   "long_running_jobs",
-  "use_model_parameters",
+  // 注意：不启用 "use_model_parameters"！
+  // Cursor 源码：P=use_model_parameters, N=use_react_model_picker, F=P||N
+  // 设置页：F() ? (P() ? clientDisplayName : variants[0].displayName) : ...
+  // P()=false + N()=true → 走 variants[0].displayName → 渲染 :icon-brain: 变体效果
   "use_react_model_picker",
 ])
 
@@ -102,32 +104,40 @@ const DEFAULT_ON_MODELS = new Set<string>([
   "gemini-3.1-pro-high",
 ])
 
-function buildStatsigBootstrapConfig(featureGates: Iterable<string>): string {
+function buildStatsigBootstrapConfig(
+  featureGates: Iterable<string>,
+  userID: string
+): string {
   const now = Date.now()
-  const featureGateEntries = Array.from(
-    featureGates,
-    (name) =>
-      [
-        name,
-        {
-          value: true,
-          rule_id: "protocol-bridge",
-          id_type: "userID",
-        },
-      ] as const
-  )
+
+  // Statsig SDK 内部使用 DJB2 hash 作为 feature gate 的查找 key。
+  // _getDetailedStoreResult 先用原名查找，再用 hash 查找。
+  // 为了确保运行时 checkFeatureGate 能正确命中，
+  // 同时提供原名和 DJB2 hash 两种 key。
   const statsigFeatureGates: Record<
     string,
     {
       value: boolean
       rule_id: string
       id_type: string
+      name?: string
     }
-  > = Object.fromEntries(featureGateEntries)
+  > = {}
 
-  return JSON.stringify({
-    time: now,
-    has_updates: true,
+  for (const name of featureGates) {
+    const entry = {
+      value: true,
+      rule_id: "protocol-bridge",
+      id_type: "userID",
+      name,
+    }
+    // 原名 key
+    statsigFeatureGates[name] = entry
+    // DJB2 hash key（statsig SDK 的 fallback 查找路径）
+    statsigFeatureGates[djb2Hash(name)] = entry
+  }
+
+  const payloadBody = {
     feature_gates: statsigFeatureGates,
     dynamic_configs: {},
     layer_configs: {},
@@ -137,9 +147,43 @@ function buildStatsigBootstrapConfig(featureGates: Iterable<string>): string {
       sdkVersion: "protocol-bridge",
     },
     user: {
-      userID: MOCK_DEFAULTS.email,
+      userID,
     },
+  }
+  const payload = {
+    // Cursor 内置 statsig store 在 setValues() 中会对 n.data 再做一次
+    // fDt(n.data, "has_updates", "EvaluationResponse") 检查，
+    // 所以内层 data 也必须带 has_updates。
+    ...payloadBody,
+    has_updates: true,
+    time: now,
+  }
+
+  return JSON.stringify({
+    // 同时保留顶层字段，尽量兼容旧缓存/旧消费路径。
+    ...payloadBody,
+    time: now,
+    has_updates: true,
+    // Cursor 当前内置的 statsig adapter 走 setData() 时，
+    // 先读取顶层 data，再把 n.data 交给 statsig store。
+    // statsig store 又要求 n.data 自身也有 has_updates。
+    // 所以正确形状是 { has_updates: true, data: { has_updates: true, ... } }。
+    data: payload,
   })
+}
+
+/**
+ * DJB2 hash — statsig SDK 内部用来查找 feature gate 的 hash 函数。
+ * 和 Cursor 前端中的 Clt 函数完全一致。
+ */
+function djb2Hash(str: string): string {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i)
+    hash = (hash << 5) - hash + char
+    hash = hash & hash // Convert to 32bit integer
+  }
+  return String(hash >>> 0)
 }
 
 /**
@@ -636,7 +680,8 @@ export class AiserverMockController {
       )
 
       const protoModels = allModels.flatMap((model) => {
-        // GPT models use legacy mode so each variant gets independent defaultOn
+        // GPT 变体需要展开成多个顶层模型项，
+        // 设置页通过 variant displayName 的 HTML :icon-brain: 标记渲染变体效果
         if (model.family === "gpt") {
           return buildLegacyCursorAvailableModels(
             model,
@@ -652,38 +697,26 @@ export class AiserverMockController {
           )
         }
 
-        // Non-GPT models use parameterized mode
-        if (parameterizedMode) {
-          return [
-            buildCursorAvailableModel(
-              model,
-              this.getNamedModelSectionIndex(model.family),
-              {
-                parameterized: true,
-                defaultOn: DEFAULT_ON_MODELS.has(model.name),
-                includeEffortInDisplayName:
-                  request.variantsWillBeShownInExplodedList,
-              }
-            ),
-          ]
-        }
-
-        return buildLegacyCursorAvailableModels(
-          model,
-          this.getNamedModelSectionIndex(model.family),
-          {
-            defaultOn: DEFAULT_ON_MODELS.has(model.name),
-            preferredDefaultModelName: defaultSelection.model,
-          }
-        )
+        // 非 GPT 模型使用 grouped 结构
+        return [
+          buildCursorAvailableModel(
+            model,
+            this.getNamedModelSectionIndex(model.family),
+            {
+              includeParameterDefinitions: parameterizedMode,
+              includeVariants: true,
+              defaultOn: DEFAULT_ON_MODELS.has(model.name),
+            }
+          ),
+        ]
       })
       const featureModelConfig = this.buildFeatureModelConfig(
         defaultSelection.model,
         allModels
       )
-      const useModelParameters =
-        parameterizedMode &&
-        allModels.some((model) => doesCursorModelUseParameters(model))
+      // 官方 AvailableModels 响应不包含 useModelParameters 字段。
+      // Cursor 客户端从 statsig feature gate 获取这些值并持久化。
+      // 我们不设置此字段，避免覆盖客户端的正确缓存。
       const response = create(AvailableModelsResponseSchema, {
         modelNames: protoModels.map((m) => m.name),
         models: protoModels,
@@ -694,7 +727,6 @@ export class AiserverMockController {
         specModelConfig: featureModelConfig,
         deepSearchModelConfig: featureModelConfig,
         quickAgentModelConfig: featureModelConfig,
-        useModelParameters,
         displayConfiguration: this.buildModelPickerDisplayConfiguration(),
       })
       const buf = Buffer.from(toBinary(AvailableModelsResponseSchema, response))
@@ -1189,6 +1221,24 @@ export class AiserverMockController {
   ): void {
     let ignoreDevStatus = false
     let operatingSystem = "unknown"
+    let statsigUserID: string = MOCK_DEFAULTS.email
+    const authHeader = req.headers.authorization
+    if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.slice("Bearer ".length)
+        const payload = JSON.parse(
+          Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")
+        ) as { sub?: string }
+        if (typeof payload.sub === "string" && payload.sub.length > 0) {
+          statsigUserID = payload.sub
+        }
+      } catch (error) {
+        this.logger.debug(
+          `BootstrapStatsig auth parse failed: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
+
     const body = req.body
     if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
       try {
@@ -1208,7 +1258,10 @@ export class AiserverMockController {
       }
     }
 
-    const config = buildStatsigBootstrapConfig(ENABLED_CURSOR_FEATURES)
+    const config = buildStatsigBootstrapConfig(
+      ENABLED_CURSOR_FEATURES,
+      statsigUserID
+    )
     const response = create(BootstrapStatsigResponseSchema, {
       config,
       generatedAtMs: BigInt(Date.now()),

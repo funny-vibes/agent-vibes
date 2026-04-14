@@ -623,9 +623,10 @@
       <div class="section">
         <div class="section-head">
           <span class="section-title">Token Usage</span>
-          <button class="btn btn-ghost" onclick="refreshUsageSummary()">Refresh</button>
+          <button class="btn btn-ghost" onclick="refreshUsageSummary(true)">Refresh</button>
         </div>
         <div id="analytics-banner" style="margin-bottom:var(--sp-3)"></div>
+        <div id="analytics-heatmap" style="margin-bottom:var(--sp-4);width:100%"></div>
         <div id="analytics-summary"></div>
       </div>
       <div class="section">
@@ -725,6 +726,8 @@
     let dlgInitialData = null;
     let allData = {};
     let usageSummaryData = null;
+    let dailyUsageData = null;
+    let analyticsHydrated = false;
     let currentLogFilePath = '';
     let currentLogFileExists = false;
 
@@ -792,6 +795,63 @@
       };
     }
 
+    function restoreAnalyticsCache() {
+      try {
+        var state = vscode.getState() || {};
+        if (state.usageSummaryData) {
+          usageSummaryData = state.usageSummaryData;
+          renderUsageSummary(state.usageSummaryData);
+        }
+        if (state.dailyUsageData) {
+          dailyUsageData = state.dailyUsageData;
+          renderTokenHeatmap(state.dailyUsageData);
+        }
+        analyticsHydrated = !!(state.usageSummaryData || state.dailyUsageData);
+      } catch (err) {
+        analyticsHydrated = false;
+      }
+    }
+
+    function restoreCodexQuotaCache() {
+      try {
+        var state = vscode.getState() || {};
+        if (state.codexQuotaData && state.codexQuotaData.accounts) {
+          codexQuotaData = state.codexQuotaData;
+          codexQuotaStatus.hasData = true;
+          codexQuotaStatus.lastUpdatedAt = state.codexQuotaUpdatedAt || getCodexQuotaTimestamp(state.codexQuotaData) || null;
+        }
+      } catch (err) {
+        codexQuotaData = null;
+      }
+    }
+
+    function persistAnalyticsCache() {
+      try {
+        var prev = vscode.getState() || {};
+        vscode.setState(Object.assign({}, prev, {
+          usageSummaryData: usageSummaryData,
+          dailyUsageData: dailyUsageData,
+        }));
+      } catch (err) {
+        // ignore cache persistence failures
+      }
+    }
+
+    function persistCodexQuotaCache() {
+      try {
+        var prev = vscode.getState() || {};
+        vscode.setState(Object.assign({}, prev, {
+          codexQuotaData: codexQuotaData,
+          codexQuotaUpdatedAt: codexQuotaStatus.lastUpdatedAt,
+        }));
+      } catch (err) {
+        // ignore cache persistence failures
+      }
+    }
+
+    restoreAnalyticsCache();
+    restoreCodexQuotaCache();
+
     // ── Tabs ──
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
@@ -802,7 +862,10 @@
         pane.classList.add('active');
         if (t.dataset.tab === 'logs') refreshLogs();
         if (t.dataset.tab === 'accounts') { refreshPoolStatus(false); }
-        if (t.dataset.tab === 'analytics') refreshUsageSummary();
+        if (t.dataset.tab === 'analytics') {
+          if (!analyticsHydrated) restoreAnalyticsCache();
+          if (!analyticsHydrated) refreshUsageSummary();
+        }
       });
     });
 
@@ -827,23 +890,35 @@
       if (m.type === 'poolStatusUpdate') renderPoolStatus(m.data);
       if (m.type === 'googleQuotaUpdate') renderGoogleQuota(m.data);
       if (m.type === 'codexQuotaUpdate') renderCodexQuota(m.data);
-      if (m.type === 'usageSummaryUpdate') renderUsageSummary(m.data);
+      if (m.type === 'usageSummaryUpdate') {
+        usageSummaryData = m.data;
+        analyticsHydrated = true;
+        renderUsageSummary(m.data);
+        persistAnalyticsCache();
+      }
+      if (m.type === 'dailyUsageUpdate') {
+        dailyUsageData = m.data;
+        analyticsHydrated = true;
+        renderTokenHeatmap(m.data);
+        persistAnalyticsCache();
+      }
       if (m.type === 'testResult') handleTestResult(m.data);
       if (m.type === 'oauthStatus') handleOAuthStatus(m.data);
       if (m.type === 'codexOAuthStatus') handleCodexOAuthStatus(m.data);
+    });
+
+    window.addEventListener('resize', function() {
+      var analyticsPane = document.getElementById('pane-analytics');
+      if (!analyticsPane || !analyticsPane.classList.contains('active')) return;
+      if (dailyUsageData && dailyUsageData.days && dailyUsageData.days.length) {
+        renderTokenHeatmap(dailyUsageData);
+      }
     });
 
     // Fetch initial pool status once on load
     setTimeout(function() {
       refreshPoolStatus();
     }, 0);
-
-    // Prefetch Codex quota shortly after initial render so switching to the
-    // Codex account view reuses warm cached data instead of repainting empty
-    // rows and then filling them in.
-    setTimeout(function() {
-      refreshCodexQuota(false);
-    }, 150);
 
     var lastStatusData = null;
     var ACTION_META = {
@@ -869,6 +944,45 @@
       var num = Number(value || 0);
       if (!isFinite(num)) return '--';
       return num.toLocaleString();
+    }
+
+    function formatCompactNumber(value) {
+      var num = Number(value || 0);
+      if (!isFinite(num)) return '--';
+      var abs = Math.abs(num);
+      if (abs < 1000) return Math.round(num).toLocaleString();
+
+      var units = [
+        { value: 1e9, suffix: 'B' },
+        { value: 1e6, suffix: 'M' },
+        { value: 1e3, suffix: 'K' }
+      ];
+
+      for (var i = 0; i < units.length; i++) {
+        var unit = units[i];
+        if (abs >= unit.value) {
+          var scaled = num / unit.value;
+          var digits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 1;
+          var text = scaled.toFixed(digits).replace(/\.0$/, '');
+          return text + unit.suffix;
+        }
+      }
+
+      return Math.round(num).toLocaleString();
+    }
+
+    function formatKUnitNumber(value) {
+      var num = Number(value || 0);
+      if (!isFinite(num)) return '--';
+      var abs = Math.abs(num);
+      if (abs < 1000) return Math.round(num).toLocaleString();
+      var scaled = num / 1000;
+      var digits = Math.abs(scaled) >= 100 ? 0 : 1;
+      var text = scaled.toLocaleString(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).replace(/\.0$/, '');
+      return text + 'k';
     }
 
     function formatPercent(value) {
@@ -1243,8 +1357,10 @@
         idx++;
       }
       renderChannelDetail();
-      if (channel === 'codex' && (!codexQuotaData || !codexQuotaData.accounts || !codexQuotaData.accounts.length)) {
-        refreshCodexQuota(false);
+      if (channel === 'codex' && codexQuotaData && codexQuotaData.accounts && codexQuotaData.accounts.length) {
+        setTimeout(function() {
+          refreshCodexQuota(false);
+        }, 0);
       }
     }
 
@@ -1301,13 +1417,15 @@
       if (!codexQuotaData || !codexQuotaData.accounts) return (poolEntry && poolEntry.rateLimits) ? poolEntry : null;
       var acctEmail = acct && acct.email ? String(acct.email).toLowerCase() : '';
       var acctId = acct && acct.accountId ? String(acct.accountId) : '';
+      var acctWorkspaceId = acct && acct.workspaceId ? String(acct.workspaceId) : '';
       var poolLabel = poolEntry && poolEntry.label ? String(poolEntry.label) : '';
       for (var i = 0; i < codexQuotaData.accounts.length; i++) {
         var item = codexQuotaData.accounts[i];
-        var itemEmail = item && item.label ? String(item.label).toLowerCase() : '';
+        var itemEmail = item && item.email ? String(item.email).toLowerCase() : '';
         var itemId = item && item.accountId ? String(item.accountId) : '';
+        var itemWorkspaceId = item && item.workspaceId ? String(item.workspaceId) : '';
         if (acctEmail && acctId && itemEmail === acctEmail && itemId === acctId) return item;
-        if (acctEmail && itemEmail === acctEmail) return item;
+        if (acctEmail && acctWorkspaceId && itemEmail === acctEmail && itemWorkspaceId === acctWorkspaceId) return item;
         if (poolLabel && item && item.label === poolLabel) return item;
       }
       return (poolEntry && poolEntry.rateLimits) ? poolEntry : null;
@@ -1350,14 +1468,24 @@
       return latest ? latest.toISOString() : null;
     }
 
+    function getCodexEffectiveRateLimit(codexQuotaAcct) {
+      if (!codexQuotaAcct || !codexQuotaAcct.rateLimits) return null;
+      return codexQuotaAcct.rateLimits.effective || null;
+    }
+
+    function getCodexRateLimitModels(codexQuotaAcct) {
+      if (!codexQuotaAcct || !codexQuotaAcct.rateLimits || !Array.isArray(codexQuotaAcct.rateLimits.models)) return [];
+      return codexQuotaAcct.rateLimits.models;
+    }
+
     function buildCodexQuotaRefreshHtml() {
       if (selectedChannel !== 'codex' || codexSubView !== 'accounts') return '';
       var tone = 'var(--fg-2)';
       var parts = [];
       if (codexQuotaStatus.loading && codexQuotaData && codexQuotaStatus.hasData) {
-        tone = 'var(--warn)';
+        tone = 'var(--fg-2)';
         parts.push('Refreshing quota');
-        parts.push('showing cached data');
+        parts.push('showing previous values');
       } else if (codexQuotaStatus.loading) {
         parts.push('Loading quota');
       } else if (codexQuotaStatus.lastUpdatedAt) {
@@ -1383,16 +1511,33 @@
     }
 
     function renderCodexRateLimitRows(codexQuotaAcct) {
-      if (!codexQuotaAcct || !codexQuotaAcct.rateLimits) return '';
-      var rl = codexQuotaAcct.rateLimits;
+      var models = getCodexRateLimitModels(codexQuotaAcct);
+      var selected = null;
+      for (var mi = 0; mi < models.length; mi++) {
+        var candidate = models[mi];
+        if (candidate && candidate.model === 'gpt-5.4' && candidate.effective) {
+          selected = candidate;
+          break;
+        }
+      }
+
+      var effective = selected && selected.effective ? selected.effective : getCodexEffectiveRateLimit(codexQuotaAcct);
+      if (!effective) return '';
       var limits = [];
       var h = '';
-      if (rl.primary) limits.push({ label: '5h limit', data: rl.primary, color: '#4fc3f7' });
-      if (rl.secondary) limits.push({ label: 'Weekly limit', data: rl.secondary, color: '#81c784' });
+      var sourceLabel = effective.source === 'request' ? 'live request' : 'probe';
+      var modelLabel = selected && selected.displayModel ? selected.displayModel : (effective.displayModel || effective.model || 'Unknown model');
+      h += '<div style="margin-top:var(--sp-2);font-size:var(--text-xs);color:var(--fg-3)">';
+      h += 'Quota · ' + esc(modelLabel) + ' · ' + esc(sourceLabel);
+      h += '</div>';
+      if (effective.primary) limits.push({ label: '5h limit', data: effective.primary, color: '#4fc3f7' });
+      if (effective.secondary) limits.push({ label: 'Weekly limit', data: effective.secondary, color: '#81c784' });
       for (var li = 0; li < limits.length; li++) {
         var lim = limits[li];
-        var leftPct = Math.max(0, +(100 - lim.data.usedPercent).toFixed(1));
+        var leftRaw = Math.max(0, 100 - lim.data.usedPercent);
+        var leftPct = Math.max(0, +leftRaw.toFixed(1));
         var leftWidth = Math.max(0, Math.min(100, leftPct));
+        var leftLabel = (leftRaw > 0 && leftRaw < 0.1) ? '<0.1% left' : (leftPct + '% left');
         var resetInfo = '';
         if (lim.data.resetsAt) {
           var resetDate = parseDateValue(lim.data.resetsAt);
@@ -1406,7 +1551,7 @@
         h += '<div style="margin-top:var(--sp-2)">';
         h += '<div style="display:flex;justify-content:space-between;font-size:var(--text-xs);color:var(--fg-2);margin-bottom:3px">';
         h += '<span>' + esc(lim.label) + '</span>';
-        h += '<span>' + esc(leftPct + '% left') + esc(resetInfo) + '</span>';
+        h += '<span>' + esc(leftLabel) + esc(resetInfo) + '</span>';
         h += '</div>';
         h += '<div class="progress-track" style="height:5px"><div class="progress-fill" style="width:' + leftWidth + '%;background:' + lim.color + '"></div></div>';
         h += '</div>';
@@ -1459,11 +1604,27 @@
       if (!d) return;
       var state = getChannelState(allData, selectedChannel);
       var list = state.accounts;
-      var totalPages = Math.max(1, Math.ceil(list.length / ACCT_PER_PAGE));
+
+      // Build sorted index array — for codex, sort by weekly quota remaining (desc)
+      var sortedIndices = [];
+      for (var si = 0; si < list.length; si++) sortedIndices.push(si);
+      if (selectedChannel === 'codex') {
+        sortedIndices.sort(function(a, b) {
+          var qaA = getCodexQuotaAccount(list[a], getPoolEntry('codex', a));
+          var qaB = getCodexQuotaAccount(list[b], getPoolEntry('codex', b));
+          var effA = getCodexEffectiveRateLimit(qaA);
+          var effB = getCodexEffectiveRateLimit(qaB);
+          var leftA = (effA && effA.secondary) ? (100 - effA.secondary.usedPercent) : -1;
+          var leftB = (effB && effB.secondary) ? (100 - effB.secondary.usedPercent) : -1;
+          return leftB - leftA;
+        });
+      }
+
+      var totalPages = Math.max(1, Math.ceil(sortedIndices.length / ACCT_PER_PAGE));
       if (acctPage >= totalPages) acctPage = totalPages - 1;
       if (acctPage < 0) acctPage = 0;
       var startIdx = acctPage * ACCT_PER_PAGE;
-      var endIdx = Math.min(startIdx + ACCT_PER_PAGE, list.length);
+      var endIdx = Math.min(startIdx + ACCT_PER_PAGE, sortedIndices.length);
       var h = '';
 
       // Channel header — title + file path only
@@ -1497,7 +1658,8 @@
       if (list.length === 0) {
         h += '<div style="color:var(--fg-3);font-size:var(--text-sm);padding:var(--sp-4) 0">No accounts configured</div>';
       } else {
-        for (var i = startIdx; i < endIdx; i++) {
+        for (var si2 = startIdx; si2 < endIdx; si2++) {
+          var i = sortedIndices[si2];
           var acct = list[i];
           var poolEntry = getPoolEntry(selectedChannel, i);
           var quotaAcct = (selectedChannel === 'antigravity' && acct.email) ? getQuotaAccount(acct.email) : null;
@@ -1572,7 +1734,7 @@
         // Pagination footer
         if (totalPages > 1) {
           h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:var(--sp-3) 0;font-size:var(--text-xs);color:var(--fg-2)">';
-          h += '<span>' + (startIdx + 1) + '–' + endIdx + ' of ' + list.length + '</span>';
+          h += '<span>' + (startIdx + 1) + '–' + endIdx + ' of ' + sortedIndices.length + '</span>';
           h += '<div style="display:flex;gap:var(--sp-2)">';
           h += '<button class="btn btn-secondary" style="font-size:var(--text-xs);padding:2px 10px" onclick="acctPageNav(-1)"' + (acctPage <= 0 ? ' disabled' : '') + '>← Prev</button>';
           h += '<button class="btn btn-secondary" style="font-size:var(--text-xs);padding:2px 10px" onclick="acctPageNav(1)"' + (acctPage >= totalPages - 1 ? ' disabled' : '') + '>Next →</button>';
@@ -1976,7 +2138,16 @@
     }
 
     function editAcct(ch, i) { openDlg(ch, 'edit', i); }
-    function rmAcct(ch, i) { vscode.postMessage({ type: 'removeAccount', channel: ch, index: i }); }
+    function rmAcct(ch, i) {
+      var payload = { type: 'removeAccount', channel: ch, index: i };
+      if (ch === 'codex' && allData) {
+        var state = getChannelState(allData, ch);
+        var acct = state.accounts[i];
+        var accountId = acct && (acct.accountId || acct.account_id) ? String(acct.accountId || acct.account_id).trim() : '';
+        if (accountId) payload.accountId = accountId;
+      }
+      vscode.postMessage(payload);
+    }
     function activateCodexCli(i) { vscode.postMessage({ type: 'activateCodexCli', index: i }); }
     function runCmd(cmd) { vscode.postMessage({ type: 'runCommand', command: cmd }); }
     function checkUpdatesBtn(btn) {
@@ -2147,7 +2318,6 @@
     function refreshPoolStatus(forceCodexQuota) {
       var btn = document.getElementById('accounts-refresh-btn');
       if (btn) { btn.disabled = true; btn.textContent = 'Refreshing...'; }
-      vscode.postMessage({ type: 'getAll' });
       vscode.postMessage({ type: 'getPoolStatus' });
       vscode.postMessage({ type: 'getGoogleQuota' });
       refreshCodexQuota(!!forceCodexQuota);
@@ -2244,14 +2414,20 @@
 
       var diffMs = ts - Date.now();
       if (diffMs <= 0) return 'now';
-      var sec = Math.round(diffMs / 1000);
-      if (sec < 60) return 'in ' + sec + 's';
-      var min = Math.round(sec / 60);
-      if (min < 60) return 'in ' + min + 'm';
-      var hr = Math.round(min / 60);
-      if (hr < 24) return 'in ' + hr + 'h';
-      var day = Math.round(hr / 24);
-      return 'in ' + day + 'd';
+
+      var totalSeconds = Math.floor(diffMs / 1000);
+      var days = Math.floor(totalSeconds / 86400);
+      var hours = Math.floor((totalSeconds % 86400) / 3600);
+      var minutes = Math.floor((totalSeconds % 3600) / 60);
+      var seconds = totalSeconds % 60;
+
+      var parts = [];
+      if (days > 0) parts.push(days + 'd');
+      if (days > 0 || hours > 0) parts.push(hours + 'h');
+      if (days > 0 || hours > 0 || minutes > 0) parts.push(minutes + 'm');
+      parts.push(seconds + 's');
+
+      return 'in ' + parts.join(' ');
     }
 
     function parseDateValue(value) {
@@ -2298,23 +2474,161 @@
         codexQuotaData = data;
         codexQuotaStatus.hasData = true;
         codexQuotaStatus.lastUpdatedAt = getCodexQuotaTimestamp(data) || new Date().toISOString();
+        codexQuotaStatus.lastErrorAt = null;
+        persistCodexQuotaCache();
       } else {
         codexQuotaStatus.lastErrorAt = new Date().toISOString();
-      }
-      if (patchVisibleCodexQuota()) {
-        renderOverviewHealth();
-        return;
       }
       renderChannelDetail();
       renderOverviewHealth();
     }
 
-    function refreshUsageSummary() {
+    function refreshUsageSummary(force) {
+      if (force !== true && analyticsHydrated && usageSummaryData && dailyUsageData) {
+        renderUsageSummary(usageSummaryData);
+        renderTokenHeatmap(dailyUsageData);
+        return;
+      }
       vscode.postMessage({ type: 'getUsageSummary' });
+      vscode.postMessage({ type: 'getDailyUsage' });
+    }
+
+    function renderTokenHeatmap(data) {
+      var container = document.getElementById('analytics-heatmap');
+      if (!container) return;
+      if (!data || !data.days || data.days.length === 0) {
+        container.innerHTML = '';
+        return;
+      }
+
+      var days = data.days;
+      var availableWidth = Math.max(container.clientWidth || 0, 320);
+      var leftPad = 30;
+      var CELL = 13;
+      var GAP = 3;
+      var step = CELL + GAP;
+      var minWeeks = 20;
+      var maxWeeks = 53;
+      var fitWeeks = Math.max(minWeeks, Math.floor((availableWidth - leftPad + GAP) / step));
+      var minWeeksFromData = minWeeks;
+      if (days.length > 0 && days[0].date) {
+        var firstParts = String(days[0].date).split('-');
+        if (firstParts.length === 3) {
+          var firstDay = new Date(Number(firstParts[0]), Number(firstParts[1]) - 1, Number(firstParts[2]));
+          firstDay.setHours(0, 0, 0, 0);
+          var todayForSpan = new Date();
+          todayForSpan.setHours(0, 0, 0, 0);
+          var spanDays = Math.max(1, Math.floor((todayForSpan - firstDay) / 86400000) + 1);
+          minWeeksFromData = Math.ceil(spanDays / 7);
+        }
+      }
+      var WEEKS = Math.min(maxWeeks, Math.max(minWeeks, fitWeeks, minWeeksFromData));
+
+      // Build date→tokens map
+      var tokensByDate = {};
+      var maxTokens = 0;
+      for (var i = 0; i < days.length; i++) {
+        var d = days[i];
+        tokensByDate[d.date] = d;
+        if (d.totalContextTokens > maxTokens) maxTokens = d.totalContextTokens;
+      }
+
+      // Generate grid: last WEEKS weeks ending today
+      var today = new Date();
+      today.setHours(0, 0, 0, 0);
+      var endDay = new Date(today);
+      // Go to next Saturday (end of week row)
+      endDay.setDate(endDay.getDate() + (6 - endDay.getDay()));
+      var startDay = new Date(endDay);
+      startDay.setDate(startDay.getDate() - (WEEKS * 7 - 1));
+
+      // Month labels
+      var monthLabels = [];
+      var prevMonth = -1;
+      var cursor = new Date(startDay);
+      for (var w = 0; w < WEEKS; w++) {
+        var weekStart = new Date(startDay);
+        weekStart.setDate(weekStart.getDate() + w * 7);
+        var m = weekStart.getMonth();
+        if (m !== prevMonth) {
+          monthLabels.push({ week: w, label: ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m] });
+          prevMonth = m;
+        }
+      }
+
+      function intensity(tokens) {
+        if (tokens <= 0 || maxTokens <= 0) return 0;
+        var ratio = tokens / maxTokens;
+        if (ratio < 0.05) return 1;
+        if (ratio < 0.25) return 2;
+        if (ratio < 0.5) return 3;
+        return 4;
+      }
+
+      var heatColors = ['var(--bg-2)', '#0e4429', '#006d32', '#26a641', '#39d353'];
+
+      var svgW = leftPad + WEEKS * CELL + Math.max(WEEKS - 1, 0) * GAP;
+      var svgH = 7 * step + 20;
+      var h = '<div style="width:100%;overflow-x:hidden">';
+      h += '<svg width="100%" viewBox="0 0 ' + svgW + ' ' + svgH + '" preserveAspectRatio="xMinYMin meet" style="display:block;width:100%;height:auto">';
+
+      // Month labels
+      for (var mi = 0; mi < monthLabels.length; mi++) {
+        var ml = monthLabels[mi];
+        h += '<text x="' + (leftPad + ml.week * step) + '" y="10" fill="var(--fg-3)" font-size="10">' + ml.label + '</text>';
+      }
+
+      // Day labels
+      var dayLabels = ['','M','','W','','F',''];
+      for (var dl = 0; dl < 7; dl++) {
+        if (dayLabels[dl]) {
+          h += '<text x="16" y="' + (20 + dl * step + CELL - 2) + '" fill="var(--fg-3)" font-size="9" text-anchor="end">' + dayLabels[dl] + '</text>';
+        }
+      }
+
+      // Cells
+      for (var w = 0; w < WEEKS; w++) {
+        for (var dow = 0; dow < 7; dow++) {
+          var cellDate = new Date(startDay);
+          cellDate.setDate(cellDate.getDate() + w * 7 + dow);
+          if (cellDate > today) continue;
+          var key = cellDate.getFullYear() + '-' + String(cellDate.getMonth() + 1).padStart(2, '0') + '-' + String(cellDate.getDate()).padStart(2, '0');
+          var entry = tokensByDate[key];
+          var tokens = entry ? entry.totalContextTokens : 0;
+          var reqs = entry ? entry.requests : 0;
+          var e429 = entry ? entry.error429Count : 0;
+          var e503 = entry ? entry.error503Count : 0;
+          var lvl = intensity(tokens);
+          var cx = leftPad + w * step;
+          var cy = 16 + dow * step;
+          var tip = key + ': ' + formatCompactNumber(tokens) + ' tokens, ' + reqs + ' reqs';
+          if (e429 > 0 || e503 > 0) tip += ', 429:' + e429 + ' 503:' + e503;
+          h += '<rect x="' + cx + '" y="' + cy + '" width="' + CELL + '" height="' + CELL + '" rx="2" fill="' + heatColors[lvl] + '" style="outline:1px solid rgba(255,255,255,.04)">';
+          h += '<title>' + esc(tip) + '</title></rect>';
+        }
+      }
+
+      h += '</svg></div>';
+
+      // Legend
+      h += '<div style="display:flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--fg-3);margin-top:var(--sp-1)">';
+      h += '<span>Less</span>';
+      for (var li = 0; li < heatColors.length; li++) {
+        h += '<span style="display:inline-block;width:' + CELL + 'px;height:' + CELL + 'px;border-radius:2px;background:' + heatColors[li] + ';outline:1px solid rgba(255,255,255,.04)"></span>';
+      }
+      h += '<span>More</span>';
+      h += '<span style="margin-left:auto">' + esc(formatCompactNumber(maxTokens)) + ' peak</span>';
+      h += '</div>';
+
+      container.innerHTML = h;
     }
 
     function renderUsageSummary(data) {
       usageSummaryData = data;
+
+      if (dailyUsageData && dailyUsageData.days && dailyUsageData.days.length) {
+        renderTokenHeatmap(dailyUsageData);
+      }
 
       var banner = document.getElementById('analytics-banner');
       var summary = document.getElementById('analytics-summary');
@@ -2393,6 +2707,19 @@
         );
       }
 
+      function googleErrorBreakdown(item) {
+        if (!item) return '';
+        var parts = [];
+        if (Number(item.error429Count || 0) > 0) {
+          parts.push('429 ' + formatNumber(item.error429Count) + ' (' + formatPercent(item.error429Rate) + ')');
+        }
+        if (Number(item.error503Count || 0) > 0) {
+          parts.push('503 ' + formatNumber(item.error503Count) + ' (' + formatPercent(item.error503Rate) + ')');
+        }
+        if (parts.length === 0) return '';
+        return parts.join(' · ') + ' / ' + formatNumber(item.requests) + ' reqs';
+      }
+
       function renderSessionRuntime(runtime) {
         var totals = runtime && runtime.totals ? runtime.totals : null;
         var rows = runtime && Array.isArray(runtime.sessions) ? runtime.sessions : [];
@@ -2403,13 +2730,13 @@
         }
 
         var runtimeCards = [
-          { label: 'Sessions', value: formatNumber(totals.totalSessions) },
-          { label: 'Active', value: formatNumber(totals.activeSessions) },
-          { label: 'Pending Tools', value: formatNumber(totals.pendingToolCalls) },
-          { label: 'Completed Tools', value: formatNumber(totals.completedToolCalls) },
+          { label: 'Sessions', value: formatCompactNumber(totals.totalSessions) },
+          { label: 'Active', value: formatCompactNumber(totals.activeSessions) },
+          { label: 'Pending Tools', value: formatCompactNumber(totals.pendingToolCalls) },
+          { label: 'Completed Tools', value: formatCompactNumber(totals.completedToolCalls) },
           { label: 'Tool Avg', value: formatDurationMs(totals.avgToolDurationMs) },
           { label: 'Tool Total', value: formatDurationMs(totals.totalToolDurationMs) },
-          { label: 'Edited Files', value: formatNumber(totals.editedFiles) },
+          { label: 'Edited Files', value: formatCompactNumber(totals.editedFiles) },
           { label: 'Line Delta', value: '+' + formatNumber(totals.linesAdded) + ' / -' + formatNumber(totals.linesRemoved) },
         ];
 
@@ -2493,13 +2820,13 @@
         '</div>';
 
       var cards = [
-        { label: 'Requests', value: formatNumber(totals.requests) },
-        { label: 'Context', value: formatNumber(totals.totalContextTokens) },
-        { label: 'Input', value: formatNumber(totals.inputTokens) },
-        { label: 'Cache Read', value: formatNumber(totals.cachedInputTokens) },
-        { label: 'Cache Write', value: formatNumber(totals.cacheCreationInputTokens) },
-        { label: 'Output', value: formatNumber(totals.outputTokens) },
-        { label: 'Web Search', value: formatNumber(totals.webSearchRequests) },
+        { label: 'Requests', value: formatKUnitNumber(totals.requests) },
+        { label: 'Context', value: formatKUnitNumber(totals.totalContextTokens) },
+        { label: 'Input', value: formatKUnitNumber(totals.inputTokens) },
+        { label: 'Cache Read', value: formatKUnitNumber(totals.cachedInputTokens) },
+        { label: 'Cache Write', value: formatKUnitNumber(totals.cacheCreationInputTokens) },
+        { label: 'Output', value: formatKUnitNumber(totals.outputTokens) },
+        { label: 'Web Search', value: formatKUnitNumber(totals.webSearchRequests) },
         { label: 'Avg Duration', value: formatDurationMs(totals.avgDurationMs) },
       ];
 
@@ -2521,7 +2848,7 @@
         var transportCount = Object.keys(backend.transports || {}).length;
         return (
           '<div class="be ' + meta.cls + '">' +
-            '<div class="be-top"><span class="be-name">' + esc(backend.label || meta.label) + '</span><span class="be-count">' + esc(formatNumber(backendTotals.requests)) + '</span></div>' +
+            '<div class="be-top"><span class="be-name">' + esc(backend.label || meta.label) + '</span><span class="be-count">' + esc(formatCompactNumber(backendTotals.requests)) + '</span></div>' +
             '<div class="be-status">' + esc(usageBreakdown(backendTotals)) + '</div>' +
             '<div class="acct-detail" style="margin-top:var(--sp-2)">Routes ' + esc(formatNumber(transportCount)) + ' · Search ' + esc(formatNumber(backendTotals.webSearchRequests)) + ' · Avg ' + esc(formatDurationMs(backendTotals.avgDurationMs)) + ' · Last ' + esc(backendTotals.lastSeenAt ? formatDateTime(backendTotals.lastSeenAt) : '--') + '</div>' +
           '</div>'
@@ -2535,7 +2862,7 @@
         var meta = backendMeta[item.backend] || { label: item.backend, cls: 'be-oai' };
         return (
           '<div class="be ' + meta.cls + '">' +
-            '<div class="be-top"><span class="be-name">' + esc(meta.label + ' · ' + routeLabel(item.backend, item.transport)) + '</span><span class="be-count">' + esc(formatNumber(item.requests)) + '</span></div>' +
+            '<div class="be-top"><span class="be-name">' + esc(meta.label + ' · ' + routeLabel(item.backend, item.transport)) + '</span><span class="be-count">' + esc(formatCompactNumber(item.requests)) + '</span></div>' +
             '<div class="be-status">' + esc(usageBreakdown(item)) + '</div>' +
             '<div class="acct-detail" style="margin-top:var(--sp-2)">' + esc(extraBreakdown(item)) + '</div>' +
           '</div>'
@@ -2553,10 +2880,11 @@
           var meta = backendMeta[item.backend] || { label: item.backend, cls: 'be-oai' };
           var badge = '<span class="setting-badge setting-badge-ok">' + esc(meta.label) + '</span>';
           var label = item[labelKey] || '--';
+          var errorLine = googleErrorBreakdown(item);
           return '<div class="acct">' +
             '<div class="acct-info">' +
               '<div class="acct-name" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' + badge + '<span>' + esc(label) + '</span></div>' +
-              '<div class="acct-detail">' + esc(usageBreakdown(item)) + '</div>' +
+              '<div class="acct-detail">' + esc(usageBreakdown(item)) + (errorLine ? '<br>' + esc(errorLine) : '') + '</div>' +
             '</div>' +
             '<div class="acct-detail" style="white-space:nowrap;text-align:right">' + esc(extraBreakdown(item)) + '</div>' +
           '</div>';

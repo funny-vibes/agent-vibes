@@ -40,13 +40,13 @@ import {
   BlameByFilePathResultSchema,
   BlameByFilePathSuccessSchema,
   BlameByFilePathToolCallSchema,
+  type CommandClassifierResult,
+  CommandClassifierResultSchema,
   ComputerUseArgsSchema,
   ComputerUseErrorSchema,
   ComputerUseResultSchema,
   ComputerUseSuccessSchema,
   ComputerUseToolCallSchema,
-  type CommandClassifierResult,
-  CommandClassifierResultSchema,
   // ConversationStateStructure
   ConversationStateStructureSchema,
   ConversationTokenDetailsSchema,
@@ -97,12 +97,12 @@ import {
   GenerateImageResultSchema,
   GenerateImageSuccessSchema,
   GenerateImageToolCallSchema,
+  GetBlobArgsSchema,
   GetMcpToolsAgentResultSchema,
   GetMcpToolsArgsSchema,
   GetMcpToolsErrorSchema,
   GetMcpToolsSuccessSchema,
   GetMcpToolsToolCallSchema,
-  GetBlobArgsSchema,
   GlobToolArgsSchema,
   GlobToolCallSchema,
   GlobToolErrorSchema,
@@ -205,14 +205,14 @@ import {
   ReflectToolCallSchema,
   ReportBugArgsSchema,
   ReportBugErrorSchema,
-  ReportBugResultSchema,
-  ReportBugSuccessSchema,
-  ReportBugToolCallSchema,
   ReportBugfixResultsArgsSchema,
   ReportBugfixResultsErrorSchema,
   ReportBugfixResultsResultSchema,
   ReportBugfixResultsSuccessSchema,
   ReportBugfixResultsToolCallSchema,
+  ReportBugResultSchema,
+  ReportBugSuccessSchema,
+  ReportBugToolCallSchema,
   SandboxPolicy_Type,
   SandboxPolicySchema,
   SemSearchToolArgsSchema,
@@ -231,9 +231,9 @@ import {
   SetupVmEnvironmentSuccessSchema,
   SetupVmEnvironmentToolCallSchema,
   ShellAbortReason,
-  ShellBackgroundReason,
   // Shell
   ShellArgsSchema,
+  ShellBackgroundReason,
   ShellCommandParsingResult_ExecutableCommandArgSchema,
   ShellCommandParsingResult_ExecutableCommandSchema,
   ShellCommandParsingResultSchema,
@@ -286,11 +286,11 @@ import {
   TaskSuccessSchema,
   TaskToolCallDeltaSchema,
   TaskToolCallSchema,
-  TimeoutBehavior,
   // InteractionUpdate sub-messages
   TextDeltaUpdateSchema,
   ThinkingCompletedUpdateSchema,
   ThinkingDeltaUpdateSchema,
+  TimeoutBehavior,
   // Todo & Phase
   TodoItemSchema,
   TokenDeltaUpdateSchema,
@@ -3285,11 +3285,10 @@ export class CursorGrpcService {
       .map((s) => (typeof s === "string" ? s.trim() : ""))
       .filter((s) => s.length > 0)
 
-    // Build plan text: prefer explicit plan, then compose from steps as markdown
+    // Build plan text from explicit narrative fields only.
+    // Do not mirror steps into `plan`, because Cursor already renders todos
+    // separately and the UI would show duplicated content.
     let plan = safeString(args.plan).trim()
-    if (!plan && stepsStrings.length > 0) {
-      plan = stepsStrings.map((s, i) => `${i + 1}. ${s}`).join("\n")
-    }
     if (!plan) {
       plan = overview || title || "Plan"
     }

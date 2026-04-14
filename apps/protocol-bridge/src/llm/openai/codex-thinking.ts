@@ -138,6 +138,8 @@ export function resolveCodexReasoningEffort(
   switch (intent.mode) {
     case "disabled":
       return clampLevelToSupported("none", supported, defaultLevel)
+    case "explicit_effort":
+      return clampLevelToSupported(intent.effort, supported, defaultLevel)
     case "explicit_budget":
       return clampLevelToSupported(
         convertBudgetToThinkingLevel(intent.budgetTokens),

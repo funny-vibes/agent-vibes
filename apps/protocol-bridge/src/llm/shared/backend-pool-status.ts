@@ -20,6 +20,8 @@ export interface BackendPoolModelCooldownStatus {
   backoffLevel?: number
 }
 
+export type CodexRateLimitSource = "request" | "probe"
+
 export interface CodexRateLimitWindow {
   usedPercent: number
   windowMinutes: number | null
@@ -27,9 +29,27 @@ export interface CodexRateLimitWindow {
 }
 
 export interface CodexRateLimitSnapshot {
+  model: string
+  displayModel: string
+  source: CodexRateLimitSource
   primary?: CodexRateLimitWindow
   secondary?: CodexRateLimitWindow
   updatedAt: number
+}
+
+export interface CodexRateLimitModelSummary {
+  model: string
+  displayModel: string
+  effective: CodexRateLimitSnapshot | null
+  request?: CodexRateLimitSnapshot
+  probe?: CodexRateLimitSnapshot
+  updatedAt: number
+}
+
+export interface CodexRateLimitAccountSummary {
+  effective: CodexRateLimitSnapshot | null
+  models: CodexRateLimitModelSummary[]
+  updatedAt: number | null
 }
 
 export interface BackendPoolEntryStatus {
@@ -53,7 +73,7 @@ export interface BackendPoolEntryStatus {
   pid?: number
   maxContextTokens?: number
   modelCooldowns: BackendPoolModelCooldownStatus[]
-  rateLimits?: CodexRateLimitSnapshot
+  rateLimits?: CodexRateLimitAccountSummary
 }
 
 export interface BackendPoolStatus {
