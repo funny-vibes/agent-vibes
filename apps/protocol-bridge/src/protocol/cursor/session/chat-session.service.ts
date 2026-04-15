@@ -274,6 +274,7 @@ export interface EditFailureContext extends EditFailureSelection {
     | "missing_search_replace"
     | "empty_search"
     | "invalid_chunk"
+  matchCountInFile?: number
 }
 
 /**

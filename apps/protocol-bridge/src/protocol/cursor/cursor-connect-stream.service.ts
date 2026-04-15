@@ -14530,18 +14530,6 @@ ${raw}
                 fileSize: readResult.value.fileSize,
                 truncated: readResult.value.truncated,
                 rangeApplied: readResult.value.rangeApplied,
-                relatedCursorRulePaths: Array.isArray(
-                  readResult.value.relatedCursorRulePaths
-                )
-                  ? readResult.value.relatedCursorRulePaths
-                  : undefined,
-                relatedCursorRules: Array.isArray(
-                  readResult.value.relatedCursorRules
-                )
-                  ? (readResult.value.relatedCursorRules as Array<
-                      Record<string, unknown>
-                    >)
-                  : undefined,
               },
             }
           }

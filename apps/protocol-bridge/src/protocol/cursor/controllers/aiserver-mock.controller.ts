@@ -498,7 +498,6 @@ export class AiserverMockController {
           AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
           {
             hideSearchBar: false,
-            hideRoutedModelView: true,
             routedModelViewToNamedViewToggle: create(
               AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
               {
