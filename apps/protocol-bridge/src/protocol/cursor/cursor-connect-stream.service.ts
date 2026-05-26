@@ -16355,6 +16355,9 @@ ${raw}
 
     // Call backend API (routed based on model name)
     try {
+      this.logger.log(
+        `[CCursorAgentRoute] conversation=${conversationId} cursorModel=${parsed.model} backend=${route.backend} backendModel=${route.model}`
+      )
       const stream = this.getBackendStream(route.model, {
         buildDtoForRoute: buildChatDtoForRoute,
         buildCodexRequestForRoute: buildChatCodexRequestForRoute,

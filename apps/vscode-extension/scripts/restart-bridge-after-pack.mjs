@@ -13,8 +13,8 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.join(extensionRoot, "package.json"), "utf-8")
 )
 
-const publisher = packageJson.publisher || "funny-vibes"
-const extensionName = packageJson.name || "agent-vibes"
+const publisher = packageJson.publisher || "local-ai"
+const extensionName = packageJson.name || "ccursor"
 const version = packageJson.version || "0.1.0"
 
 const target = `${process.platform}-${process.arch}`
@@ -90,7 +90,7 @@ function loadCursorSettings() {
 
 function resolveConfig() {
   const settings = loadCursorSettings()
-  const defaultDataDir = path.join(os.homedir(), ".agent-vibes")
+  const defaultDataDir = path.join(os.homedir(), ".ccursor")
   const dataDir =
     typeof settings["agentVibes.dataDir"] === "string" &&
     settings["agentVibes.dataDir"].trim()
@@ -363,7 +363,7 @@ async function main() {
   throw new Error(
     `Bridge restart did not pass health check on port ${port}. ` +
       `Timed out after ${STARTUP_HEALTH_TIMEOUT_MS}ms. ` +
-      `Check ${LOG_FILE} or run "Agent Vibes: Restart Server" in Cursor.`
+      `Check ${LOG_FILE} or run "CCursor: Restart Server" in Cursor.`
   )
 }
 

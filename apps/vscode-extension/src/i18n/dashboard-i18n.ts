@@ -10,14 +10,14 @@ export function readDashboardLocale(): DashboardLocale {
 }
 
 export function getDashboardPanelTitle(locale: DashboardLocale): string {
-  return locale === "zh" ? "Agent Vibes 控制台" : "Agent Vibes Dashboard"
+  return locale === "zh" ? "CCursor 控制台" : "CCursor Dashboard"
 }
 
 /** Flat strings for the dashboard webview (`L(key)`). */
 const UI_EN: Record<string, string> = {
   "page.lang": "en",
-  "page.title": "Agent Vibes Dashboard",
-  "page.tagline": "Unified AI Agent Gateway - Happy vibing!",
+  "page.title": "CCursor Dashboard",
+  "page.tagline": "Unified AI Agent Gateway - Private BYOK routing.",
   "tab.overview": "Overview",
   "tab.accounts": "Accounts",
   "tab.analytics": "Analytics",
@@ -110,17 +110,16 @@ const UI_EN: Record<string, string> = {
   "acct.noToken": "No token",
   "acct.unknown": "Unknown",
   "acct.unnamed": "Unnamed",
-  "oauth.googleTab": "Google OAuth",
+  "oauth.googleTab": "Google Token",
   "oauth.tokenTab": "Refresh Token",
-  "oauth.openaiTab": "OpenAI OAuth",
+  "oauth.openaiTab": "OpenAI Token",
   "oauth.manualTab": "Manual Sync",
-  "oauth.googleHelp":
-    "Click the button below to open Google authorization in your browser. After you sign in, the account will be saved automatically.",
+  "oauth.googleHelp": "Paste an existing Google refresh token or account JSON.",
   "oauth.openaiHelp":
-    "Click the button below to open OpenAI authorization in your browser.",
+    "Use local Codex sync or configure an OpenAI-compatible endpoint directly.",
   "oauth.codexManualHelp":
     "Sync from your local Codex CLI configuration at ~/.codex/auth.json.",
-  "oauth.startAuth": "Start Authorization",
+  "oauth.startAuth": "Start",
   "oauth.openingBrowser": "Opening browser...",
   "oauth.waiting": "Waiting...",
   "oauth.retry": "Retry",
@@ -326,7 +325,7 @@ const UI_EN: Record<string, string> = {
 
 const UI_ZH: Record<string, string> = {
   "page.lang": "zh",
-  "page.title": "Agent Vibes 控制台",
+  "page.title": "CCursor 控制台",
   "page.tagline": "统一 AI 代理网关 — 祝你编码愉快！",
   "tab.overview": "概览",
   "tab.accounts": "账号",
@@ -418,15 +417,15 @@ const UI_ZH: Record<string, string> = {
   "acct.noToken": "无 Token",
   "acct.unknown": "未知",
   "acct.unnamed": "未命名",
-  "oauth.googleTab": "Google OAuth",
+  "oauth.googleTab": "Google Token",
   "oauth.tokenTab": "Refresh Token",
-  "oauth.openaiTab": "OpenAI OAuth",
+  "oauth.openaiTab": "OpenAI Token",
   "oauth.manualTab": "手动同步",
-  "oauth.googleHelp":
-    "点击下方按钮在浏览器中打开 Google 授权。登录后账号会自动保存。",
-  "oauth.openaiHelp": "点击下方按钮在浏览器中打开 OpenAI 授权。",
+  "oauth.googleHelp": "粘贴已有 Google refresh token 或账号 JSON。",
+  "oauth.openaiHelp":
+    "使用本机 Codex 同步，或直接配置 OpenAI-compatible endpoint。",
   "oauth.codexManualHelp": "从本机 Codex CLI 配置 ~/.codex/auth.json 同步。",
-  "oauth.startAuth": "开始授权",
+  "oauth.startAuth": "开始",
   "oauth.openingBrowser": "正在打开浏览器…",
   "oauth.waiting": "请稍候…",
   "oauth.retry": "重试",
@@ -687,7 +686,7 @@ const OVERVIEW_EN: OverviewMsg = {
   forwardingIptables: "Hosts mapping and iptables appear active.",
   setupHeadline: "Setup required",
   setupSummary:
-    "Finish the remaining setup steps to route Cursor traffic through Agent Vibes.",
+    "Finish the remaining setup steps to route Cursor traffic through CCursor.",
   readyHeadline: "Ready",
   readySummary: "Everything is ready.",
   attentionHeadline: "Almost there",
@@ -717,7 +716,7 @@ const OVERVIEW_ZH: OverviewMsg = {
   forwardingPortproxy: "Hosts 映射与端口代理似乎已生效。",
   forwardingIptables: "Hosts 映射与 iptables 似乎已生效。",
   setupHeadline: "需要完成设置",
-  setupSummary: "完成以下步骤，以便通过 Agent Vibes 路由 Cursor 流量。",
+  setupSummary: "完成以下步骤，以便通过 CCursor 路由 Cursor 流量。",
   readyHeadline: "已就绪",
   readySummary: "一切就绪。",
   attentionHeadline: "即将完成",
@@ -737,9 +736,9 @@ export function translatePatchResetHint(
   hint: string
 ): string {
   const mapEnToZh: Record<string, string> = {
-    "No original baseline has been captured yet. Apply a Cursor repair through Agent Vibes first.":
-      "尚未捕获原始基线。请先在 Agent Vibes 中执行一次 Cursor 修复。",
-    "Some active checksum changes were applied before Agent Vibes captured the original baseline, so one-click reset is currently unsafe.":
+    "No original baseline has been captured yet. Apply a Cursor repair through CCursor first.":
+      "尚未捕获原始基线。请先在 CCursor 中执行一次 Cursor 修复。",
+    "Some active checksum changes were applied before CCursor captured the original baseline, so one-click reset is currently unsafe.":
       "在捕获原始基线之前已应用部分校验和修改，一键还原当前不安全。",
   }
   const restorePrefix =
@@ -872,11 +871,11 @@ const SETTINGS_EN: SettingsCopy = {
       items: {
         language: {
           label: "Dashboard Language",
-          desc: "Language used by the Agent Vibes dashboard webview",
+          desc: "Language used by the CCursor dashboard webview",
         },
         autoCheckUpdates: {
           label: "Auto Check Updates",
-          desc: "Check GitHub Releases for new VSIX updates on startup",
+          desc: "Check local release channel for new VSIX updates on startup",
         },
         updateCheckIntervalHours: {
           label: "Update Check Interval (hours)",
@@ -926,7 +925,7 @@ const SETTINGS_EN: SettingsCopy = {
       items: {
         dataDir: {
           label: "Data Directory",
-          desc: "Root directory for all Agent Vibes data (default: ~/.agent-vibes)",
+          desc: "Root directory for all CCursor data (default: ~/.ccursor)",
         },
         antigravityAccountsPath: {
           label: "Antigravity Accounts File",
@@ -981,12 +980,12 @@ const SETTINGS_EN: SettingsCopy = {
   },
   general: {
     languageLabel: "Dashboard Language",
-    languageDesc: "Language used by the Agent Vibes dashboard webview",
+    languageDesc: "Language used by the CCursor dashboard webview",
     langEn: "English",
     langZh: "中文",
     autoCheckUpdatesLabel: "Auto Check Updates",
     autoCheckUpdatesDesc:
-      "Check GitHub Releases for new VSIX updates on startup",
+      "Check local release channel for new VSIX updates on startup",
     updateIntervalLabel: "Update Check Interval (hours)",
     updateIntervalDesc: "Minimum hours between automatic update checks",
   },
@@ -1000,11 +999,11 @@ const SETTINGS_ZH: SettingsCopy = {
       items: {
         language: {
           label: "控制台语言",
-          desc: "Agent Vibes 控制台（Webview）显示语言",
+          desc: "CCursor 控制台（Webview）显示语言",
         },
         autoCheckUpdates: {
           label: "自动检查更新",
-          desc: "启动时检查 GitHub Releases 是否有新 VSIX",
+          desc: "启动时检查 local release channel 是否有新 VSIX",
         },
         updateCheckIntervalHours: {
           label: "检查更新间隔（小时）",
@@ -1054,7 +1053,7 @@ const SETTINGS_ZH: SettingsCopy = {
       items: {
         dataDir: {
           label: "数据目录",
-          desc: "Agent Vibes 数据根目录（默认：~/.agent-vibes）",
+          desc: "CCursor 数据根目录（默认：~/.ccursor）",
         },
         antigravityAccountsPath: {
           label: "Antigravity 账号文件",
@@ -1109,11 +1108,11 @@ const SETTINGS_ZH: SettingsCopy = {
   },
   general: {
     languageLabel: "控制台语言",
-    languageDesc: "Agent Vibes 控制台（Webview）显示语言",
+    languageDesc: "CCursor 控制台（Webview）显示语言",
     langEn: "English",
     langZh: "中文",
     autoCheckUpdatesLabel: "自动检查更新",
-    autoCheckUpdatesDesc: "启动时检查 GitHub Releases 是否有新 VSIX",
+    autoCheckUpdatesDesc: "启动时检查 local release channel 是否有新 VSIX",
     updateIntervalLabel: "检查更新间隔（小时）",
     updateIntervalDesc: "自动检查更新之间的最短时间间隔",
   },

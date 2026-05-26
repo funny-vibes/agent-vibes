@@ -1,13 +1,13 @@
 /**
- * Shared constants for the Agent Vibes extension.
+ * Shared constants for the CCursor extension.
  */
 
 // Extension identifiers
 export const EXTENSION_ID = "agent-vibes"
-export const EXTENSION_DISPLAY_NAME = "Agent Vibes"
-export const GITHUB_REPO = "funny-vibes/agent-vibes"
-export const GITHUB_RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`
-export const GITHUB_RELEASES_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`
+export const EXTENSION_DISPLAY_NAME = "CCursor"
+export const GITHUB_REPO = ""
+export const GITHUB_RELEASES_URL = ""
+export const GITHUB_RELEASES_API_URL = ""
 
 // Context keys (for when-clause evaluation)
 export const CTX_SERVER_RUNNING = "agentVibes.serverRunning"
@@ -40,6 +40,7 @@ export const CMD = {
   OPEN_DASHBOARD: "agentVibes.openDashboard",
   APPLY_CURSOR_CHECKSUMS: "agentVibes.applyCursorChecksums",
   RESET_CURSOR_PATCHES: "agentVibes.resetCursorPatches",
+  DEBUG_SUBMIT_CURSOR_AGENT: "agentVibes.debugSubmitCursorAgent",
 } as const
 
 // Default configuration values

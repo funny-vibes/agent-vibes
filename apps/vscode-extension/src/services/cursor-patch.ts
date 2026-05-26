@@ -16,15 +16,24 @@ interface PatchRule {
   find: RegExp
   replace: string
   marker: string
+  optional?: boolean
 }
 
 const TRANSPORT_PATCHES: PatchRule[] = [
+  {
+    name: "Cursor Agent Chat Open Auto Submit",
+    find: /fl\.registerCommand\("workbench\.action\.chat\.open",async\(n,e\)=>\{const t=n\.get\(w_\),i=n\.get\(eP\),r=n\.get\(uI\),s=typeof e=="string"\?e:e\?\.query,[\s\S]*?\}\),Nn\(HcS\);/,
+    replace:
+      'fl.registerCommand("workbench.action.chat.open",async(n,e)=>{const t=n.get(w_),i=n.get(eP),r=n.get(uI),l=n.get(mW),s=typeof e=="string"?e:e?.query,o=typeof e=="object"&&e?.ccursorAutoSubmit===!0,a=typeof e=="object"&&e?.ccursorAutoSubmitMode?e.ccursorAutoSubmitMode:"agent",u=typeof e=="object"&&typeof e?.ccursorAutoSubmitDelayMs=="number"?e.ccursorAutoSubmitDelayMs:3000,d=s?{text:s,richText:s}:void 0;if(o&&d)d.unifiedMode=a,d.analyticsMetadata={source:"ccursor-chat-open-autosubmit"};const h=await t.createComposer({unifiedMode:o?a:void 0,partialState:d,openInNewTab:!0});if(!h){console.error("[composer] Failed to create composer for workbench.action.chat.open");return}const f=h.composerId;s&&r.fireShouldForceText({composerId:f}),await i.showAndFocus(f);if(o&&s&&s.trim().length>0){await new Promise(c=>setTimeout(c,u));console.warn("[CCURSOR_CHAT_OPEN_AUTOSUBMIT]",JSON.stringify({composerId:f,textLength:s.length,mode:a,delayMs:u}));await l.submitChatMaybeAbortCurrent(f,s,{skipClearInput:!0});console.warn("[CCURSOR_CHAT_OPEN_AUTOSUBMITTED]",JSON.stringify({composerId:f}))}return{composerId:f,textLength:s?.length??0,autoSubmitted:o,autoSubmitDelayMs:o?u:void 0}}),Nn(HcS);',
+    marker: "[CCURSOR_CHAT_OPEN_AUTOSUBMIT]",
+  },
   {
     name: "Transport Request Initiation",
     find: /this\.structuredLogService\.debug\("transport","Initiating stream AI connect",\{service:e\.typeName,method:t\.name,streamId:(\w+),requestId:(\w+)\?\?"not-found"/,
     replace:
       'console.warn("[TRANSPORT_REQUEST]",JSON.stringify({service:e.typeName,method:t.name,streamId:$1,requestId:$2,requestType:t.I?.typeName,responseType:t.O?.typeName})),this.structuredLogService.debug("transport","Initiating stream AI connect",{service:e.typeName,method:t.name,streamId:$1,requestId:$2??"not-found"',
     marker: "[TRANSPORT_REQUEST]",
+    optional: true,
   },
   {
     name: "Transport Request Payload",
@@ -32,6 +41,7 @@ const TRANSPORT_PATCHES: PatchRule[] = [
     replace:
       'const $1=new t.I($2);(()=>{try{console.warn("[TRANSPORT_REQUEST_PAYLOAD]",JSON.stringify({type:t.I?.typeName,payload:$1.toJson?$1.toJson():$2}))}catch(xErr){console.warn("[TRANSPORT_REQUEST_PAYLOAD]",JSON.stringify({type:t.I?.typeName,error:String(xErr)}))}})();$3=$4.wrap($1.toBinary())',
     marker: "[TRANSPORT_REQUEST_PAYLOAD]",
+    optional: true,
   },
   {
     name: "Transport Response Chunk",
@@ -39,6 +49,7 @@ const TRANSPORT_PATCHES: PatchRule[] = [
     replace:
       '(console.warn("[TRANSPORT_CHUNK]",JSON.stringify({streamId:$2,chunkSize:$1?.length||0,chunkB64:$1?btoa(String.fromCharCode.apply(null,$1.slice(0,2000))):null})),this._proxy.$pushAiConnectTransportStreamChunk($1,$2,$3))',
     marker: "[TRANSPORT_CHUNK]",
+    optional: true,
   },
   {
     name: "Transport Response Yield",
@@ -46,6 +57,7 @@ const TRANSPORT_PATCHES: PatchRule[] = [
     replace:
       'for await(const $1 of $2){if($3.token.isCancellationRequested)continue;const xResp=t.O.fromBinary($1.buffer);(()=>{try{console.warn("[TRANSPORT_RESPONSE]",JSON.stringify({type:t.O?.typeName,payload:xResp.toJson?xResp.toJson():xResp}))}catch(xErr){console.warn("[TRANSPORT_RESPONSE]",JSON.stringify({type:t.O?.typeName,error:String(xErr)}))}})();yield xResp}',
     marker: "[TRANSPORT_RESPONSE]",
+    optional: true,
   },
   {
     name: "Unary Request Payload",
@@ -53,6 +65,7 @@ const TRANSPORT_PATCHES: PatchRule[] = [
     replace:
       'const $1=new a.I($2);(()=>{try{const svc=o.typeName,mth=a.name;const skip=["GetTeams","GetUser","GetSubscription","CheckQueuePosition","FlushEvents","Batch","SubmitLogs","SubmitSpans","BootstrapStatsig","ReportClientNumericMetrics"];if(skip.includes(mth))return;console.warn("[UNARY_REQUEST]",JSON.stringify({service:svc,method:mth,type:a.I?.typeName,payload:$1.toJson?$1.toJson():$2}))}catch(xErr){console.warn("[UNARY_REQUEST]",JSON.stringify({service:o.typeName,method:a.name,type:a.I?.typeName,error:String(xErr)}))}})();const $3=$4.wrap($1.toBinary())',
     marker: "[UNARY_REQUEST]",
+    optional: true,
   },
   {
     name: "Unary Response",
@@ -60,10 +73,18 @@ const TRANSPORT_PATCHES: PatchRule[] = [
     replace:
       'const $1=$2.message,$3=$2.header,$4=$2.trailer,$5=a.O.fromBinary($1);(()=>{try{const svc=o.typeName,mth=a.name;const skip=["GetTeams","GetUser","GetSubscription","CheckQueuePosition","FlushEvents","Batch","SubmitLogs","SubmitSpans","BootstrapStatsig","ReportClientNumericMetrics"];if(skip.includes(mth))return;console.warn("[UNARY_RESPONSE]",JSON.stringify({service:svc,method:mth,type:a.O?.typeName,payload:$5.toJson?$5.toJson():$5}))}catch(xErr){console.warn("[UNARY_RESPONSE]",JSON.stringify({service:o.typeName,method:a.name,type:a.O?.typeName,error:String(xErr)}))}})()',
     marker: "[UNARY_RESPONSE]",
+    optional: true,
   },
 ]
 
 const PATCH_MARKERS = TRANSPORT_PATCHES.map((p) => p.marker)
+const CURRENT_CHAT_OPEN_PATCH_SNIPPET = "autoSubmitDelayMs:o?u:void 0"
+const LEGACY_PATCH_MARKERS = [
+  "[CCURSOR_NATIVE_AGENT_SUBMIT]",
+  "[CCURSOR_CHAT_OPEN_AUTOSUBMIT_V2]",
+  "[CCURSOR_CHAT_OPEN_AUTOSUBMIT_V3]",
+  "[CCURSOR_CHAT_OPEN_AUTOSUBMIT_V4]",
+]
 
 export interface PatchStatus {
   filePath: string | null
@@ -145,8 +166,21 @@ export class CursorPatchService {
       this.logger.info("Created backup of Cursor workbench")
     }
 
-    // Apply patches
     let content = fs.readFileSync(filePath, "utf-8")
+    const hasOutdatedChatOpenPatch =
+      content.includes("[CCURSOR_CHAT_OPEN_AUTOSUBMIT]") &&
+      !content.includes(CURRENT_CHAT_OPEN_PATCH_SNIPPET)
+    if (
+      hasOutdatedChatOpenPatch ||
+      LEGACY_PATCH_MARKERS.some((m) => content.includes(m))
+    ) {
+      content = fs.readFileSync(backupPath, "utf-8")
+      this.logger.info(
+        "Restored clean Cursor workbench before applying updated patches"
+      )
+    }
+
+    // Apply patches
     const original = content
     let applied = 0
 
@@ -159,7 +193,12 @@ export class CursorPatchService {
         applied++
         this.logger.info(`Applied patch: ${patch.name}`)
       } else {
-        errors.push(`Pattern not found: ${patch.name}`)
+        const message = `Pattern not found: ${patch.name}`
+        if (patch.optional) {
+          this.logger.warn(message)
+        } else {
+          errors.push(message)
+        }
       }
     }
 

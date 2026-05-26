@@ -2292,6 +2292,21 @@ export class OpenaiCompatService implements OnModuleInit {
     const FIRST_CHUNK_TIMEOUT_MS = this.getStreamFirstChunkTimeoutMs()
     const IDLE_TIMEOUT_MS = this.getStreamIdleTimeoutMs()
     let receivedChunk = false
+    let usageRecorded = false
+
+    const recordStreamUsage = () => {
+      if (usageRecorded) {
+        return
+      }
+      usageRecorded = true
+      this.markAccountHealthy(account, request.model)
+      this.recordOpenAiCompatUsage(account, request.model, "chat-completions", {
+        inputTokens: state.lastInputTokens,
+        cachedInputTokens: state.lastCachedInputTokens,
+        outputTokens: state.lastOutputTokens,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+      })
+    }
 
     try {
       while (true) {
@@ -2324,6 +2339,9 @@ export class OpenaiCompatService implements OnModuleInit {
 
           const events = this.translateStreamChunk(trimmed, state)
           for (const event of events) {
+            if (event.includes('"type":"message_stop"')) {
+              recordStreamUsage()
+            }
             yield event
           }
         }
@@ -2333,21 +2351,18 @@ export class OpenaiCompatService implements OnModuleInit {
       if (buffer.trim()) {
         const events = this.translateStreamChunk(buffer.trim(), state)
         for (const event of events) {
+          if (event.includes('"type":"message_stop"')) {
+            recordStreamUsage()
+          }
           yield event
         }
       }
 
       // Emit final message_delta + message_stop if not already emitted
       if (state.messageStartEmitted) {
+        recordStreamUsage()
         yield* this.emitStreamEnd(state)
       }
-      this.markAccountHealthy(account, request.model)
-      this.recordOpenAiCompatUsage(account, request.model, "chat-completions", {
-        inputTokens: state.lastInputTokens,
-        cachedInputTokens: state.lastCachedInputTokens,
-        outputTokens: state.lastOutputTokens,
-        durationMs: Math.max(0, Date.now() - requestStartedAt),
-      })
     } catch (error) {
       const abortedError = toUpstreamRequestAbortedError(
         error,
@@ -2992,6 +3007,21 @@ export class OpenaiCompatService implements OnModuleInit {
       cachedInputTokens: number
       outputTokens: number
     } | null = null
+    let usageRecorded = false
+
+    const recordStreamUsage = () => {
+      if (usageRecorded) {
+        return
+      }
+      usageRecorded = true
+      this.markAccountHealthy(account, modelName)
+      this.recordOpenAiCompatUsage(account, modelName, "responses", {
+        inputTokens: completedUsage?.inputTokens || 0,
+        cachedInputTokens: completedUsage?.cachedInputTokens || 0,
+        outputTokens: completedUsage?.outputTokens || 0,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+      })
+    }
 
     try {
       while (true) {
@@ -3037,6 +3067,9 @@ export class OpenaiCompatService implements OnModuleInit {
           // Use Codex SSE translator to convert to Claude SSE events
           const events = translateCodexSseEvent(trimmed, state, reverseToolMap)
           for (const event of events) {
+            if (event.includes('"type":"message_stop"')) {
+              recordStreamUsage()
+            }
             yield event
           }
         }
@@ -3063,16 +3096,12 @@ export class OpenaiCompatService implements OnModuleInit {
           reverseToolMap
         )
         for (const event of events) {
+          if (event.includes('"type":"message_stop"')) {
+            recordStreamUsage()
+          }
           yield event
         }
       }
-      this.markAccountHealthy(account, modelName)
-      this.recordOpenAiCompatUsage(account, modelName, "responses", {
-        inputTokens: completedUsage?.inputTokens || 0,
-        cachedInputTokens: completedUsage?.cachedInputTokens || 0,
-        outputTokens: completedUsage?.outputTokens || 0,
-        durationMs: Math.max(0, Date.now() - requestStartedAt),
-      })
     } catch (error) {
       const abortedError = toUpstreamRequestAbortedError(
         error,

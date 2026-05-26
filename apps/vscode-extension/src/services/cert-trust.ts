@@ -90,21 +90,21 @@ export class CertTrustService {
     caCertPath: string,
     home: string
   ): string {
-    const scriptPath = path.join(os.tmpdir(), "agent-vibes-trust-ca.sh")
-    const marker = "# Added by Agent Vibes (Electron/Node.js CA trust)"
+    const scriptPath = path.join(os.tmpdir(), "ccursor-trust-ca.sh")
+    const marker = "# Added by CCursor (Electron/Node.js CA trust)"
     const exportLine = `export NODE_EXTRA_CA_CERTS="${caCertPath}"`
 
     let script = `#!/bin/bash
 set -e
 
-echo "🔐 Agent Vibes — Certificate Trust Setup"
+echo "🔐 CCursor — Certificate Trust Setup"
 echo ""
 
 # ── Step 1: Add CA to macOS System Keychain ───────────────────────────
-# Remove any existing Agent Vibes CA to avoid stale certificate conflicts
+# Remove any existing CCursor CA to avoid stale certificate conflicts
 echo "▸ Cleaning up old CA certificates from System Keychain..."
-while security find-certificate -c "Agent Vibes Local CA" /Library/Keychains/System.keychain >/dev/null 2>&1; do
-  security delete-certificate -c "Agent Vibes Local CA" /Library/Keychains/System.keychain 2>/dev/null && \\
+while security find-certificate -c "CCursor Local CA" /Library/Keychains/System.keychain >/dev/null 2>&1; do
+  security delete-certificate -c "CCursor Local CA" /Library/Keychains/System.keychain 2>/dev/null && \\
     echo "  ✓ Removed old CA entry" || break
 done
 
@@ -141,23 +141,23 @@ echo ""
   // ── Linux ──────────────────────────────────────────────────────────
 
   private static generateLinuxScript(caCertPath: string, home: string): string {
-    const scriptPath = path.join(os.tmpdir(), "agent-vibes-trust-ca.sh")
-    const marker = "# Added by Agent Vibes (Electron/Node.js CA trust)"
+    const scriptPath = path.join(os.tmpdir(), "ccursor-trust-ca.sh")
+    const marker = "# Added by CCursor (Electron/Node.js CA trust)"
     const exportLine = `export NODE_EXTRA_CA_CERTS="${caCertPath}"`
 
     let script = `#!/bin/bash
 set -e
 
-echo "🔐 Agent Vibes — Certificate Trust Setup"
+echo "🔐 CCursor — Certificate Trust Setup"
 echo ""
 
 # ── Step 1: Add CA to system trust store ──────────────────────────────
 echo "▸ Adding CA to system trust store..."
 if [ -d /usr/local/share/ca-certificates ]; then
-  cp "${caCertPath}" /usr/local/share/ca-certificates/agent-vibes-ca.crt
+  cp "${caCertPath}" /usr/local/share/ca-certificates/ccursor-ca.crt
   update-ca-certificates 2>/dev/null && echo "✓ CA added to trust store" || echo "⚠ update-ca-certificates failed"
 elif [ -d /etc/pki/ca-trust/source/anchors ]; then
-  cp "${caCertPath}" /etc/pki/ca-trust/source/anchors/agent-vibes-ca.pem
+  cp "${caCertPath}" /etc/pki/ca-trust/source/anchors/ccursor-ca.pem
   update-ca-trust extract 2>/dev/null && echo "✓ CA added to trust store" || echo "⚠ update-ca-trust failed"
 else
   echo "⚠ Could not find system CA directory"
@@ -188,9 +188,9 @@ echo ""
   // ── Windows ────────────────────────────────────────────────────────
 
   private static generateWindowsScript(caCertPath: string): string {
-    const scriptPath = path.join(os.tmpdir(), "agent-vibes-trust-ca.ps1")
+    const scriptPath = path.join(os.tmpdir(), "ccursor-trust-ca.ps1")
     const script = `
-Write-Host "🔐 Agent Vibes — Certificate Trust Setup" -ForegroundColor Cyan
+Write-Host "🔐 CCursor — Certificate Trust Setup" -ForegroundColor Cyan
 Write-Host ""
 
 # Step 1: Import CA to Trusted Root
@@ -243,7 +243,7 @@ if [ -f "${profile.path}" ]; then
   if grep -q "NODE_EXTRA_CA_CERTS" "${profile.path}" 2>/dev/null; then
     # Check if it already points to the correct CA path
     if grep -q 'NODE_EXTRA_CA_CERTS="${caCertPath}"' "${profile.path}" 2>/dev/null || \\
-       grep -q "NODE_EXTRA_CA_CERTS=\\"\\$HOME/.agent-vibes/certs/ca.pem\\"" "${profile.path}" 2>/dev/null; then
+       grep -q "NODE_EXTRA_CA_CERTS=\\"\\$HOME/.ccursor/certs/ca.pem\\"" "${profile.path}" 2>/dev/null; then
       echo "✓ NODE_EXTRA_CA_CERTS already correctly configured in ${profile.name}"
     else
       # Replace existing NODE_EXTRA_CA_CERTS with the correct path
@@ -251,7 +251,7 @@ if [ -f "${profile.path}" ]; then
       echo "" >> "${profile.path}"
       echo "${marker}" >> "${profile.path}"
       echo '${exportLine}' >> "${profile.path}"
-      echo "✓ Updated NODE_EXTRA_CA_CERTS in ${profile.name} to point to Agent Vibes CA"
+      echo "✓ Updated NODE_EXTRA_CA_CERTS in ${profile.name} to point to CCursor CA"
     fi
   else
     echo "" >> "${profile.path}"

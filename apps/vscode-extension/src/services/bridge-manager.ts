@@ -345,7 +345,18 @@ export class BridgeManager extends EventEmitter {
       return { binary: process.execPath, args: [sourceMain] }
     }
 
-    // 3. Check global install directory ~/.agent-vibes/bin/
+    // 3. Check global install directories
+    const ccursorBin = path.join(
+      os.homedir(),
+      ".ccursor",
+      "bin",
+      `agent-vibes-bridge${ext}`
+    )
+    if (fs.existsSync(ccursorBin)) {
+      logger.info(`Using globally installed SEA binary: ${ccursorBin}`)
+      return { binary: ccursorBin, args: [] }
+    }
+
     const globalBin = path.join(
       os.homedir(),
       ".agent-vibes",

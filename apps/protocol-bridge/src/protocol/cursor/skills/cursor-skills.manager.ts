@@ -17,10 +17,8 @@
 
 import { Injectable, Logger } from "@nestjs/common"
 import type { CursorRule } from "../../../gen/agent/v1_pb"
-import type {
-  ChatSession,
-  ChatSessionManager,
-} from "../session/chat-session.service"
+import { ChatSessionManager } from "../session/chat-session.service"
+import type { ChatSession } from "../session/chat-session.service"
 import { renderCursorSkillsCatalog } from "./catalog"
 import { normalizePathForMatch, normalizeSkillName } from "./frontmatter"
 import {

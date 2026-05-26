@@ -6,7 +6,7 @@ import * as vscode from "vscode"
  */
 export function executeInTerminal(
   command: string,
-  name: string = "Agent Vibes"
+  name: string = "CCursor"
 ): vscode.Terminal {
   const terminal = vscode.window.createTerminal({ name })
   terminal.show()
@@ -20,7 +20,7 @@ export function executeInTerminal(
  */
 export function executePrivileged(
   command: string,
-  name: string = "Agent Vibes (sudo)"
+  name: string = "CCursor (sudo)"
 ): vscode.Terminal {
   if (process.platform === "win32") {
     return executeInTerminal(

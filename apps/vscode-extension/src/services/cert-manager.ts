@@ -39,8 +39,8 @@ export class CertManager {
     )
 
     const caAttrs: forge.pki.CertificateField[] = [
-      { name: "commonName", value: "Agent Vibes Local CA" },
-      { name: "organizationName", value: "Agent Vibes" },
+      { name: "commonName", value: "CCursor Local CA" },
+      { name: "organizationName", value: "CCursor" },
     ]
     caCert.setSubject(caAttrs)
     caCert.setIssuer(caAttrs)
@@ -67,7 +67,7 @@ export class CertManager {
 
     const serverAttrs: forge.pki.CertificateField[] = [
       { name: "commonName", value: "localhost" },
-      { name: "organizationName", value: "Agent Vibes" },
+      { name: "organizationName", value: "CCursor" },
     ]
     serverCert.setSubject(serverAttrs)
     serverCert.setIssuer(caAttrs) // signed by CA

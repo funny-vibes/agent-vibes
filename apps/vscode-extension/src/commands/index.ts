@@ -14,6 +14,7 @@ import { CertTrustService } from "../services/cert-trust"
 import { ConfigManager } from "../services/config-manager"
 import { CursorChecksumsService } from "../services/cursor-checksums"
 import { CursorPatchManagerService } from "../services/cursor-patch-manager"
+import { CursorPatchService } from "../services/cursor-patch"
 import { ExtensionUpdateService } from "../services/extension-update"
 import { NetworkManager } from "../services/network-manager"
 import { logger } from "../utils/logger"
@@ -92,6 +93,79 @@ function mergeAntigravityAccountWithExisting(
   }
 }
 
+const CURSOR_AGENT_SUBMIT_STRATEGIES = [
+  "ccursor.debugNativeAgentSubmit",
+  "glass.newAgentWithQuery",
+  "composer.startComposerPrompt2",
+  "composer.startComposerPrompt",
+  "workbench.action.chat.open",
+] as const
+const DEFAULT_CURSOR_AGENT_AUTO_SUBMIT_DELAY_MS = 3000
+
+type CursorAgentSubmitStrategy = (typeof CURSOR_AGENT_SUBMIT_STRATEGIES)[number]
+
+function isCursorAgentSubmitStrategy(
+  value: string | undefined
+): value is CursorAgentSubmitStrategy {
+  return CURSOR_AGENT_SUBMIT_STRATEGIES.includes(
+    value as CursorAgentSubmitStrategy
+  )
+}
+
+function normalizeCursorAgentSubmitStrategy(
+  value: string | undefined
+): CursorAgentSubmitStrategy {
+  return isCursorAgentSubmitStrategy(value)
+    ? value
+    : "workbench.action.chat.open"
+}
+
+async function executeCursorAgentCommand(
+  command: CursorAgentSubmitStrategy,
+  prompt: string,
+  autoSubmitDelayMs?: number
+): Promise<unknown> {
+  const submitDelayMs =
+    autoSubmitDelayMs ?? DEFAULT_CURSOR_AGENT_AUTO_SUBMIT_DELAY_MS
+
+  switch (command) {
+    case "ccursor.debugNativeAgentSubmit":
+      return vscode.commands.executeCommand(command, {
+        query: prompt,
+        mode: "agent",
+      })
+    case "glass.newAgentWithQuery":
+      return vscode.commands.executeCommand(command, prompt)
+    case "composer.startComposerPrompt2":
+    case "composer.startComposerPrompt":
+      return vscode.commands.executeCommand(command, prompt)
+    case "workbench.action.chat.open":
+      return vscode.commands.executeCommand(command, {
+        query: prompt,
+        ccursorAutoSubmit: true,
+        ccursorAutoSubmitMode: "agent",
+        ccursorAutoSubmitDelayMs: submitDelayMs,
+      })
+  }
+}
+
+export async function submitCursorAgentPrompt(
+  input: string,
+  strategy?: string,
+  autoSubmitDelayMs?: number
+): Promise<unknown> {
+  const prompt = input.trim()
+  if (prompt.length === 0) return
+  const command = normalizeCursorAgentSubmitStrategy(strategy)
+
+  logger.info(
+    `Debug submitting prompt through Cursor Agent via ${command}` +
+      ` (delay=${autoSubmitDelayMs ?? DEFAULT_CURSOR_AGENT_AUTO_SUBMIT_DELAY_MS}ms)`
+  )
+
+  return executeCursorAgentCommand(command, prompt, autoSubmitDelayMs)
+}
+
 async function openJsonFile(filePath: string): Promise<void> {
   const fs = await import("fs")
   const dirPath = path.dirname(filePath)
@@ -118,6 +192,7 @@ export function registerCommands(
 ): void {
   const cursorChecksums = new CursorChecksumsService()
   const cursorPatchManager = new CursorPatchManagerService()
+  const cursorPatch = new CursorPatchService(logger)
 
   const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
     if (context.globalState.get<boolean>(STATE.FORWARDING_RELOAD_PROMPTED)) {
@@ -188,6 +263,16 @@ export function registerCommands(
 
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.APPLY_CURSOR_CHECKSUMS, async () => {
+      const patchResult = cursorPatch.applyPatches()
+      if (!patchResult.success) {
+        const detail =
+          patchResult.errors.join("; ") || t("checksums.unknownError")
+        void vscode.window.showErrorMessage(
+          tFmt("patches.applyFailed", { detail })
+        )
+        return
+      }
+
       const result = cursorChecksums.apply()
       if (!result.success) {
         const detail = result.errors.join("; ") || t("checksums.unknownError")
@@ -321,7 +406,7 @@ export function registerCommands(
           return
         }
 
-        // Write to ~/.agent-vibes/data/antigravity-accounts.json
+        // Write to the configured local data directory.
         // Upsert imported accounts while preserving unmatched existing ones
         const destPath = config.antigravityAccountsPath
         const existing = config.readAccounts(destPath)
@@ -568,7 +653,7 @@ export function registerCommands(
           )
         } else {
           vscode.window.showWarningMessage(
-            "Kiro: no local credentials found. Log in to Kiro IDE first, or use Builder ID OAuth from the Dashboard."
+            "Kiro: no local credentials found. Configure a token manually or sync from an existing local Kiro cache."
           )
         }
       } catch (err) {
@@ -713,5 +798,24 @@ export function registerCommands(
         "agentVibes"
       )
     })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.DEBUG_SUBMIT_CURSOR_AGENT,
+      async (prompt?: unknown) => {
+        const input =
+          typeof prompt === "string" && prompt.trim().length > 0
+            ? prompt
+            : await vscode.window.showInputBox({
+                prompt: "Prompt to submit through Cursor Agent",
+                placeHolder: "Say OK from gpt-5.5",
+              })
+
+        if (!input || input.trim().length === 0) return
+
+        await submitCursorAgentPrompt(input)
+      }
+    )
   )
 }

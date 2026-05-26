@@ -7,13 +7,13 @@ import { type DashboardLocale, readDashboardLocale } from "./dashboard-i18n"
  */
 const EN: Record<string, string> = {
   // ── Setup / onboarding ──
-  "setup.needsSetup": "Agent Vibes needs setup: {missing} not configured.",
+  "setup.needsSetup": "CCursor needs setup: {missing} not configured.",
   "setup.missing.certs": "SSL certificates",
   "setup.missing.accounts": "backend accounts",
   "setup.action.now": "Setup Now",
   "setup.action.later": "Later",
   "setup.addAccountHint":
-    "Add at least one backend account from the Agent Vibes Dashboard.",
+    "Add at least one backend account from the CCursor Dashboard.",
 
   // ── Forwarding ──
   "forwarding.enabledRestart":
@@ -32,19 +32,18 @@ const EN: Record<string, string> = {
   "forwarding.loopbackSuffix": " | Loopback: {flag}",
 
   // ── Bridge ──
-  "bridge.failedRestart":
-    "Agent Vibes failed to restart on port {port}: {message}",
+  "bridge.failedRestart": "CCursor failed to restart on port {port}: {message}",
   "bridge.restartingBusy": "Restarting…",
-  "bridge.restartingTooltip": "Agent Vibes — Restarting bridge on port {port}",
+  "bridge.restartingTooltip": "CCursor — Restarting bridge on port {port}",
   "bridge.reconfiguringBusy": "Reconfiguring…",
   "bridge.reconfiguringTooltip":
-    "Agent Vibes — Reconfiguring forwarding for port {port}",
+    "CCursor — Reconfiguring forwarding for port {port}",
 
   // ── Terminal titles ──
-  "terminal.enableForwarding": "Agent Vibes — Enable Forwarding",
-  "terminal.disableForwarding": "Agent Vibes — Disable Forwarding",
-  "terminal.reconfigureForwarding": "Agent Vibes — Reconfigure Forwarding",
-  "terminal.trustCa": "Agent Vibes — Trust CA",
+  "terminal.enableForwarding": "CCursor — Enable Forwarding",
+  "terminal.disableForwarding": "CCursor — Disable Forwarding",
+  "terminal.reconfigureForwarding": "CCursor — Reconfigure Forwarding",
+  "terminal.trustCa": "CCursor — Trust CA",
 
   // ── Cursor checksums / patches ──
   "checksums.failed": "Failed to update Cursor checksums: {detail}",
@@ -54,6 +53,7 @@ const EN: Record<string, string> = {
     "Cursor checksums already match the current core files.",
   "checksums.unknownError": "Unknown error",
   "patches.resetFailed": "Failed to reset Cursor patches: {detail}",
+  "patches.applyFailed": "Failed to apply Cursor patches: {detail}",
   "patches.resetSummary":
     "Reset {count} Cursor file(s). Fully restart Cursor to apply.",
 
@@ -96,9 +96,9 @@ const EN: Record<string, string> = {
   "update.draftWarn": "The latest GitHub release is still marked as draft.",
   "update.upToDate": "{name} is already up to date ({version}).",
   "update.assetMissing":
-    "Agent Vibes {version} is available, but no VSIX asset was found for {target}.",
+    "CCursor {version} is available, but no VSIX asset was found for {target}.",
   "update.available":
-    "Agent Vibes {version} is available from GitHub Releases.",
+    "CCursor {version} is available from local release channel.",
   "update.action.install": "Install Update",
   "update.action.viewRelease": "View Release",
   "update.action.skip": "Skip This Version",
@@ -111,7 +111,7 @@ const EN: Record<string, string> = {
     "{name} {version} installed. Reload Cursor to activate it.",
   "update.action.reload": "Reload Window",
   "update.action.later": "Later",
-  "update.installFailed": "Failed to install Agent Vibes {version}: {message}",
+  "update.installFailed": "Failed to install CCursor {version}: {message}",
 
   // ── Dashboard webview-triggered toasts ──
   "dash.logCopied": "Log file path copied",
@@ -131,22 +131,22 @@ const EN: Record<string, string> = {
   "dash.codex.activateFailed": "Codex CLI activation failed: {message}",
 
   // ── Status bar tooltips ──
-  "status.tooltip.running": "Agent Vibes — Running (click to open dashboard)",
-  "status.tooltip.starting": "Agent Vibes — Starting...",
-  "status.tooltip.error": "Agent Vibes — Error (click to open dashboard)",
-  "status.tooltip.stopped": "Agent Vibes — Stopped (click to open dashboard)",
-  "status.tooltip.busy": "Agent Vibes — {label}",
+  "status.tooltip.running": "CCursor — Running (click to open dashboard)",
+  "status.tooltip.starting": "CCursor — Starting...",
+  "status.tooltip.error": "CCursor — Error (click to open dashboard)",
+  "status.tooltip.stopped": "CCursor — Stopped (click to open dashboard)",
+  "status.tooltip.busy": "CCursor — {label}",
   "status.text.starting": "Starting…",
 }
 
 const ZH: Record<string, string> = {
   // ── Setup / onboarding ──
-  "setup.needsSetup": "Agent Vibes 需要完成初始化：{missing} 尚未配置。",
+  "setup.needsSetup": "CCursor 需要完成初始化：{missing} 尚未配置。",
   "setup.missing.certs": "SSL 证书",
   "setup.missing.accounts": "后端账号",
   "setup.action.now": "立即设置",
   "setup.action.later": "稍后",
-  "setup.addAccountHint": "请在 Agent Vibes 控制台中至少添加一个后端账号。",
+  "setup.addAccountHint": "请在 CCursor 控制台中至少添加一个后端账号。",
 
   // ── Forwarding ──
   "forwarding.enabledRestart":
@@ -163,17 +163,17 @@ const ZH: Record<string, string> = {
   "forwarding.loopbackSuffix": " | Loopback：{flag}",
 
   // ── Bridge ──
-  "bridge.failedRestart": "Agent Vibes 在端口 {port} 上重启失败：{message}",
+  "bridge.failedRestart": "CCursor 在端口 {port} 上重启失败：{message}",
   "bridge.restartingBusy": "重启中…",
-  "bridge.restartingTooltip": "Agent Vibes — 正在端口 {port} 上重启桥接",
+  "bridge.restartingTooltip": "CCursor — 正在端口 {port} 上重启桥接",
   "bridge.reconfiguringBusy": "重新配置中…",
-  "bridge.reconfiguringTooltip": "Agent Vibes — 正在为端口 {port} 重新配置转发",
+  "bridge.reconfiguringTooltip": "CCursor — 正在为端口 {port} 重新配置转发",
 
   // ── Terminal titles ──
-  "terminal.enableForwarding": "Agent Vibes — 启用转发",
-  "terminal.disableForwarding": "Agent Vibes — 关闭转发",
-  "terminal.reconfigureForwarding": "Agent Vibes — 重新配置转发",
-  "terminal.trustCa": "Agent Vibes — 信任 CA",
+  "terminal.enableForwarding": "CCursor — 启用转发",
+  "terminal.disableForwarding": "CCursor — 关闭转发",
+  "terminal.reconfigureForwarding": "CCursor — 重新配置转发",
+  "terminal.trustCa": "CCursor — 信任 CA",
 
   // ── Cursor checksums / patches ──
   "checksums.failed": "更新 Cursor 校验和失败：{detail}",
@@ -182,6 +182,7 @@ const ZH: Record<string, string> = {
   "checksums.alreadyMatched": "Cursor 校验和已与当前核心文件一致。",
   "checksums.unknownError": "未知错误",
   "patches.resetFailed": "重置 Cursor 补丁失败：{detail}",
+  "patches.applyFailed": "应用 Cursor 补丁失败：{detail}",
   "patches.resetSummary":
     "已还原 {count} 个 Cursor 文件。请完整重启 Cursor 以应用。",
 
@@ -219,8 +220,8 @@ const ZH: Record<string, string> = {
   "update.draftWarn": "GitHub 上最新的发布仍为草稿状态。",
   "update.upToDate": "{name} 已是最新版本（{version}）。",
   "update.assetMissing":
-    "Agent Vibes {version} 已发布，但未找到适用于 {target} 的 VSIX。",
-  "update.available": "GitHub Releases 上有可用更新：Agent Vibes {version}。",
+    "CCursor {version} 已发布，但未找到适用于 {target} 的 VSIX。",
+  "update.available": "local release channel 上有可用更新：CCursor {version}。",
   "update.action.install": "安装更新",
   "update.action.viewRelease": "查看发布",
   "update.action.skip": "跳过此版本",
@@ -232,7 +233,7 @@ const ZH: Record<string, string> = {
   "update.installed": "{name} {version} 已安装。请重新加载 Cursor 以激活。",
   "update.action.reload": "重新加载窗口",
   "update.action.later": "稍后",
-  "update.installFailed": "安装 Agent Vibes {version} 失败：{message}",
+  "update.installFailed": "安装 CCursor {version} 失败：{message}",
 
   // ── Dashboard webview-triggered toasts ──
   "dash.logCopied": "日志文件路径已复制",
@@ -252,11 +253,11 @@ const ZH: Record<string, string> = {
   "dash.codex.activateFailed": "Codex CLI 激活失败：{message}",
 
   // ── Status bar tooltips ──
-  "status.tooltip.running": "Agent Vibes — 运行中（点击打开控制台）",
-  "status.tooltip.starting": "Agent Vibes — 启动中…",
-  "status.tooltip.error": "Agent Vibes — 出现错误（点击打开控制台）",
-  "status.tooltip.stopped": "Agent Vibes — 已停止（点击打开控制台）",
-  "status.tooltip.busy": "Agent Vibes — {label}",
+  "status.tooltip.running": "CCursor — 运行中（点击打开控制台）",
+  "status.tooltip.starting": "CCursor — 启动中…",
+  "status.tooltip.error": "CCursor — 出现错误（点击打开控制台）",
+  "status.tooltip.stopped": "CCursor — 已停止（点击打开控制台）",
+  "status.tooltip.busy": "CCursor — {label}",
   "status.text.starting": "启动中…",
 }
 

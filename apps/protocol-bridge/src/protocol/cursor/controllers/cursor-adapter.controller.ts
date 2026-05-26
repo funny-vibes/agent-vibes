@@ -10,6 +10,11 @@ import {
   UploadConversationBlobsResponseSchema,
 } from "../../../gen/agent/v1_pb"
 import {
+  BidiAppendRequestSchema,
+  BidiAppendResponseSchema,
+  BidiPollRequestSchema,
+  BidiPollResponseSchema,
+  BidiRequestIdSchema,
   BugBotStatusSchema,
   BugBotStatus_Status,
   BugLocationSchema,
@@ -42,6 +47,7 @@ import { ModelRouterService } from "../../../llm/shared/model-router.service"
 import type { AnthropicResponse } from "../../../shared/anthropic"
 import type { CreateMessageDto } from "../../anthropic/dto/create-message.dto"
 import { MessagesService } from "../../anthropic/messages.service"
+import { CursorBidiFallbackCoordinator } from "../cursor-bidi-fallback"
 import { connectRPCHandler } from "../connect-rpc-handler"
 import { CursorConnectStreamService } from "../cursor-connect-stream.service"
 import {
@@ -57,6 +63,7 @@ import { KvStorageService } from "../kv-storage.service"
 @Controller()
 export class CursorAdapterController {
   private readonly logger = new Logger(CursorAdapterController.name)
+  private readonly bidiFallback = new CursorBidiFallbackCoordinator()
 
   /** BugBot fallback model chain (after the primary model fails) */
   private static readonly BUGBOT_FALLBACK_MODELS = [
@@ -160,6 +167,33 @@ export class CursorAdapterController {
   private logModelNames(label: string, modelNames: string[]): void {
     this.logger.debug(
       `${label}: ${modelNames.length} model(s) -> ${modelNames.join(", ")}`
+    )
+  }
+
+  private decodeProtoBody(req: FastifyRequest): Buffer {
+    const body = req.body
+    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
+      return Buffer.alloc(0)
+    }
+
+    return connectRPCHandler.stripEnvelope(Buffer.from(body))
+  }
+
+  private decodeHexPayload(hex: string): Buffer {
+    const normalized = hex.trim()
+    if (!normalized) {
+      return Buffer.alloc(0)
+    }
+    if (!/^[0-9a-fA-F]+$/.test(normalized) || normalized.length % 2 !== 0) {
+      throw new Error("invalid bidi hex payload")
+    }
+    return Buffer.from(normalized, "hex")
+  }
+
+  private startBidiFallbackRun(requestId: string): void {
+    const session = this.bidiFallback.getOrCreate(requestId)
+    session.start((inputMessages) =>
+      this.connectStreamService.handleBidiStream(inputMessages)
     )
   }
 
@@ -334,6 +368,138 @@ export class CursorAdapterController {
       const errorMessage =
         error instanceof Error ? error.message : String(error)
       throw new Error(`Agent run failed: ${errorMessage}`)
+    }
+  }
+
+  /**
+   * HTTP/1 fallback input channel used by Cursor when bidirectional streaming is
+   * downgraded to append + SSE/poll.
+   */
+  @Post("aiserver.v1.BidiService/BidiAppend")
+  handleBidiAppend(@Req() req: FastifyRequest, @Res() res: FastifyReply): void {
+    this.logger.log(">>> BidiService/BidiAppend request received")
+
+    const payload = this.decodeProtoBody(req)
+    const appendRequest = fromBinary(BidiAppendRequestSchema, payload)
+    const requestId = appendRequest.requestId?.requestId?.trim()
+
+    if (!requestId) {
+      throw new Error("BidiAppend missing request_id")
+    }
+
+    const messageBuffer = this.decodeHexPayload(appendRequest.data)
+    const session = this.bidiFallback.getOrCreate(requestId)
+    session.append(appendRequest.appendSeqno, messageBuffer)
+
+    this.logger.debug(
+      `BidiAppend accepted request=${requestId} seqno=${appendRequest.appendSeqno.toString()} bytes=${messageBuffer.length}`
+    )
+
+    res.header("Content-Type", "application/proto")
+    res.header("Connect-Protocol-Version", "1")
+    const response = create(BidiAppendResponseSchema, {})
+    res
+      .status(200)
+      .send(Buffer.from(toBinary(BidiAppendResponseSchema, response)))
+  }
+
+  /**
+   * HTTP/1 fallback output channel. Cursor sends a BidiRequestId and expects a
+   * normal Connect server stream of AgentServerMessage frames.
+   */
+  @Post("agent.v1.AgentService/RunSSE")
+  async handleAgentRunSSE(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): Promise<void> {
+    this.logger.log(">>> AgentService/RunSSE request received")
+
+    const request = fromBinary(BidiRequestIdSchema, this.decodeProtoBody(req))
+    const requestId = request.requestId.trim()
+    if (!requestId) {
+      throw new Error("RunSSE missing request_id")
+    }
+
+    const session = this.bidiFallback.getOrCreate(requestId)
+    this.startBidiFallbackRun(requestId)
+    connectRPCHandler.setupStreamingResponse(res)
+
+    let responseCount = 0
+    try {
+      for await (const responseBuffer of session.streamFrames()) {
+        responseCount++
+        connectRPCHandler.writeMessage(res, responseBuffer)
+      }
+      connectRPCHandler.endStream(res)
+      this.logger.log(
+        `>>> AgentService/RunSSE sent ${responseCount} responses for request=${requestId}`
+      )
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error)
+      connectRPCHandler.endStream(res, new Error(errorMessage))
+      this.logger.error("Error in AgentService/RunSSE", error)
+    } finally {
+      this.bidiFallback.delete(requestId)
+    }
+  }
+
+  /**
+   * HTTP/1 fallback output channel for clients that cannot keep an SSE stream.
+   * Each poll response contains raw AgentServerMessage protobuf bytes hex-coded
+   * inside BidiPollResponse.data.
+   */
+  @Post("agent.v1.AgentService/RunPoll")
+  async handleAgentRunPoll(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): Promise<void> {
+    this.logger.log(">>> AgentService/RunPoll request received")
+
+    const request = fromBinary(BidiPollRequestSchema, this.decodeProtoBody(req))
+    const requestId = request.requestId?.requestId?.trim()
+    if (!requestId) {
+      throw new Error("RunPoll missing request_id")
+    }
+
+    const session = this.bidiFallback.getOrCreate(requestId)
+    if (request.startRequest) {
+      this.startBidiFallbackRun(requestId)
+    }
+
+    connectRPCHandler.setupStreamingResponse(res)
+
+    try {
+      const pollFrames = await session.nextPollFrames(20_000, 32)
+      for (const pollFrame of pollFrames) {
+        const response = create(BidiPollResponseSchema, {
+          seqno: pollFrame.seqno,
+          data: pollFrame.frame
+            ? connectRPCHandler.stripEnvelope(pollFrame.frame).toString("hex")
+            : "",
+          eof: pollFrame.eof || undefined,
+        })
+        const binary = toBinary(BidiPollResponseSchema, response)
+        connectRPCHandler.writeMessage(
+          res,
+          connectRPCHandler.encodeMessage(Buffer.from(binary))
+        )
+      }
+
+      connectRPCHandler.endStream(res)
+
+      if (pollFrames.some((frame) => frame.eof)) {
+        this.bidiFallback.delete(requestId)
+      }
+
+      this.logger.debug(
+        `RunPoll returned ${pollFrames.length} frame(s) for request=${requestId}`
+      )
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error)
+      connectRPCHandler.endStream(res, new Error(errorMessage))
+      this.logger.error("Error in AgentService/RunPoll", error)
     }
   }
 

@@ -1,22 +1,17 @@
 {
-  "name": "agent-vibes",
+  "name": "ccursor",
   "version": "1.0.0",
   "description": "Unified Agent Gateway — Enables Claude Code CLI and Cursor IDE to use free AI backends through protocol translation",
   "private": true,
   "bin": {
     "agent-vibes": "bin/agent-vibes"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/funny-vibes/agent-vibes.git"
-  },
-  "homepage": "https://github.com/funny-vibes/agent-vibes#readme",
-  "bugs": {
-    "url": "https://github.com/funny-vibes/agent-vibes/issues"
-  },
+  "repository": {},
+  "homepage": "",
+  "bugs": {},
   "author": "recronin",
   "keywords": [
-    "agent-vibes",
+    "ccursor",
     "cursor",
     "claude-code",
     "antigravity",

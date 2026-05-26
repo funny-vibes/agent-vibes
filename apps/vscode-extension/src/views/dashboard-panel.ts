@@ -75,7 +75,7 @@ type DashboardVersionPayload = {
 }
 
 /**
- * Webview Panel for the Agent Vibes Dashboard.
+ * Webview Panel for the CCursor Dashboard.
  * Singleton — opening an existing panel brings it to focus.
  */
 export class DashboardPanel {
@@ -980,20 +980,6 @@ export class DashboardPanel {
                   { value: "en", label: st.general.langEn },
                   { value: "zh", label: st.general.langZh },
                 ],
-              },
-              {
-                label: st.groups.general.items.autoCheckUpdates.label,
-                desc: st.groups.general.items.autoCheckUpdates.desc,
-                type: "toggle",
-                key: "autoCheckUpdates",
-                value: agentCfg.get<boolean>("autoCheckUpdates") ?? true,
-              },
-              {
-                label: st.groups.general.items.updateCheckIntervalHours.label,
-                desc: st.groups.general.items.updateCheckIntervalHours.desc,
-                type: "number",
-                key: "updateCheckIntervalHours",
-                value: agentCfg.get<number>("updateCheckIntervalHours") ?? 12,
               },
             ],
           },

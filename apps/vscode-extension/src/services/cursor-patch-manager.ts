@@ -28,9 +28,9 @@ export class CursorPatchManagerService {
       !hasUnmanagedAppliedPatches
 
     const hint = !baselineStatus.manifestExists
-      ? "No original baseline has been captured yet. Apply a Cursor repair through Agent Vibes first."
+      ? "No original baseline has been captured yet. Apply a Cursor repair through CCursor first."
       : hasUnmanagedAppliedPatches
-        ? "Some active checksum changes were applied before Agent Vibes captured the original baseline, so one-click reset is currently unsafe."
+        ? "Some active checksum changes were applied before CCursor captured the original baseline, so one-click reset is currently unsafe."
         : `Restore ${managedFileCount} managed Cursor file(s) to the captured original baseline, then re-apply the repairs you still want.`
 
     return {

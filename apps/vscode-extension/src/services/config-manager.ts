@@ -4,7 +4,7 @@ import * as vscode from "vscode"
 import { ensureDir, getDefaultDataDir } from "../utils/platform"
 
 /**
- * Manages the extension's configuration and data directory (~/.agent-vibes/).
+ * Manages the extension's configuration and data directory (~/.ccursor/).
  */
 export class ConfigManager {
   constructor() {

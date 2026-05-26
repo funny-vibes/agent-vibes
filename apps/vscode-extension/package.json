@@ -1,22 +1,17 @@
 {
-  "name": "agent-vibes",
-  "displayName": "Agent Vibes",
-  "publisher": "funny-vibes",
-  "description": "Unified AI Agent Gateway — Route Antigravity, Claude, and GPT backends through Cursor IDE and Claude Code CLI with protocol-native translation.",
+  "name": "ccursor",
+  "displayName": "CCursor",
+  "publisher": "local-ai",
+  "description": "Cursor BYOK Gateway — route OpenAI-compatible, Claude, Codex, and other local accounts through Cursor IDE with protocol-native translation.",
   "version": "0.1.25",
   "agentVibes": {
     "cursorVersion": "3.4.16"
   },
   "private": true,
   "license": "MIT",
-  "homepage": "https://github.com/funny-vibes/agent-vibes#readme",
-  "bugs": {
-    "url": "https://github.com/funny-vibes/agent-vibes/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/funny-vibes/agent-vibes.git"
-  },
+  "homepage": "",
+  "bugs": {},
+  "repository": {},
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -39,29 +34,10 @@
     "color": "#1e1e2e",
     "theme": "dark"
   },
-  "badges": [
-    {
-      "url": "https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml/badge.svg?branch=main",
-      "href": "https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml",
-      "description": "CI Status"
-    },
-    {
-      "url": "https://img.shields.io/badge/License-MIT-blue.svg",
-      "href": "https://github.com/funny-vibes/agent-vibes/blob/main/LICENSE",
-      "description": "MIT License"
-    },
-    {
-      "url": "https://img.shields.io/badge/Node.js-≥24-339933?logo=nodedotjs&logoColor=white",
-      "href": "https://nodejs.org/",
-      "description": "Node.js ≥ 24"
-    }
-  ],
+  "badges": [],
   "preview": true,
   "markdown": "github",
-  "qna": "https://github.com/funny-vibes/agent-vibes/discussions",
-  "sponsor": {
-    "url": "https://github.com/sponsors/funny-vibes"
-  },
+  "qna": false,
   "extensionKind": [
     "ui"
   ],
@@ -75,117 +51,111 @@
       {
         "command": "agentVibes.openDashboard",
         "title": "Open Dashboard",
-        "category": "Agent Vibes",
+        "category": "CCursor",
         "icon": "$(dashboard)"
       },
       {
         "command": "agentVibes.generateCert",
         "title": "Generate SSL Certificates",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.syncAntigravityIDE",
         "title": "Sync Antigravity IDE Credentials",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.syncAntigravityTools",
         "title": "Sync Antigravity Tool Credentials",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.syncClaude",
         "title": "Sync Claude Credentials",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.syncCodex",
         "title": "Sync Codex Credentials",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.importCodexCpaJsons",
         "title": "Import Codex CPA JSONs",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.openOpenAICompatAccounts",
         "title": "Open OpenAI-Compatible Accounts JSON",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.openClaudeApiAccounts",
         "title": "Open Claude API Accounts JSON",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.openKiroAccounts",
         "title": "Open Kiro Accounts JSON",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.syncKiroIDE",
         "title": "Sync Kiro IDE Credentials",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.startServer",
         "title": "Start Server",
-        "category": "Agent Vibes",
+        "category": "CCursor",
         "icon": "$(play)"
       },
       {
         "command": "agentVibes.enableForwarding",
         "title": "Enable Port Forwarding",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.disableForwarding",
         "title": "Disable Port Forwarding",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.forwardingStatus",
         "title": "Port Forwarding Status",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.openConfig",
         "title": "Edit Configuration",
-        "category": "Agent Vibes",
+        "category": "CCursor",
         "icon": "$(gear)"
       },
       {
         "command": "agentVibes.applyCursorChecksums",
         "title": "Apply Cursor Checksums Fix",
-        "category": "Agent Vibes"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.resetCursorPatches",
         "title": "Reset Cursor Patches",
-        "category": "Agent Vibes"
-      },
-      {
-        "command": "agentVibes.checkExtensionUpdates",
-        "title": "Check Extension Updates",
-        "category": "Agent Vibes",
-        "icon": "$(cloud-download)"
+        "category": "CCursor"
       },
       {
         "command": "agentVibes.stopServer",
         "title": "Stop Server",
-        "category": "Agent Vibes",
+        "category": "CCursor",
         "icon": "$(debug-stop)"
       },
       {
         "command": "agentVibes.restartServer",
         "title": "Restart Server",
-        "category": "Agent Vibes",
+        "category": "CCursor",
         "icon": "$(debug-restart)"
       }
     ],
     "configuration": {
-      "title": "Agent Vibes",
+      "title": "CCursor",
       "properties": {
         "agentVibes.language": {
           "type": "string",
@@ -207,8 +177,8 @@
         },
         "agentVibes.autoCheckUpdates": {
           "type": "boolean",
-          "default": true,
-          "description": "Automatically check GitHub Releases for new extension VSIX updates on startup"
+          "default": false,
+          "description": "Automatically check for extension updates on startup"
         },
         "agentVibes.updateCheckIntervalHours": {
           "type": "number",
@@ -249,7 +219,7 @@
         "agentVibes.dataDir": {
           "type": "string",
           "default": "",
-          "description": "Custom data directory path (default: ~/.agent-vibes)"
+          "description": "Custom data directory path (default: ~/.ccursor)"
         },
         "agentVibes.antigravityAccountsPath": {
           "type": "string",
@@ -293,10 +263,10 @@
     "lint:fix": "eslint src/ --fix",
     "test": "jest --passWithNoTests",
     "types": "tsc --noEmit",
-    "package": "npm run prepare:pack && npx @vscode/vsce package --no-dependencies",
-    "package:fast": "npm run prepare:pack:fast && npx @vscode/vsce package --no-dependencies",
-    "pack": "npm run package && cursor --install-extension agent-vibes-$npm_package_version.vsix --force && npm run restart:bridge",
-    "pack:fast": "npm run package:fast && cursor --install-extension agent-vibes-$npm_package_version.vsix --force && npm run restart:bridge",
+    "package": "npm run prepare:pack && npx @vscode/vsce package --no-dependencies --baseContentUrl https://example.invalid/ccursor --baseImagesUrl https://example.invalid/ccursor",
+    "package:fast": "npm run prepare:pack:fast && npx @vscode/vsce package --no-dependencies --baseContentUrl https://example.invalid/ccursor --baseImagesUrl https://example.invalid/ccursor",
+    "pack": "npm run package && cursor --install-extension ccursor-$npm_package_version.vsix --force && npm run restart:bridge",
+    "pack:fast": "npm run package:fast && cursor --install-extension ccursor-$npm_package_version.vsix --force && npm run restart:bridge",
     "clean": "node ../../scripts/rm-paths.js dist node_modules .turbo"
   },
   "dependencies": {

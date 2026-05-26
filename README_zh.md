@@ -1,8 +1,7 @@
-# Agent Vibes
+# CCursor
 
 [English](README.md) | 中文
 
-[![CI](https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/funny-vibes/agent-vibes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-≥24-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -10,7 +9,7 @@
 [![Fastify](https://img.shields.io/badge/Fastify-HTTP%2F2-000000?logo=fastify&logoColor=white)](https://fastify.dev/)
 
 <p align="center">
-  <img src="apps/vscode-extension/resources/icon.png" alt="Agent Vibes 标志" width="120" />
+  <img src="apps/vscode-extension/resources/icon.png" alt="CCursor 标志" width="120" />
 </p>
 
 <p align="center">
@@ -23,12 +22,12 @@
 > [!WARNING]
 > **dev** 分支正在基于 **Claude Code** 源码架构进行大规模重构和密集测试，
 > **不建议用于生产环境的编码任务。** 稳定后将发布 LTS 版本。
-> **Agent Vibes v0.1.10 (Cursor 3.0.16)** 之前的版本存在许多已知缺陷，
+> **CCursor v0.1.10 (Cursor 3.0.16)** 之前的版本存在许多已知缺陷，
 > 建议及时更新至 v0.1.10 或更高版本。
 
 ## 概览
 
-Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后端之间的协议转换，还完整实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道与流式工具调用循环，并在 Antigravity、Claude 兼容、Codex、OpenAI-compatible 与 Kiro (AWS CodeWhisperer) 等后端之间进行请求路由。
+CCursor 是一个统一的 AI Agent 网关。它不只是做客户端与后端之间的协议转换，还完整实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道与流式工具调用循环，并在 Antigravity、Claude 兼容、Codex、OpenAI-compatible 与 Kiro (AWS CodeWhisperer) 等后端之间进行请求路由。
 
 **客户端**（前端）：
 
@@ -59,7 +58,7 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
                               │
                               ▼
 + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
-│                  Agent Vibes Proxy Server                   │
+│                  CCursor Proxy Server                   │
 │                                                             │
 │  Gemini           → Antigravity IDE (Cloud Code)            │
 │  Claude           → Claude API / Antigravity                │
@@ -87,9 +86,9 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
 ## 与 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的差异
 
 CLIProxyAPI 是这个项目最接近的参考项目，但两者重心不同。
-CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放在 Cursor 的原生客户端兼容性，以及 Antigravity 的原生上游保真度上。
+CLIProxyAPI 更偏 API-first 和 CLI 场景；CCursor 则把主要精力放在 Cursor 的原生客户端兼容性，以及 Antigravity 的原生上游保真度上。
 
-- **Cursor：** Agent Vibes 并不止步于 OpenAI / Claude 兼容接口，而是直接实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道，以协议兼容的 protobuf 定义实现了互操作性，并直接实现流式工具循环。
+- **Cursor：** CCursor 并不止步于 OpenAI / Claude 兼容接口，而是直接实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道，以协议兼容的 protobuf 定义实现了互操作性，并直接实现流式工具循环。
 - **Antigravity：** 本仓库当前的主路径是较新的 worker-native 方案，围绕运行 Antigravity 自身运行时与模块来构建，使 Cloud Code 请求保持协议兼容，并在此基础上实现配额感知的 worker 轮转。
 - **致谢：** 本项目借鉴和移植了大量开源项目的代码与思路，其中 Claude Code CLI 和 Codex CLI 主要参考
   CLIProxyAPI，在 TypeScript/NestJS 架构下重写。Cursor 原生协议层和 Antigravity worker 池为原创实现。
@@ -102,7 +101,7 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
 它会全程指导你完成安装配置，遇到问题会直接分析源码和你的环境来修复：
 
 ```text
-请指导我完成 Agent Vibes 的 Cursor 扩展安装、配置和测试。
+请指导我完成 CCursor 的 Cursor 扩展安装、配置和测试。
 用中文回答，并优先给我可执行命令。
 
 请严格按下面步骤依次指导我：
@@ -111,9 +110,9 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
    - 检查我的操作系统、CPU 架构、Cursor 版本、Node.js 版本，以及 `cursor` CLI 是否可用。
    - 确认我当前 Cursor 版本是否与这个 release 兼容。
 
-2. 下载并安装 VSIX
-   - 从 GitHub Releases 下载正确的 VSIX：
-     <https://github.com/funny-vibes/agent-vibes/releases>
+2. 构建并安装本地 VSIX
+   - 使用本仓库生成的私有 VSIX，例如：
+     `apps/vscode-extension/ccursor-0.1.25.vsix`
    - 按我的平台给出正确的安装命令。
 
 3. 首次启动与 forwarding
@@ -138,8 +137,7 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
      请结合测试源码和用户当前平台/环境判断结果是否可信。
 
 7. 出错排查
-   - 如果任一步骤失败，请直接分析源码：
-     <https://github.com/funny-vibes/agent-vibes>
+   - 如果任一步骤失败，请直接分析这个本地 checkout 的源码。
    - 同时结合我当前环境给出明确修复方案。
    - 优先提供最小、可执行的修复步骤。
    - 根据必须配置的环节，重点排查以下方向：
@@ -150,10 +148,10 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
      * HTTP/2 TLS：连接 Cursor 域名后是否解析到本地地址、证书有效、H2 协商正常？
      * forwarding/proxy 脚本本身也可能有 bug——请阅读源码确认。
    - Bridge 日志位于系统临时目录（`os.tmpdir()`）下：
-     * macOS: `/private/var/folders/.../T/agent-vibes-bridge.log`
-     * Linux: `/tmp/agent-vibes-bridge.log`
-     * Windows: `%TEMP%\agent-vibes-bridge.log`
-     * 详细 protocol 日志: `<tmpdir>/agent-vibes-logs/`
+     * macOS: `/private/var/folders/.../T/ccursor-bridge.log`
+     * Linux: `/tmp/ccursor-bridge.log`
+     * Windows: `%TEMP%\ccursor-bridge.log`
+     * 详细 protocol 日志: `<tmpdir>/ccursor-logs/`
 
 8. bug 提交
    - 如果问题修复成功且确认发现了真实 bug，请帮我准备 `gh issue create` 的提交内容。
@@ -164,47 +162,13 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
 
 Cursor 客户端侧使用 free 账号即可，不需要开通 Cursor 付费订阅。
 
-从 [GitHub Releases](https://github.com/funny-vibes/agent-vibes/releases) 一键下载并安装：
 兼容 Cursor 版本：`3.4.16`。
 
-#### macOS Apple Silicon
+安装本地私有 VSIX：
 
 ```bash
-# Download
-curl -L -o agent-vibes-darwin-arm64-0.1.25.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.25/agent-vibes-darwin-arm64-0.1.25.vsix
-
-# Install
-cursor --install-extension agent-vibes-darwin-arm64-0.1.25.vsix --force
-```
-
-#### macOS Intel
-
-```bash
-# Download
-curl -L -o agent-vibes-darwin-x64-0.1.25.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.25/agent-vibes-darwin-x64-0.1.25.vsix
-
-# Install
-cursor --install-extension agent-vibes-darwin-x64-0.1.25.vsix --force
-```
-
-#### Linux x64
-
-```bash
-# Download
-curl -L -o agent-vibes-linux-x64-0.1.25.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.25/agent-vibes-linux-x64-0.1.25.vsix
-
-# Install
-cursor --install-extension agent-vibes-linux-x64-0.1.25.vsix --force
-```
-
-#### Windows x64
-
-```powershell
-# Download
-Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.25/agent-vibes-win32-x64-0.1.25.vsix" -OutFile "agent-vibes-win32-x64-0.1.25.vsix"
-
-# Install
-cursor --install-extension agent-vibes-win32-x64-0.1.25.vsix --force
+npm --workspace apps/vscode-extension run package
+cursor --install-extension apps/vscode-extension/ccursor-0.1.25.vsix --force
 ```
 
 安装后重启 Cursor，扩展会自动启动代理服务器并引导你完成首次配置（SSL 证书、账号同步、网络转发等均可在命令面板中操作）。
@@ -215,10 +179,9 @@ cursor --install-extension agent-vibes-win32-x64-0.1.25.vsix --force
 > Linux 和 Windows 虽然都已实现支持，但尚未完整验证，脚本在这些平台上仍可能存在边界问题。欢迎 PR。
 
 ```bash
-git clone https://github.com/funny-vibes/agent-vibes.git
-cd agent-vibes
+# 从这个本地 checkout 执行：
 npm install && npm run build
-npm link                          # 将 `agent-vibes` 注册为全局命令
+npm link                          # 将 `ccursor` 注册为全局命令
 ```
 
 生成 SSL 证书：
@@ -226,16 +189,16 @@ npm link                          # 将 `agent-vibes` 注册为全局命令
 ```bash
 # 先安装 mkcert: https://github.com/FiloSottile/mkcert#installation
 mkcert -install
-agent-vibes cert
+ccursor cert
 ```
 
 Cursor 需要 HTTPS 拦截，以下为一次性设置：
 
 ```bash
-agent-vibes forward hosts        # 在 hosts 中添加 DNS 重定向
-agent-vibes forward on           # 开启端口转发
-agent-vibes                      # 启动代理
-agent-vibes forward status       # 验证是否正常工作
+ccursor forward hosts        # 在 hosts 中添加 DNS 重定向
+ccursor forward on           # 开启端口转发
+ccursor                      # 启动代理
+ccursor forward status       # 验证是否正常工作
 ```
 
 ### 选择一个上游来源
@@ -243,30 +206,30 @@ agent-vibes forward status       # 验证是否正常工作
 Antigravity（[Antigravity IDE](https://antigravity.google) 或 [Antigravity Manager](https://github.com/lbjlaq/Antigravity-Manager)）：
 
 ```bash
-agent-vibes sync --ide       # 从 Antigravity IDE 同步
-agent-vibes sync --tools     # 从 Antigravity Manager 同步
+ccursor sync --ide       # 从 Antigravity IDE 同步
+ccursor sync --tools     # 从 Antigravity Manager 同步
 ```
 
 Claude Code 第三方配置：
 
 ```bash
-agent-vibes sync --claude
+ccursor sync --claude
 ```
 
 Codex：
 
 ```bash
 codex --login
-agent-vibes sync --codex
+ccursor sync --codex
 ```
 
 Kiro（AWS Builder ID / IdC / Kiro IDE）：
 
 - **最简单：** Dashboard → Accounts → Kiro → 新增账号 → **Builder ID** 标签页。
   Bridge 会全程跑完 OAuth device flow，自动打开浏览器，并把令牌写入
-  `~/.agent-vibes/data/kiro-accounts.json`。
+  `~/.ccursor/data/kiro-accounts.json`。
 - **从已登录的 Kiro IDE / AWS CLI 同步：** 命令面板 →
-  `Agent Vibes: Sync Kiro IDE Credentials`。Bridge 会扫描
+  `CCursor: Sync Kiro IDE Credentials`。Bridge 会扫描
   `~/.aws/sso/cache/*.json` 与 Kiro IDE 的
   `globalStorage/kiro.kiroagent/kiro-cache/`，自动配对 token 与 client
   registration 后导入可用条目。
@@ -280,25 +243,24 @@ Kiro（AWS Builder ID / IdC / Kiro IDE）：
 
 #### 安装 / 配置命令
 
-| 步骤 | 命令面板标题                                      | Command ID                            | 用途                                                                     |
-| ---- | ------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------ |
-| 1    | Agent Vibes: Open Dashboard                       | `agentVibes.openDashboard`            | 打开主 Dashboard，先查看当前安装状态。                                   |
-| 2    | Agent Vibes: Generate SSL Certificates            | `agentVibes.generateCert`             | 生成 HTTPS 拦截所需的本地证书。                                          |
-| 3    | Dashboard → Accounts                              | _主入口_                              | 在账号管理 tab 中完成账号配置；支持新增、编辑、OAuth、token 导入等操作。 |
-| 3    | Agent Vibes: Sync Antigravity IDE Credentials     | `agentVibes.syncAntigravityIDE`       | 从 Antigravity IDE 导入凭据。                                            |
-| 3    | Agent Vibes: Sync Antigravity Tool Credentials    | `agentVibes.syncAntigravityTools`     | 从 Antigravity Manager / tools 导入凭据。                                |
-| 3    | Agent Vibes: Sync Claude Credentials              | `agentVibes.syncClaude`               | 将 Claude 兼容凭据同步到 Agent Vibes。                                   |
-| 3    | Agent Vibes: Sync Codex Credentials               | `agentVibes.syncCodex`                | 将 Codex 凭据同步到 Agent Vibes。                                        |
-| 3    | Agent Vibes: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts` | 打开 `openai-compat-accounts.json` 进行手动配置。                        |
-| 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | 打开 `claude-api-accounts.json` 进行手动配置。                           |
-| 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | 打开 `kiro-accounts.json` 进行手动配置。                                 |
-| 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | 导入 Kiro IDE 或 AWS CLI 在本地缓存的 Kiro / AWS SSO token。             |
-| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | 在证书和至少一个账号准备完成后启动本地 bridge。                          |
-| 5    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`         | 启用 Cursor 流量拦截所需的本地转发。                                     |
-| 5    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`        | 关闭本地转发。                                                           |
-| 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`         | 检查 forwarding 与 hosts 配置状态。                                      |
-| 7    | Agent Vibes: Edit Configuration                   | `agentVibes.openConfig`               | 打开 Cursor 中的 `agentVibes` 设置。                                     |
-| 8    | Agent Vibes: Check Extension Updates              | `agentVibes.checkExtensionUpdates`    | 检查 GitHub Releases 上是否有新的 VSIX。                                 |
+| 步骤 | 命令面板标题                                  | Command ID                            | 用途                                                                     |
+| ---- | --------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------ |
+| 1    | CCursor: Open Dashboard                       | `agentVibes.openDashboard`            | 打开主 Dashboard，先查看当前安装状态。                                   |
+| 2    | CCursor: Generate SSL Certificates            | `agentVibes.generateCert`             | 生成 HTTPS 拦截所需的本地证书。                                          |
+| 3    | Dashboard → Accounts                          | _主入口_                              | 在账号管理 tab 中完成账号配置；支持新增、编辑、OAuth、token 导入等操作。 |
+| 3    | CCursor: Sync Antigravity IDE Credentials     | `agentVibes.syncAntigravityIDE`       | 从 Antigravity IDE 导入凭据。                                            |
+| 3    | CCursor: Sync Antigravity Tool Credentials    | `agentVibes.syncAntigravityTools`     | 从 Antigravity Manager / tools 导入凭据。                                |
+| 3    | CCursor: Sync Claude Credentials              | `agentVibes.syncClaude`               | 将 Claude 兼容凭据同步到 CCursor。                                       |
+| 3    | CCursor: Sync Codex Credentials               | `agentVibes.syncCodex`                | 将 Codex 凭据同步到 CCursor。                                            |
+| 3    | CCursor: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts` | 打开 `openai-compat-accounts.json` 进行手动配置。                        |
+| 3    | CCursor: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | 打开 `claude-api-accounts.json` 进行手动配置。                           |
+| 3    | CCursor: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | 打开 `kiro-accounts.json` 进行手动配置。                                 |
+| 3    | CCursor: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | 导入 Kiro IDE 或 AWS CLI 在本地缓存的 Kiro / AWS SSO token。             |
+| 4    | CCursor: Start Server                         | `agentVibes.startServer`              | 在证书和至少一个账号准备完成后启动本地 bridge。                          |
+| 5    | CCursor: Enable Port Forwarding               | `agentVibes.enableForwarding`         | 启用 Cursor 流量拦截所需的本地转发。                                     |
+| 5    | CCursor: Disable Port Forwarding              | `agentVibes.disableForwarding`        | 关闭本地转发。                                                           |
+| 6    | CCursor: Port Forwarding Status               | `agentVibes.forwardingStatus`         | 检查 forwarding 与 hosts 配置状态。                                      |
+| 7    | CCursor: Edit Configuration                   | `agentVibes.openConfig`               | 打开 Cursor 中的 `agentVibes` 设置。                                     |
 
 #### Dashboard tabs
 
@@ -324,7 +286,7 @@ Kiro（AWS Builder ID / IdC / Kiro IDE）：
 如果你还需要把 Claude Code CLI 接到同一个本地代理，可使用：
 
 ```bash
-agent-vibes                  # 启动代理
+ccursor                  # 启动代理
 ```
 
 在另一个终端中：
@@ -345,13 +307,13 @@ claude
 配置方式：
 
 ```bash
-agent-vibes sync --ide
-agent-vibes sync --tools
+ccursor sync --ide
+ccursor sync --tools
 ```
 
 行为：
 
-- 凭据会同步到 `~/.agent-vibes/data/antigravity-accounts.json`。
+- 凭据会同步到 `~/.ccursor/data/antigravity-accounts.json`。
 - 支持多账号轮转。
 - **Claude 模型路由：** 当 Claude Code CLI 通过 Google 后端路由时，
   只有 **Opus** 模型走 Claude-through-Google（Cloud Code）路径。
@@ -382,10 +344,10 @@ agent-vibes sync --tools
 
 ```bash
 codex --login
-agent-vibes sync --codex
+ccursor sync --codex
 ```
 
-- OpenAI 兼容配置文件：`~/.agent-vibes/data/openai-compat-accounts.json`
+- OpenAI 兼容配置文件：`~/.ccursor/data/openai-compat-accounts.json`
 
 ```json
 {
@@ -422,9 +384,9 @@ agent-vibes sync --codex
 
 配置方式：
 
-- `agent-vibes sync --claude` 会读取 `~/.claude/settings.json`，并在 `~/.agent-vibes/data/claude-api-accounts.json` 中写入或更新一个受管理的 `claude-code-sync` 条目。
+- `ccursor sync --claude` 会读取 `~/.claude/settings.json`，并在 `~/.ccursor/data/claude-api-accounts.json` 中写入或更新一个受管理的 `claude-code-sync` 条目。
   这个受管理条目会以当前源设置为准；如果源设置里已经没有显式模型 ID，旧的受管 `models` 也会被清掉，以便动态发现生效。
-- 或手动编辑 `~/.agent-vibes/data/claude-api-accounts.json`：
+- 或手动编辑 `~/.ccursor/data/claude-api-accounts.json`：
 
 ```json
 {
@@ -480,14 +442,14 @@ agent-vibes sync --codex
 配置方式（任选其一）：
 
 - **Builder ID OAuth（推荐）：** Dashboard → Accounts → Kiro → 新增 → **Builder ID**。
-- **同步本地缓存：** 命令面板 → `Agent Vibes: Sync Kiro IDE Credentials`。从 `~/.aws/sso/cache/` 与 Kiro IDE `globalStorage` 导入已登录的 token。
+- **同步本地缓存：** 命令面板 → `CCursor: Sync Kiro IDE Credentials`。从 `~/.aws/sso/cache/` 与 Kiro IDE `globalStorage` 导入已登录的 token。
 - **手动粘贴：** Dashboard → Accounts → Kiro → 新增 → **Token**。
 
 行为：
 
 - `authMethod`：`"idc"`（Builder ID / IdC，需要 `clientId` + `clientSecret`）或 `"social"`（GitHub / Google）。
 - AWS 不返回 Anthropic 格式的 cache token 计数，Bridge 在客户端模拟 `cache_read_input_tokens` / `cache_creation_input_tokens`。
-- 刷新后的 token 会写回 `~/.agent-vibes/data/kiro-accounts.json`，后台每 15 分钟自动刷新一次。
+- 刷新后的 token 会写回 `~/.ccursor/data/kiro-accounts.json`，后台每 15 分钟自动刷新一次。
 
 ## SSH 远程开发
 
@@ -555,10 +517,10 @@ agent-vibes sync --codex
 
    ```bash
    # 在远端
-   mkdir -p ~/.agent-vibes/certs
-   # 把本机 ~/.agent-vibes/certs/ca.pem 拷过来，例如在本机：
-   #   scp ~/.agent-vibes/certs/ca.pem user@remote-host:~/.agent-vibes/certs/ca.pem
-   export NODE_EXTRA_CA_CERTS=$HOME/.agent-vibes/certs/ca.pem
+   mkdir -p ~/.ccursor/certs
+   # 把本机 ~/.ccursor/certs/ca.pem 拷过来，例如在本机：
+   #   scp ~/.ccursor/certs/ca.pem user@remote-host:~/.ccursor/certs/ca.pem
+   export NODE_EXTRA_CA_CERTS=$HOME/.ccursor/certs/ca.pem
    ```
 
 2. 让 agent runtime 走代理，再启动 `cursor-server`：
@@ -581,9 +543,9 @@ agent-vibes sync --codex
 
 ## 常见问题 / 故障排查
 
-### `agent-vibes forward on` 在系统全局 TUN 代理下不生效
+### `ccursor forward on` 在系统全局 TUN 代理下不生效
 
-现象：执行 `npm run cursor:forward:on`（或 `agent-vibes forward on`）后，Cursor 仍然无法连到 bridge，Diagnostics 报 DNS / 转发失败，或 `curl https://api2.cursor.sh/health` 卡住。
+现象：执行 `npm run cursor:forward:on`（或 `ccursor forward on`）后，Cursor 仍然无法连到 bridge，Diagnostics 报 DNS / 转发失败，或 `curl https://api2.cursor.sh/health` 卡住。
 
 根因：系统代理工作在 **TUN 模式**（Clash Verge、Mihomo、V2RayN TUN、sing-box 等）下，会在网络层拦截所有流量，**早于** hosts 文件改写或回环重定向生效。
 即使代理规则里写了 `127.0.0.0/8 -> DIRECT`，上游解析器也可能已经把 `localhost` / Cursor 域名劫持到 fake-ip 段，导致 IP-CIDR 规则根本没匹配上。
@@ -634,9 +596,9 @@ agent-vibes sync --codex
 ## 项目结构
 
 ```text
-agent-vibes/
+ccursor/
 ├── bin/
-│   └── agent-vibes                            # CLI 入口
+│   └── ccursor                            # CLI 入口
 ├── apps/
 │   └── protocol-bridge/                       # 主代理服务（NestJS + Fastify）
 │       ├── sea/                               # SEA 打包脚本与入口
@@ -744,11 +706,11 @@ agent-vibes/
 
 ## 交流讨论
 
-欢迎在 [LINUX DO](https://linux.do/t/topic/1814066) 参与关于 Agent Vibes 的讨论与交流，或者随时在 [GitHub Issues](https://github.com/funny-vibes/agent-vibes/issues) 反馈问题。
+这个 CCursor 私有构建已去掉公开社区入口和 Hub 登录入口。后端请通过控制台或账号 JSON 文件在本地配置。
 
 ## 贡献
 
-如果你发现了 bug，或者有新的想法，欢迎使用我们的 [issue templates](https://github.com/funny-vibes/agent-vibes/issues/new/choose) 提交 bug 或功能请求。
+如果你发现了 bug，或者有新的想法，请记录到你的私有 issue 系统或本地 fork。
 
 提交 PR 前，请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 

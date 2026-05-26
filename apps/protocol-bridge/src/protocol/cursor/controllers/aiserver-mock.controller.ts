@@ -36,7 +36,16 @@ import {
   CheckFeaturesStatusResponse_FeatureStatusSchema,
   CheckQueuePositionResponseSchema,
   CheckUsageBasedPriceResponseSchema,
+  CppConfigResponse_ImportPredictionConfigSchema,
+  CppConfigResponse_MergeBehaviorSchema,
+  CppConfigResponse_RecentlyRejectedEditThresholdsSchema,
+  CppConfigResponseSchema,
   FindBugsResponseSchema,
+  FSConfigResponseSchema,
+  FSInternalHealthCheckResponseSchema,
+  FSIsEnabledForUserResponseSchema,
+  FSSyncErrorType,
+  FSSyncFileResponseSchema,
   GetCloudSetupBlockersResponseSchema,
   GetCurrentPeriodUsageResponseSchema,
   GetDefaultModelNudgeDataResponseSchema,
@@ -1350,6 +1359,99 @@ export class AiserverMockController {
   @Post("aiserver.v1.AiService/CppEditHistoryStatus")
   handleCppEditHistoryStatus(@Res() res: FastifyReply): void {
     this.sendEmpty(res)
+  }
+
+  @Post("aiserver.v1.FileSyncService/FSIsEnabledForUser")
+  handleFSIsEnabledForUser(@Res() res: FastifyReply): void {
+    const response = create(FSIsEnabledForUserResponseSchema, {
+      enabled: false,
+    })
+    this.sendProto(res, FSIsEnabledForUserResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.FileSyncService/FSConfig")
+  handleFSConfig(@Res() res: FastifyReply): void {
+    const response = create(FSConfigResponseSchema, {
+      checkFilesyncHashPercent: 0,
+      rateLimiterBreakerResetTimeMs: 1_000,
+      rateLimiterRps: 1,
+      rateLimiterBurstCapacity: 1,
+      maxRecentUpdatesStored: 0,
+      maxModelVersionCacheSize: 0,
+      maxFileSizeToSyncBytes: 0,
+      syncRetryMaxAttempts: 0,
+      syncRetryInitialDelayMs: 1_000,
+      syncRetryTimeMultiplier: 1,
+      fileSyncStatusMaxCacheSize: 0,
+      successiveSyncsRequiredForReliance: 0,
+      extraSuccessfulSyncsNeededAfterErrors: 0,
+      bigChangeStrippingThresholdBytes: 0,
+      lastNUpdatesToSend: 0,
+      fileSyncStatusTtlMs: 1_000,
+      syncDebounceMs: 1_000,
+      syncUpdateThreshold: 0,
+    })
+    this.sendProto(res, FSConfigResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.FileSyncService/FSInternalHealthCheck")
+  handleFSInternalHealthCheck(@Res() res: FastifyReply): void {
+    const response = create(FSInternalHealthCheckResponseSchema, {
+      success: true,
+    })
+    this.sendProto(res, FSInternalHealthCheckResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.FileSyncService/FSSyncFile")
+  handleFSSyncFile(@Res() res: FastifyReply): void {
+    const response = create(FSSyncFileResponseSchema, {
+      error: FSSyncErrorType.FS_SYNC_ERROR_TYPE_UNSPECIFIED,
+    })
+    this.sendProto(res, FSSyncFileResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/CppConfig")
+  handleCppConfig(@Res() res: FastifyReply): void {
+    const response = create(CppConfigResponseSchema, {
+      aboveRadius: 10,
+      belowRadius: 10,
+      mergeBehavior: create(CppConfigResponse_MergeBehaviorSchema, {
+        type: "none",
+      }),
+      isOn: false,
+      isGhostText: true,
+      shouldLetUserEnableCppEvenIfNotPro: true,
+      heuristics: [],
+      excludeRecentlyViewedFilesPatterns: [],
+      enableRvfTracking: false,
+      globalDebounceDurationMillis: 250,
+      clientDebounceDurationMillis: 250,
+      cppUrl: "",
+      useWhitespaceDiffHistory: false,
+      importPredictionConfig: create(
+        CppConfigResponse_ImportPredictionConfigSchema,
+        {
+          isDisabledByBackend: true,
+          shouldTurnOnAutomatically: false,
+          pythonEnabled: false,
+        }
+      ),
+      enableFilesyncDebounceSkipping: false,
+      checkFilesyncHashPercent: 0,
+      geoCppBackendUrl: "",
+      recentlyRejectedEditThresholds: create(
+        CppConfigResponse_RecentlyRejectedEditThresholdsSchema,
+        {
+          hardRejectThreshold: 0,
+          softRejectThreshold: 0,
+        }
+      ),
+      isFusedCursorPredictionModel: false,
+      includeUnchangedLines: false,
+      shouldFetchRvfText: false,
+      allowsTabChunks: false,
+    })
+    this.sendProto(res, CppConfigResponseSchema, response)
   }
 
   @Post("aiserver.v1.AiService/CppAppend")

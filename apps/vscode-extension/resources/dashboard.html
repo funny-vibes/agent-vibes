@@ -7,7 +7,7 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';"
     />
-    <title>Agent Vibes Dashboard</title>
+    <title>CCursor Dashboard</title>
     <style>
       /* ── Design tokens (matching sidebar) ── */
       :root {
@@ -1377,7 +1377,7 @@
           <img
             id="overview-logo"
             src=""
-            alt="Agent Vibes"
+            alt="CCursor"
             style="
               width: 48px;
               height: 48px;
@@ -1393,13 +1393,13 @@
                 letter-spacing: -0.02em;
               "
             >
-              Agent Vibes
+              CCursor
             </div>
             <div
               style="font-size: var(--text-sm); color: var(--fg-2)"
               data-i18n="page.tagline"
             >
-              Unified AI Agent Gateway - Happy vibing!
+              Unified AI Agent Gateway - Private BYOK routing.
             </div>
             <div class="overview-meta" id="overview-meta"></div>
           </div>
@@ -2569,9 +2569,7 @@
               )
             })
             .join("") +
-          '<button type="button" class="btn btn-ghost" style="height:24px;padding:0 10px;font-size:var(--text-xs)" onclick="checkUpdatesBtn(this)">' +
-          esc(L("checkUpdates")) +
-          "</button>"
+          ""
 
         const isRunning = s.bridge === "Running"
         const setup = s.setup || null
@@ -2736,22 +2734,16 @@
       }
 
       // ── Accounts tab ──
-      var selectedChannel = "antigravity"
+      var selectedChannel = "openai-compat"
       var emailPrivacy = false
       var codexSubView = "accounts"
       var antigravityDraft = { proxyUrl: "" }
       var ACCT_PROVIDER_GROUPS = [
         {
-          key: "google",
-          label: "Google",
-          barCls: "ch-bar-ag",
-          channels: ["antigravity"],
-        },
-        {
           key: "openai",
           label: "OpenAI",
-          barCls: "ch-bar-cx",
-          channels: ["codex", "openai-compat"],
+          barCls: "ch-bar-oai",
+          channels: ["openai-compat", "codex"],
         },
         {
           key: "anthropic",
@@ -2783,14 +2775,20 @@
       }
 
       function getDefaultSelectedChannel() {
-        if (selectedChannel && CH[selectedChannel]) return selectedChannel
         var groups = getAccountSidebarGroups()
+        if (selectedChannel && CH[selectedChannel]) {
+          for (var ci = 0; ci < groups.length; ci++) {
+            if (groups[ci].channels.indexOf(selectedChannel) >= 0) {
+              return selectedChannel
+            }
+          }
+        }
         for (var gi = 0; gi < groups.length; gi++) {
           if (groups[gi].channels.length > 0) {
             return groups[gi].channels[0]
           }
         }
-        return "antigravity"
+        return "openai-compat"
       }
 
       function maskEmail(email) {
@@ -4080,24 +4078,8 @@
       function renderAntigravityDlg() {
         const fields = document.getElementById("dlg-fields")
         const okBtn = document.getElementById("dlg-ok")
-        const isOAuth = dlgOAuthTab === "oauth"
+        const isOAuth = false
         let h = ""
-
-        // Tab bar
-        h += '<div class="oauth-tabs">'
-        h +=
-          '<button type="button" class="oauth-tab' +
-          (isOAuth ? " active" : "") +
-          '" onclick="switchOAuthTab(\'oauth\')">' +
-          esc(L("oauth.googleTab")) +
-          "</button>"
-        h +=
-          '<button type="button" class="oauth-tab' +
-          (!isOAuth ? " active" : "") +
-          '" onclick="switchOAuthTab(\'token\')">' +
-          esc(L("oauth.tokenTab")) +
-          "</button>"
-        h += "</div>"
 
         h += '<div class="dlg-body">'
 
@@ -4203,24 +4185,8 @@
       function renderKiroDlg() {
         var fields = document.getElementById("dlg-fields")
         var okBtn = document.getElementById("dlg-ok")
-        var isOAuth = kiroOAuthTab === "oauth"
+        var isOAuth = false
         var h = ""
-
-        // Tab bar
-        h += '<div class="oauth-tabs">'
-        h +=
-          '<button type="button" class="oauth-tab' +
-          (isOAuth ? " active" : "") +
-          '" onclick="switchKiroOAuthTab(\'oauth\')">' +
-          "Builder ID" +
-          "</button>"
-        h +=
-          '<button type="button" class="oauth-tab' +
-          (!isOAuth ? " active" : "") +
-          '" onclick="switchKiroOAuthTab(\'token\')">' +
-          esc(L("oauth.tokenTab")) +
-          "</button>"
-        h += "</div>"
 
         h += '<div class="dlg-body">'
 
@@ -4229,7 +4195,7 @@
           h +=
             '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6">'
           h +=
-            "Click the button below to start AWS Builder ID authorization. A browser window will open for you to approve access."
+            "Paste an existing Kiro token JSON. Browser authorization is disabled in this build."
           h += "</div>"
           h +=
             '<div id="kiro-oauth-status" style="margin-top:var(--sp-3)"></div>'
@@ -4406,29 +4372,14 @@
       }
 
       // ── Codex OAuth Dialog ──
-      var codexOAuthTab = "oauth"
+      var codexOAuthTab = "token"
 
       function renderCodexDlg() {
         var fields = document.getElementById("dlg-fields")
         var okBtn = document.getElementById("dlg-ok")
-        var isOAuth = codexOAuthTab === "oauth"
-        var isToken = codexOAuthTab === "token"
+        var isOAuth = false
+        var isToken = true
         var h = ""
-
-        h += '<div class="oauth-tabs">'
-        h +=
-          '<button type="button" class="oauth-tab' +
-          (isOAuth ? " active" : "") +
-          '" onclick="switchCodexOAuthTab(\'oauth\')">' +
-          esc(L("oauth.openaiTab")) +
-          "</button>"
-        h +=
-          '<button type="button" class="oauth-tab' +
-          (isToken ? " active" : "") +
-          '" onclick="switchCodexOAuthTab(\'token\')">' +
-          esc(L("oauth.manualTab")) +
-          "</button>"
-        h += "</div>"
 
         h += '<div class="dlg-body">'
 
@@ -4595,17 +4546,6 @@
       }
       function runCmd(cmd) {
         vscode.postMessage({ type: "runCommand", command: cmd })
-      }
-      function checkUpdatesBtn(btn) {
-        if (btn.classList.contains("btn-loading")) return
-        btn.classList.add("btn-loading")
-        btn.innerHTML =
-          '<span class="btn-spinner"></span>' + esc(L("checkingUpdates"))
-        runCmd("agentVibes.checkExtensionUpdates")
-        setTimeout(function () {
-          btn.classList.remove("btn-loading")
-          btn.innerHTML = esc(L("checkUpdates"))
-        }, 8000)
       }
       function runCmdWithLoading(btn, cmd) {
         if (getPendingCommand()) return

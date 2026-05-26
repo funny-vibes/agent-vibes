@@ -65,8 +65,8 @@ function getExpectedAssetNames(version: string): string[] {
   const normalizedVersion = normalizeVersion(version)
   const target = getPlatformTarget()
   return [
-    `agent-vibes-${target}-${normalizedVersion}.vsix`,
-    `agent-vibes-${normalizedVersion}.vsix`,
+    `ccursor-${target}-${normalizedVersion}.vsix`,
+    `ccursor-${normalizedVersion}.vsix`,
   ]
 }
 
@@ -96,7 +96,7 @@ function request(url: string, redirectCount = 0): Promise<IncomingMessage> {
       {
         headers: {
           Accept: "application/vnd.github+json",
-          "User-Agent": "agent-vibes-extension-updater",
+          "User-Agent": "ccursor-extension-updater",
         },
       },
       (response) => {
@@ -129,7 +129,7 @@ async function getJson<T>(url: string): Promise<T> {
 
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error(
-      `GitHub Releases request failed (${statusCode}): ${body.toString("utf8").trim()}`
+      `Release request failed (${statusCode}): ${body.toString("utf8").trim()}`
     )
   }
 
@@ -168,7 +168,7 @@ export class ExtensionUpdateService {
 
   async checkForUpdatesOnStartup(): Promise<void> {
     const config = vscode.workspace.getConfiguration("agentVibes")
-    if (!config.get<boolean>("autoCheckUpdates", true)) {
+    if (!config.get<boolean>("autoCheckUpdates", false)) {
       return
     }
 
@@ -198,6 +198,14 @@ export class ExtensionUpdateService {
 
   async checkForUpdates(options: CheckForUpdatesOptions = {}): Promise<void> {
     const userInitiated = options.userInitiated === true
+    if (!GITHUB_RELEASES_API_URL) {
+      if (userInitiated) {
+        void vscode.window.showInformationMessage(
+          `${EXTENSION_DISPLAY_NAME} update checks are disabled in this build.`
+        )
+      }
+      return
+    }
     const packageJson = this.context.extension.packageJSON as {
       version?: unknown
     }
@@ -280,7 +288,7 @@ export class ExtensionUpdateService {
     asset: ReleaseAsset,
     releaseUrl: string
   ): Promise<void> {
-    const tempDir = path.join(os.tmpdir(), "agent-vibes-updates")
+    const tempDir = path.join(os.tmpdir(), "ccursor-updates")
     const downloadPath = path.join(tempDir, asset.name)
 
     try {

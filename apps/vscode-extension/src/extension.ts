@@ -1,5 +1,8 @@
 import * as vscode from "vscode"
-import { registerCommands } from "./commands"
+import * as fs from "fs"
+import * as os from "os"
+import * as path from "path"
+import { registerCommands, submitCursorAgentPrompt } from "./commands"
 import { CMD, STATE, type ServerState } from "./constants"
 import { t, tFmt } from "./i18n/messages-i18n"
 import { BridgeManager } from "./services/bridge-manager"
@@ -7,6 +10,8 @@ import { CertManager } from "./services/cert-manager"
 import { ConfigManager } from "./services/config-manager"
 import { ExtensionUpdateService } from "./services/extension-update"
 import { NetworkManager } from "./services/network-manager"
+import { CursorChecksumsService } from "./services/cursor-checksums"
+import { CursorPatchService } from "./services/cursor-patch"
 import { logger } from "./utils/logger"
 import { executePrivileged } from "./utils/terminal"
 import { StatusIndicator } from "./views/status-indicator"
@@ -16,15 +21,163 @@ let bridge: BridgeManager | null = null
 let network: NetworkManager | null = null
 let statusIndicator: StatusIndicator | null = null
 
+type DebugSubmitMarker = {
+  action?: "submit" | "listCommands" | "applyPatches"
+  autoSubmitDelayMs?: number
+  command?: string
+  outputPath?: string
+  workspace?: string
+  prompt?: string
+}
+
+const DEBUG_SUBMIT_MARKER_PATH = path.join(
+  os.tmpdir(),
+  "ccursor-debug-submit-agent.json"
+)
+const DEBUG_COMMANDS_OUTPUT_PATH = path.join(
+  os.tmpdir(),
+  "ccursor-debug-commands.json"
+)
+
+function parseDebugSubmitMarker(raw: string): DebugSubmitMarker {
+  const parsed: unknown = JSON.parse(raw)
+  if (!parsed || typeof parsed !== "object") {
+    return {}
+  }
+  return parsed as DebugSubmitMarker
+}
+
+function toJsonSafe(value: unknown): unknown {
+  if (value === undefined) return null
+  return JSON.parse(JSON.stringify(value)) as unknown
+}
+
+function getWorkspaceFolderPath(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+}
+
+function markerMatchesWorkspace(marker: DebugSubmitMarker): boolean {
+  if (!marker.workspace) return true
+
+  const workspace = getWorkspaceFolderPath()
+  if (!workspace) return false
+
+  return path.resolve(marker.workspace) === path.resolve(workspace)
+}
+
+async function tryRunDebugSubmitMarker(): Promise<void> {
+  if (!fs.existsSync(DEBUG_SUBMIT_MARKER_PATH)) return
+
+  let marker: DebugSubmitMarker
+  try {
+    marker = parseDebugSubmitMarker(
+      fs.readFileSync(DEBUG_SUBMIT_MARKER_PATH, "utf8")
+    )
+  } catch (error) {
+    logger.error("Failed to parse Cursor Agent debug marker", error)
+    return
+  }
+
+  if (!markerMatchesWorkspace(marker)) {
+    logger.info("Cursor Agent debug marker ignored for non-matching workspace")
+    return
+  }
+
+  try {
+    fs.unlinkSync(DEBUG_SUBMIT_MARKER_PATH)
+  } catch (error) {
+    logger.warn(
+      `Failed to remove Cursor Agent debug marker: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+
+  if (marker.action === "listCommands") {
+    const commands = await vscode.commands.getCommands(true)
+    const interesting = commands
+      .filter((command) => /chat|composer|agent/i.test(command))
+      .sort()
+    const outputPath = marker.outputPath || DEBUG_COMMANDS_OUTPUT_PATH
+    fs.writeFileSync(
+      outputPath,
+      JSON.stringify(
+        {
+          workspace: getWorkspaceFolderPath(),
+          total: commands.length,
+          commands: interesting,
+        },
+        null,
+        2
+      )
+    )
+    logger.info(`Wrote Cursor command list to ${outputPath}`)
+    return
+  }
+
+  if (marker.action === "applyPatches") {
+    const cursorPatch = new CursorPatchService(logger)
+    const cursorChecksums = new CursorChecksumsService()
+    const patchResult = cursorPatch.applyPatches()
+    const checksumResult = patchResult.success
+      ? cursorChecksums.apply()
+      : { success: false, updated: 0, errors: [] }
+    const outputPath = marker.outputPath || DEBUG_COMMANDS_OUTPUT_PATH
+    fs.writeFileSync(
+      outputPath,
+      JSON.stringify(
+        {
+          workspace: getWorkspaceFolderPath(),
+          patchResult,
+          checksumResult,
+        },
+        null,
+        2
+      )
+    )
+    logger.info(`Applied Cursor patches via debug marker: ${outputPath}`)
+    return
+  }
+
+  const prompt = typeof marker.prompt === "string" ? marker.prompt.trim() : ""
+  if (prompt.length === 0) {
+    logger.warn("Cursor Agent debug marker has no prompt")
+    return
+  }
+
+  const autoSubmitDelayMs =
+    typeof marker.autoSubmitDelayMs === "number" &&
+    Number.isFinite(marker.autoSubmitDelayMs) &&
+    marker.autoSubmitDelayMs >= 0
+      ? marker.autoSubmitDelayMs
+      : undefined
+  const result = await submitCursorAgentPrompt(
+    prompt,
+    marker.command,
+    autoSubmitDelayMs
+  )
+  if (marker.outputPath) {
+    fs.writeFileSync(
+      marker.outputPath,
+      JSON.stringify(
+        {
+          workspace: getWorkspaceFolderPath(),
+          command: marker.command || "workbench.action.chat.open",
+          autoSubmitDelayMs,
+          result: toJsonSafe(result),
+        },
+        null,
+        2
+      )
+    )
+  }
+}
+
 /**
  * Extension entry point — called on startup (onStartupFinished).
  */
-export async function activate(
-  context: vscode.ExtensionContext
-): Promise<void> {
+export function activate(context: vscode.ExtensionContext): void {
   // Initialize logger
   logger.initialize()
-  logger.info("Agent Vibes extension activating...")
+  logger.info("CCursor extension activating...")
 
   // Create core services
   const config = new ConfigManager()
@@ -59,7 +212,7 @@ export async function activate(
       currentPort = nextPort
       network?.setPort(nextPort)
 
-      logger.info(`Agent Vibes port changed: ${previousPort} → ${nextPort}`)
+      logger.info(`CCursor port changed: ${previousPort} → ${nextPort}`)
 
       const bridgeRunning = bridge?.isRunning ?? false
       const forwardingActive = network?.isForwardingActive() ?? false
@@ -111,14 +264,20 @@ export async function activate(
 
   // ── First-run onboarding ──────────────────────────────────────────
   const needsCerts = !config.hasCertificates()
+  const hasOpenAICompatAccounts =
+    config.getAccountCount(config.openaiCompatAccountsPath) > 0
   const hasAnyAccounts =
+    hasOpenAICompatAccounts ||
     config.getAccountCount(config.antigravityAccountsPath) > 0 ||
     config.getAccountCount(config.claudeApiAccountsPath) > 0 ||
     config.getAccountCount(config.codexAccountsPath) > 0 ||
-    config.getAccountCount(config.openaiCompatAccountsPath) > 0 ||
     config.getAccountCount(config.kiroAccountsPath) > 0
 
-  if (needsCerts || !hasAnyAccounts) {
+  const runFirstRunOnboarding = async (): Promise<void> => {
+    if (!needsCerts && hasAnyAccounts) {
+      return
+    }
+
     const missing: string[] = []
     if (needsCerts) missing.push(t("setup.missing.certs"))
     if (!hasAnyAccounts) missing.push(t("setup.missing.accounts"))
@@ -139,6 +298,11 @@ export async function activate(
       }
     }
   }
+  void runFirstRunOnboarding().catch((error) => {
+    logger.warn(
+      `First-run setup prompt failed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  })
 
   const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
     if (!network) return
@@ -199,7 +363,21 @@ export async function activate(
 
   void updater.checkForUpdatesOnStartup()
 
-  logger.info("Agent Vibes extension activated")
+  setTimeout(() => {
+    void tryRunDebugSubmitMarker().catch((error) => {
+      logger.error("Cursor Agent debug marker submission failed", error)
+    })
+  }, 1500)
+  const debugMarkerPoller = setInterval(() => {
+    void tryRunDebugSubmitMarker().catch((error) => {
+      logger.error("Cursor Agent debug marker submission failed", error)
+    })
+  }, 1000)
+  context.subscriptions.push({
+    dispose: () => clearInterval(debugMarkerPoller),
+  })
+
+  logger.info("CCursor extension activated")
 }
 
 /**
@@ -209,6 +387,6 @@ export function deactivate(): void {
   bridge?.dispose()
   network?.dispose()
   statusIndicator?.dispose()
-  logger.info("Agent Vibes extension deactivated")
+  logger.info("CCursor extension deactivated")
   logger.dispose()
 }
