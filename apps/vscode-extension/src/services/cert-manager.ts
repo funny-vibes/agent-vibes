@@ -95,6 +95,7 @@ export class CertManager {
       "api2.cursor.sh",
       "api2geo.cursor.sh",
       "api2direct.cursor.sh",
+      "*.authentication.cursor.sh",
     ]
     for (const d of extraDomains) {
       if (!altNames.some((a) => a.type === 2 && a.value === d)) {

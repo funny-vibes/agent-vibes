@@ -50,6 +50,9 @@ if ($Managed.Count -eq 0) {
 
 foreach ($item in $Managed) {
   Write-Host "Account: $($item.label) $($item.baseUrl) responses=$($item.preferResponsesApi)"
+  if ($item.preferResponsesApi -ne $false) {
+    throw "$($item.label) uses preferResponsesApi=$($item.preferResponsesApi). Rerun Install CCursor.ps1 to switch to the stable Chat Completions path."
+  }
 }
 
 Write-Host ""

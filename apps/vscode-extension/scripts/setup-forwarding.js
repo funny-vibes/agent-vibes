@@ -60,6 +60,13 @@ const HOST_DOMAINS = [
   "api2.cursor.sh",
   "api2geo.cursor.sh",
   "api2direct.cursor.sh",
+  // Cursor 3.5+ auxiliary endpoints used before AgentService/Run starts
+  "api3.cursor.sh",
+  "api4.cursor.sh",
+  "authentication.cursor.sh",
+  "authenticator.cursor.sh",
+  "prod.authentication.cursor.sh",
+  "repo42.cursor.sh",
 ]
 
 // ANSI colors

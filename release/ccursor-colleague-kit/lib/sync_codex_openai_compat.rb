@@ -8,6 +8,7 @@ require "time"
 
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_CONTEXT_TOKENS = 200_000
+DEFAULT_PREFER_RESPONSES_API = false
 MANAGED_BY = "ccursor-colleague-kit"
 
 options = {
@@ -201,7 +202,7 @@ account = {
   "label" => label,
   "apiKey" => api_key,
   "baseUrl" => base_url,
-  "preferResponsesApi" => true,
+  "preferResponsesApi" => DEFAULT_PREFER_RESPONSES_API,
   "maxContextTokens" => DEFAULT_CONTEXT_TOKENS,
   "managedBy" => MANAGED_BY,
   "sourceProvider" => provider_name,
@@ -236,6 +237,8 @@ summary = {
   "apiKey" => "[hidden]",
   "destination" => dest_path,
   "accountLabel" => label,
+  "preferResponsesApi" => DEFAULT_PREFER_RESPONSES_API,
+  "protocol" => "chat_completions",
   "wouldWrite" => !(options[:check_only] || options[:dry_run])
 }
 
@@ -259,6 +262,7 @@ else
   puts "Base URL: #{summary["baseUrl"]}"
   puts "API key: #{summary["apiKey"]} (#{summary["keySource"]})"
   puts "CCursor account: #{summary["accountLabel"]}"
+  puts "Protocol: Chat Completions (preferResponsesApi=#{summary["preferResponsesApi"]})"
   puts "Destination: #{summary["destination"]}"
   puts "Backup: #{summary["backup"]}" if summary["backup"]
   puts(options[:check_only] || options[:dry_run] ? "Mode: check only" : "Synced: yes")

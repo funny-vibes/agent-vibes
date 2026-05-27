@@ -18,7 +18,7 @@ import * as net from "net"
  *
  * The proxy implements only the parts of HTTP/1.1 needed for HTTPS
  * traffic via the CONNECT method:
- *   - For Cursor agent domains (api2.cursor.sh, api5.cursor.sh, …),
+ *   - For Cursor agent/auth domains (api2.cursor.sh, api5.cursor.sh, …),
  *     the connection is spliced to the bridge's loopback HTTPS port so
  *     the existing TLS certificate chain handles the request.
  *   - For any other domain, the connection is spliced through to the
@@ -35,17 +35,23 @@ import * as net from "net"
 
 const BRIDGE_HOST = "127.0.0.1"
 
-const CURSOR_AGENT_HOSTS: ReadonlyArray<string> = [
+const CURSOR_BRIDGE_HOSTS: ReadonlyArray<string> = [
   "api2.cursor.sh",
   "api2geo.cursor.sh",
   "api2direct.cursor.sh",
+  "api3.cursor.sh",
+  "api4.cursor.sh",
   "api5.cursor.sh",
   "api5geo.cursor.sh",
   "api5lat.cursor.sh",
+  "authentication.cursor.sh",
+  "authenticator.cursor.sh",
+  "prod.authentication.cursor.sh",
+  "repo42.cursor.sh",
 ]
 
-const CURSOR_AGENT_HOST_SUFFIXES: ReadonlyArray<string> =
-  CURSOR_AGENT_HOSTS.map((host) => `.${host}`)
+const CURSOR_BRIDGE_HOST_SUFFIXES: ReadonlyArray<string> =
+  CURSOR_BRIDGE_HOSTS.map((host) => `.${host}`)
 
 interface ConnectRequest {
   host: string
@@ -75,8 +81,8 @@ export interface ForwardProxyOptions {
 export function isCursorAgentHost(host: string): boolean {
   const normalized = host.trim().toLowerCase()
   if (!normalized) return false
-  if (CURSOR_AGENT_HOSTS.includes(normalized)) return true
-  return CURSOR_AGENT_HOST_SUFFIXES.some((suffix) =>
+  if (CURSOR_BRIDGE_HOSTS.includes(normalized)) return true
+  return CURSOR_BRIDGE_HOST_SUFFIXES.some((suffix) =>
     normalized.endsWith(suffix)
   )
 }

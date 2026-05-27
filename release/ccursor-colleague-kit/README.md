@@ -2,6 +2,8 @@
 
 用途：让 Cursor 原生 Agent 通过公司 AI 中台调用模型。同事只需要本机已经有 Codex，并且 `~/.codex/config.toml` 里配置好了 `model_provider`、`base_url` 和 key。
 
+默认走 OpenAI Chat Completions 协议，也就是 `preferResponsesApi=false`。当前 Skylink AI 中台的 Responses API 在大上下文/流式场景下不稳定，安装包会主动避开这条路径。
+
 这个包提供两个入口：
 
 - `Open Cursor Official`：不走 CCursor 代理，使用 Cursor 官方账号和官方模型。
@@ -14,7 +16,7 @@
 1. 双击 `Install CCursor.command`
 2. 使用官方模型时，双击 `Open Cursor Official.command`
 3. 使用 AI 中台时，双击 `Open Cursor with CCursor.command`
-4. CCursor 窗口打开后等待 10-20 秒
+4. 启动器会先确认本机 bridge 健康，再打开 Cursor
 5. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
 
 ## Windows 安装
@@ -22,7 +24,7 @@
 1. 右键 `Install CCursor.ps1`，选择 `Run with PowerShell`
 2. 使用官方模型时，右键 `Open Cursor Official.ps1`，选择 `Run with PowerShell`
 3. 使用 AI 中台时，右键 `Open Cursor with CCursor.ps1`，选择 `Run with PowerShell`
-4. CCursor 窗口打开后等待 10-20 秒
+4. 启动器会先确认本机 bridge 健康，再打开 Cursor
 5. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
 
 ## 如何同时使用官方模型和 AI 中台
@@ -44,6 +46,7 @@ Windows 右键 `Check CCursor.ps1`，选择 `Run with PowerShell`。
 
 - 是否能读取 `~/.codex/config.toml`
 - 是否已写入 `~/.ccursor/data/openai-compat-accounts.json`
+- CCursor 账号是否使用稳定的 Chat Completions 路径：`preferResponsesApi=false`
 - 默认 Cursor 和隔离 CCursor profile 是否已安装 `local-ai.ccursor`
 - CCursor bridge 是否在 `https://localhost:2026` 正常运行
 - Cursor 代理 `http://127.0.0.1:18080` 是否可达
@@ -74,6 +77,6 @@ experimental_bearer_token = "..."
 ## 常见处理
 
 - 如果 macOS 阻止打开 `.command`，右键点击文件，选择打开。
-- 如果检查显示 bridge 未启动，先用 `Open Cursor with CCursor` 打开 Cursor，再等 10-20 秒。
+- 如果检查显示 bridge 未启动，重新运行 `Open Cursor with CCursor`；启动器会先尝试拉起 bridge。
 - 如果 Cursor 里仍然连接失败，完整退出 CCursor profile 窗口后重新用 `Open Cursor with CCursor` 打开。
 - 如果需要 Cursor 官方模型，用 `Open Cursor Official`，不要从 CCursor 窗口里切回官方模型。

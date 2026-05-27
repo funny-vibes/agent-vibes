@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $DefaultModel = "gpt-5.5"
 $DefaultContextTokens = 200000
+$DefaultPreferResponsesApi = $false
 $ManagedBy = "ccursor-colleague-kit"
 
 function Fail-With {
@@ -280,7 +281,7 @@ $Account = [ordered]@{
   label = $Label
   apiKey = $ApiKey
   baseUrl = $BaseUrl
-  preferResponsesApi = $true
+  preferResponsesApi = $DefaultPreferResponsesApi
   maxContextTokens = $DefaultContextTokens
   managedBy = $ManagedBy
   sourceProvider = $ProviderName
@@ -324,6 +325,8 @@ $Output = [ordered]@{
   apiKey = "[hidden]"
   destination = $DestPath
   accountLabel = $Label
+  preferResponsesApi = $DefaultPreferResponsesApi
+  protocol = "chat_completions"
   wouldWrite = -not ($CheckOnly -or $DryRun)
 }
 
@@ -349,6 +352,7 @@ if ($Json) {
   Write-Host "Base URL: $($Output.baseUrl)"
   Write-Host "API key: [hidden] ($($Output.keySource))"
   Write-Host "CCursor account: $($Output.accountLabel)"
+  Write-Host "Protocol: Chat Completions (preferResponsesApi=$($Output.preferResponsesApi))"
   Write-Host "Destination: $($Output.destination)"
   if ($Output.backup) {
     Write-Host "Backup: $($Output.backup)"

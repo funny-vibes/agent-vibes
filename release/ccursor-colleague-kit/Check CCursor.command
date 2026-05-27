@@ -22,6 +22,9 @@ managed = accounts.select { |item| item.is_a?(Hash) && item["managedBy"] == "ccu
 abort("ERROR: no ccursor-colleague-kit account found in #{path}") if managed.empty?
 managed.each do |item|
   puts "Account: #{item["label"]} #{item["baseUrl"]} responses=#{item["preferResponsesApi"]}"
+  if item["preferResponsesApi"] != false
+    abort("ERROR: #{item["label"]} uses preferResponsesApi=#{item["preferResponsesApi"]}. Rerun Install CCursor.command to switch to the stable Chat Completions path.")
+  end
 end
 '
 
