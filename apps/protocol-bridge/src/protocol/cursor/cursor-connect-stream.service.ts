@@ -728,6 +728,9 @@ export class CursorConnectStreamService {
   private readonly LARGE_TOOL_RESULT_HEAD_LINES = 220
   private readonly LARGE_TOOL_RESULT_TAIL_LINES = 120
   private readonly LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS = 24_000
+  private readonly TOOL_COMPLETION_UI_READ_CONTENT_MAX_CHARS = 48_000
+  private readonly TOOL_COMPLETION_UI_READ_CONTENT_HEAD_CHARS = 32_000
+  private readonly TOOL_COMPLETION_UI_READ_CONTENT_TAIL_CHARS = 8_000
   private readonly LARGE_READ_FILE_SIZE_BYTES = 256 * 1024
   private readonly OFFICIAL_VIEW_FILE_MAX_LINES = 800
   private readonly OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS = 18_000
@@ -15309,7 +15312,11 @@ ${raw}
       toolResultContent,
       pendingToolCall.toolFamilyHint,
       pendingToolCall.modelCallId,
-      extraData
+      this.prepareToolCompletionExtraDataForUi(
+        pendingToolCall.toolName,
+        toolInputOverride || pendingToolCall.toolInput,
+        extraData
+      )
     )
     yield toolCompleted
 
@@ -15358,7 +15365,11 @@ ${raw}
       toolResultContent,
       undefined,
       pendingToolCall.modelCallId,
-      extraData
+      this.prepareToolCompletionExtraDataForUi(
+        projectedToolName,
+        projectedToolInput,
+        extraData
+      )
     )
     yield toolCompleted
 
@@ -15367,6 +15378,63 @@ ${raw}
       session.stepId,
       durationMs
     )
+  }
+
+  private prepareToolCompletionExtraDataForUi(
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    extraData?: ToolCompletedExtraData
+  ): ToolCompletedExtraData | undefined {
+    const readSuccess = extraData?.readSuccess
+    const content = readSuccess?.content
+    if (typeof content !== "string") {
+      return extraData
+    }
+    if (content.length <= this.TOOL_COMPLETION_UI_READ_CONTENT_MAX_CHARS) {
+      return extraData
+    }
+
+    const pathForLog =
+      extraData?.readSuccess?.path ||
+      this.pickFirstString(toolInput, [
+        "path",
+        "file_path",
+        "filePath",
+        "TargetFile",
+        "targetFile",
+        "target_file",
+        "AbsolutePath",
+        "absolutePath",
+        "absolute_path",
+      ]) ||
+      "(unknown path)"
+    const headChars = Math.min(
+      this.TOOL_COMPLETION_UI_READ_CONTENT_HEAD_CHARS,
+      content.length
+    )
+    const tailChars = Math.min(
+      this.TOOL_COMPLETION_UI_READ_CONTENT_TAIL_CHARS,
+      Math.max(content.length - headChars, 0)
+    )
+    const omittedChars = Math.max(content.length - headChars - tailChars, 0)
+    const uiContent =
+      content.slice(0, headChars) +
+      `\n\n[CCursor UI payload truncated: omitted ${omittedChars} chars from a large read result. The model history keeps the context-safe projection; use focused read_file ranges for the omitted middle section.]\n\n` +
+      (tailChars > 0 ? content.slice(content.length - tailChars) : "")
+
+    this.logger.warn(
+      `Truncated large read_file ToolCallCompleted UI payload: tool=${toolName}, ` +
+        `target=${pathForLog}, content=${content.length} chars -> ${uiContent.length} chars`
+    )
+
+    return {
+      ...extraData,
+      readSuccess: {
+        ...readSuccess,
+        content: uiContent,
+        truncated: true,
+      },
+    }
   }
 
   private *emitShellToolDelta(
