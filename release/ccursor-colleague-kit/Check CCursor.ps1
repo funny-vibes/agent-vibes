@@ -53,7 +53,17 @@ try {
   $bridgeHandler.ServerCertificateCustomValidationCallback = { $true }
   $bridgeClient = [System.Net.Http.HttpClient]::new($bridgeHandler)
   $bridgeClient.Timeout = [TimeSpan]::FromSeconds(5)
-  $statusBody = $bridgeClient.GetStringAsync("https://localhost:2026/pool/status").GetAwaiter().GetResult()
+  $statusBody = $null
+  foreach ($uri in @("http://127.0.0.1:2026/pool/status", "https://localhost:2026/pool/status")) {
+    try {
+      $statusBody = $bridgeClient.GetStringAsync($uri).GetAwaiter().GetResult()
+      break
+    } catch {
+      if ($uri -eq "https://localhost:2026/pool/status") {
+        throw
+      }
+    }
+  }
   $status = $statusBody | ConvertFrom-Json
   $pool = $status.backends.openaiCompat
   Write-Host "Bridge: running"

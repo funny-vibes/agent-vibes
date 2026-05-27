@@ -237,6 +237,16 @@ function Load-ExistingAccounts {
   }
 }
 
+function Write-Utf8NoBom {
+  param(
+    [string]$Path,
+    [string]$Content
+  )
+
+  $encoding = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
 $CodexConfigPath = Join-Path $CodexHome "config.toml"
 if (-not (Test-Path -LiteralPath $CodexConfigPath)) {
@@ -325,9 +335,9 @@ if (-not $CheckOnly -and -not $DryRun) {
     Copy-Item -LiteralPath $DestPath -Destination $backupPath -Force
     $Output.backup = $backupPath
   }
-  [ordered]@{ accounts = @($NextAccounts) } |
-    ConvertTo-Json -Depth 16 |
-    Set-Content -LiteralPath $DestPath -Encoding UTF8
+  $accountJsonText = [ordered]@{ accounts = $NextAccounts.ToArray() } |
+    ConvertTo-Json -Depth 16
+  Write-Utf8NoBom $DestPath $accountJsonText
 }
 
 if ($Json) {
