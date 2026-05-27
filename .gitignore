@@ -50,4 +50,4 @@ apps/vscode-extension/*.vsix
 apps/vscode-extension/bridge/**
 !apps/vscode-extension/bridge/
 !apps/vscode-extension/bridge/README.md
-
+release/ccursor-colleague-kit/dist/
