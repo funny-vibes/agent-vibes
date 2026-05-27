@@ -2,16 +2,25 @@
 
 用途：让 Cursor 原生 Agent 通过公司 AI 中台调用模型。同事只需要本机已经有 Codex，并且 `~/.codex/config.toml` 里配置好了 `model_provider`、`base_url` 和 key。
 
-## 安装
+## macOS 安装
 
 1. 双击 `Install CCursor.command`
 2. 双击 `Open Cursor with CCursor.command`
 3. Cursor 打开后等待 10-20 秒
 4. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
 
+## Windows 安装
+
+1. 右键 `Install CCursor.ps1`，选择 `Run with PowerShell`
+2. 右键 `Open Cursor with CCursor.ps1`，选择 `Run with PowerShell`
+3. Cursor 打开后等待 10-20 秒
+4. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
+
 ## 检查
 
-双击 `Check CCursor.command`。
+macOS 双击 `Check CCursor.command`。
+
+Windows 右键 `Check CCursor.ps1`，选择 `Run with PowerShell`。
 
 检查项包括：
 

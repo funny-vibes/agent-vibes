@@ -15,6 +15,20 @@ if [[ ! -f "$VSIX" ]]; then
   exit 1
 fi
 
+VSIX_FILES="$(unzip -Z1 "$VSIX")"
+
+if ! grep -Fxq "extension/bridge/darwin-arm64/agent-vibes-bridge" <<<"$VSIX_FILES"; then
+  echo "ERROR: VSIX is missing the macOS arm64 bridge"
+  echo "Run: release/ccursor-colleague-kit/build-universal-package.sh"
+  exit 1
+fi
+
+if ! grep -Fxq "extension/bridge/win32-x64/agent-vibes-bridge.exe" <<<"$VSIX_FILES"; then
+  echo "ERROR: VSIX is missing the Windows x64 bridge"
+  echo "Run: release/ccursor-colleague-kit/build-universal-package.sh"
+  exit 1
+fi
+
 rm -rf "$PACKAGE_DIR" "$ZIP_PATH"
 mkdir -p "$PACKAGE_DIR"
 
@@ -22,9 +36,13 @@ cp "$VSIX" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Install CCursor.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor with CCursor.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Check CCursor.command" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Install CCursor.ps1" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Open Cursor with CCursor.ps1" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Check CCursor.ps1" "$PACKAGE_DIR/"
 cp "$KIT_DIR/README.md" "$PACKAGE_DIR/"
 mkdir -p "$PACKAGE_DIR/lib"
 cp "$KIT_DIR/lib/sync_codex_openai_compat.rb" "$PACKAGE_DIR/lib/"
+cp "$KIT_DIR/lib/Sync-CodexOpenAICompat.ps1" "$PACKAGE_DIR/lib/"
 
 chmod +x "$PACKAGE_DIR/Install CCursor.command" \
   "$PACKAGE_DIR/Open Cursor with CCursor.command" \

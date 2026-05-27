@@ -24,7 +24,12 @@ end
 echo
 echo "Checking installed Cursor extension..."
 if command -v cursor >/dev/null 2>&1; then
-  cursor --list-extensions | grep -q '^local-ai.ccursor$' && echo "Extension: local-ai.ccursor installed" || echo "WARN: local-ai.ccursor not listed by Cursor CLI"
+  extensions="$(cursor --list-extensions)"
+  if grep -Fxq "local-ai.ccursor" <<<"$extensions"; then
+    echo "Extension: local-ai.ccursor installed"
+  else
+    echo "WARN: local-ai.ccursor not listed by Cursor CLI"
+  fi
 else
   echo "WARN: cursor CLI not in PATH; extension list skipped"
 fi

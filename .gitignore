@@ -43,6 +43,7 @@ scripts/capture/kiro_traffic.log
 *.pem
 *.sqlite
 *.sqlite-journal
+.cache/
 
 # Extension build artifacts
 apps/vscode-extension/README.md
