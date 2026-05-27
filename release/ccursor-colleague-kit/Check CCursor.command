@@ -2,6 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CCURSOR_USER_DATA_DIR="${CCURSOR_USER_DATA_DIR:-$HOME/.cursor-ccursor-profile}"
+CCURSOR_EXTENSIONS_DIR="${CCURSOR_EXTENSIONS_DIR:-$CCURSOR_USER_DATA_DIR/extensions}"
+OFFICIAL_USER_DATA_DIR="${CURSOR_OFFICIAL_USER_DATA_DIR:-$HOME/.cursor-official-profile}"
+OFFICIAL_EXTENSIONS_DIR="${CURSOR_OFFICIAL_EXTENSIONS_DIR:-$OFFICIAL_USER_DATA_DIR/extensions}"
 
 echo "Checking Codex config..."
 ruby "$SCRIPT_DIR/lib/sync_codex_openai_compat.rb" --check-only
@@ -33,6 +37,25 @@ if command -v cursor >/dev/null 2>&1; then
 else
   echo "WARN: cursor CLI not in PATH; extension list skipped"
 fi
+
+if command -v cursor >/dev/null 2>&1; then
+  profile_extensions="$(cursor \
+    --user-data-dir "$CCURSOR_USER_DATA_DIR" \
+    --extensions-dir "$CCURSOR_EXTENSIONS_DIR" \
+    --list-extensions 2>/dev/null || true)"
+  if grep -Fxq "local-ai.ccursor" <<<"$profile_extensions"; then
+    echo "Extension: local-ai.ccursor installed in CCursor profile"
+  else
+    echo "WARN: local-ai.ccursor not listed in CCursor profile. Rerun Install CCursor.command."
+  fi
+fi
+
+echo
+echo "Checking Cursor launch profiles..."
+echo "Official profile data: $OFFICIAL_USER_DATA_DIR"
+echo "Official profile extensions: $OFFICIAL_EXTENSIONS_DIR"
+echo "CCursor profile data: $CCURSOR_USER_DATA_DIR"
+echo "CCursor profile extensions: $CCURSOR_EXTENSIONS_DIR"
 
 echo
 echo "Checking CCursor bridge..."

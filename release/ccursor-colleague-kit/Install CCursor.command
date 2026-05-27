@@ -21,11 +21,23 @@ fi
 echo "Installing CCursor extension..."
 "$CURSOR_CLI" --install-extension "$VSIX_PATH" --force
 
+CCURSOR_USER_DATA_DIR="${CCURSOR_USER_DATA_DIR:-$HOME/.cursor-ccursor-profile}"
+CCURSOR_EXTENSIONS_DIR="${CCURSOR_EXTENSIONS_DIR:-$CCURSOR_USER_DATA_DIR/extensions}"
+mkdir -p "$CCURSOR_USER_DATA_DIR" "$CCURSOR_EXTENSIONS_DIR"
+
+echo "Installing CCursor extension into isolated CCursor profile..."
+"$CURSOR_CLI" \
+  --user-data-dir "$CCURSOR_USER_DATA_DIR" \
+  --extensions-dir "$CCURSOR_EXTENSIONS_DIR" \
+  --install-extension "$VSIX_PATH" \
+  --force
+
 echo
 echo "Reading Codex config and writing CCursor OpenAI-compatible account..."
 ruby "$SCRIPT_DIR/lib/sync_codex_openai_compat.rb"
 
 echo
 echo "Install finished."
-echo "Next: double-click 'Open Cursor with CCursor.command'."
-
+echo "Next:"
+echo "  - double-click 'Open Cursor Official.command' for Cursor official models"
+echo "  - double-click 'Open Cursor with CCursor.command' for your AI gateway"

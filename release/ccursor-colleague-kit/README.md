@@ -2,19 +2,37 @@
 
 用途：让 Cursor 原生 Agent 通过公司 AI 中台调用模型。同事只需要本机已经有 Codex，并且 `~/.codex/config.toml` 里配置好了 `model_provider`、`base_url` 和 key。
 
+这个包提供两个入口：
+
+- `Open Cursor Official`：不走 CCursor 代理，使用 Cursor 官方账号和官方模型。
+- `Open Cursor with CCursor`：走本机 CCursor 代理，使用 Codex 配置里的 AI 中台。
+
+两个入口使用独立 Cursor profile，避免官方模型、AI 中台、扩展和登录态互相污染。
+
 ## macOS 安装
 
 1. 双击 `Install CCursor.command`
-2. 双击 `Open Cursor with CCursor.command`
-3. Cursor 打开后等待 10-20 秒
-4. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
+2. 使用官方模型时，双击 `Open Cursor Official.command`
+3. 使用 AI 中台时，双击 `Open Cursor with CCursor.command`
+4. CCursor 窗口打开后等待 10-20 秒
+5. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
 
 ## Windows 安装
 
 1. 右键 `Install CCursor.ps1`，选择 `Run with PowerShell`
-2. 右键 `Open Cursor with CCursor.ps1`，选择 `Run with PowerShell`
-3. Cursor 打开后等待 10-20 秒
-4. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
+2. 使用官方模型时，右键 `Open Cursor Official.ps1`，选择 `Run with PowerShell`
+3. 使用 AI 中台时，右键 `Open Cursor with CCursor.ps1`，选择 `Run with PowerShell`
+4. CCursor 窗口打开后等待 10-20 秒
+5. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
+
+## 如何同时使用官方模型和 AI 中台
+
+同时打开两个窗口即可：
+
+- 官方窗口：从 `Open Cursor Official` 启动。这里使用 Cursor 官方模型。
+- 中台窗口：从 `Open Cursor with CCursor` 启动。这里使用你的 AI 中台模型。
+
+不要用同一个 Cursor 窗口来回切。当前 CCursor 实现是在启动时给整个 Cursor 进程挂本地代理，所以同一实例内不适合同时混用官方链路和中台链路。
 
 ## 检查
 
@@ -26,7 +44,7 @@ Windows 右键 `Check CCursor.ps1`，选择 `Run with PowerShell`。
 
 - 是否能读取 `~/.codex/config.toml`
 - 是否已写入 `~/.ccursor/data/openai-compat-accounts.json`
-- Cursor 是否已安装 `local-ai.ccursor`
+- 默认 Cursor 和隔离 CCursor profile 是否已安装 `local-ai.ccursor`
 - CCursor bridge 是否在 `https://localhost:2026` 正常运行
 - Cursor 代理 `http://127.0.0.1:18080` 是否可达
 
@@ -56,5 +74,6 @@ experimental_bearer_token = "..."
 ## 常见处理
 
 - 如果 macOS 阻止打开 `.command`，右键点击文件，选择打开。
-- 如果检查显示 bridge 未启动，先用 `Open Cursor with CCursor.command` 打开 Cursor，再等 10-20 秒。
-- 如果 Cursor 里仍然连接失败，完整退出 Cursor 后重新用 `Open Cursor with CCursor.command` 打开。
+- 如果检查显示 bridge 未启动，先用 `Open Cursor with CCursor` 打开 Cursor，再等 10-20 秒。
+- 如果 Cursor 里仍然连接失败，完整退出 CCursor profile 窗口后重新用 `Open Cursor with CCursor` 打开。
+- 如果需要 Cursor 官方模型，用 `Open Cursor Official`，不要从 CCursor 窗口里切回官方模型。

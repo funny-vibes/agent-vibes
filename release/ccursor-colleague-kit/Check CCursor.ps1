@@ -1,6 +1,26 @@
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$CCursorUserDataDir = if ($env:CCURSOR_USER_DATA_DIR) {
+  $env:CCURSOR_USER_DATA_DIR
+} else {
+  Join-Path $HOME ".cursor-ccursor-profile"
+}
+$CCursorExtensionsDir = if ($env:CCURSOR_EXTENSIONS_DIR) {
+  $env:CCURSOR_EXTENSIONS_DIR
+} else {
+  Join-Path $CCursorUserDataDir "extensions"
+}
+$OfficialUserDataDir = if ($env:CURSOR_OFFICIAL_USER_DATA_DIR) {
+  $env:CURSOR_OFFICIAL_USER_DATA_DIR
+} else {
+  Join-Path $HOME ".cursor-official-profile"
+}
+$OfficialExtensionsDir = if ($env:CURSOR_OFFICIAL_EXTENSIONS_DIR) {
+  $env:CURSOR_OFFICIAL_EXTENSIONS_DIR
+} else {
+  Join-Path $OfficialUserDataDir "extensions"
+}
 
 Write-Host "Checking Codex config..."
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "lib\Sync-CodexOpenAICompat.ps1") -CheckOnly
@@ -45,6 +65,22 @@ if ($CursorCli) {
 } else {
   Write-Host "WARN: cursor CLI not in PATH; extension list skipped"
 }
+
+if ($CursorCli) {
+  $profileExtensions = & $CursorCli.Source --user-data-dir $CCursorUserDataDir --extensions-dir $CCursorExtensionsDir --list-extensions 2>$null
+  if ($profileExtensions -match '^local-ai\.ccursor$') {
+    Write-Host "Extension: local-ai.ccursor installed in CCursor profile"
+  } else {
+    Write-Host "WARN: local-ai.ccursor not listed in CCursor profile. Rerun Install CCursor.ps1."
+  }
+}
+
+Write-Host ""
+Write-Host "Checking Cursor launch profiles..."
+Write-Host "Official profile data: $OfficialUserDataDir"
+Write-Host "Official profile extensions: $OfficialExtensionsDir"
+Write-Host "CCursor profile data: $CCursorUserDataDir"
+Write-Host "CCursor profile extensions: $CCursorExtensionsDir"
 
 Write-Host ""
 Write-Host "Checking CCursor bridge..."

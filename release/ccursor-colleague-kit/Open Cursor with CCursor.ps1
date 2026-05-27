@@ -1,6 +1,17 @@
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$CCursorUserDataDir = if ($env:CCURSOR_USER_DATA_DIR) {
+  $env:CCURSOR_USER_DATA_DIR
+} else {
+  Join-Path $HOME ".cursor-ccursor-profile"
+}
+$CCursorExtensionsDir = if ($env:CCURSOR_EXTENSIONS_DIR) {
+  $env:CCURSOR_EXTENSIONS_DIR
+} else {
+  Join-Path $CCursorUserDataDir "extensions"
+}
+New-Item -ItemType Directory -Force -Path $CCursorUserDataDir, $CCursorExtensionsDir | Out-Null
 
 function Find-CursorExe {
   $candidates = @(
@@ -33,9 +44,11 @@ $CursorExe = Find-CursorExe
 Write-Host ""
 Write-Host "Opening Cursor through CCursor local proxy..."
 Start-Process -FilePath $CursorExe -ArgumentList @(
+  "--user-data-dir=$CCursorUserDataDir",
+  "--extensions-dir=$CCursorExtensionsDir",
   "--proxy-server=http://127.0.0.1:18080",
   "--ignore-certificate-errors"
 )
 
 Write-Host ""
-Write-Host "Cursor is starting. Wait 10-20 seconds, then run 'Check CCursor.ps1' if needed."
+Write-Host "Cursor CCursor profile is starting. Wait 10-20 seconds, then run 'Check CCursor.ps1' if needed."
