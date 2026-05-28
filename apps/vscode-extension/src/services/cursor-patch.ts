@@ -26,6 +26,14 @@ const TRANSPORT_PATCHES: PatchRule[] = [
     replace:
       'fl.registerCommand("workbench.action.chat.open",async(n,e)=>{const t=n.get(w_),i=n.get(eP),r=n.get(uI),l=n.get(mW),s=typeof e=="string"?e:e?.query,o=typeof e=="object"&&e?.ccursorAutoSubmit===!0,a=typeof e=="object"&&e?.ccursorAutoSubmitMode?e.ccursorAutoSubmitMode:"agent",u=typeof e=="object"&&typeof e?.ccursorAutoSubmitDelayMs=="number"?e.ccursorAutoSubmitDelayMs:3000,d=s?{text:s,richText:s}:void 0;if(o&&d)d.unifiedMode=a,d.analyticsMetadata={source:"ccursor-chat-open-autosubmit"};const h=await t.createComposer({unifiedMode:o?a:void 0,partialState:d,openInNewTab:!0});if(!h){console.error("[composer] Failed to create composer for workbench.action.chat.open");return}const f=h.composerId;s&&r.fireShouldForceText({composerId:f}),await i.showAndFocus(f);if(o&&s&&s.trim().length>0){await new Promise(c=>setTimeout(c,u));console.warn("[CCURSOR_CHAT_OPEN_AUTOSUBMIT]",JSON.stringify({composerId:f,textLength:s.length,mode:a,delayMs:u}));await l.submitChatMaybeAbortCurrent(f,s,{skipClearInput:!0});console.warn("[CCURSOR_CHAT_OPEN_AUTOSUBMITTED]",JSON.stringify({composerId:f}))}return{composerId:f,textLength:s?.length??0,autoSubmitted:o,autoSubmitDelayMs:o?u:void 0}}),Nn(HcS);',
     marker: "[CCURSOR_CHAT_OPEN_AUTOSUBMIT]",
+    optional: true,
+  },
+  {
+    name: "Cursor Agent Chat Open Auto Submit (Cursor 3.5)",
+    find: /pl\.registerCommand\("workbench\.action\.chat\.open",async\(n,e\)=>\{const t=n\.get\(h_\),i=n\.get\(eP\),r=n\.get\(dI\),s=typeof e=="string"\?e:e\?\.query,[\s\S]*?\}\),Dn\(TuS\);/,
+    replace:
+      'pl.registerCommand("workbench.action.chat.open",async(n,e)=>{const t=n.get(h_),i=n.get(eP),r=n.get(dI),l=n.get(fW),s=typeof e=="string"?e:e?.query,o=typeof e=="object"&&e?.ccursorAutoSubmit===!0,a=typeof e=="object"&&e?.ccursorAutoSubmitMode?e.ccursorAutoSubmitMode:"agent",u=typeof e=="object"&&typeof e?.ccursorAutoSubmitDelayMs=="number"?e.ccursorAutoSubmitDelayMs:3000,d=s?{text:s,richText:s}:void 0;if(o&&d)d.unifiedMode=a,d.analyticsMetadata={source:"ccursor-chat-open-autosubmit"};const h=await t.createComposer({unifiedMode:o?a:void 0,partialState:d,openInNewTab:!0});if(!h){console.error("[composer] Failed to create composer for workbench.action.chat.open");return}const p=h.composerId;s&&r.fireShouldForceText({composerId:p}),await i.showAndFocus(p);if(o&&s&&s.trim().length>0){await new Promise(g=>setTimeout(g,u));console.warn("[CCURSOR_CHAT_OPEN_AUTOSUBMIT]",JSON.stringify({composerId:p,textLength:s.length,mode:a,delayMs:u}));await l.submitChatMaybeAbortCurrent(p,s,{skipClearInput:!0});console.warn("[CCURSOR_CHAT_OPEN_AUTOSUBMITTED]",JSON.stringify({composerId:p}))}return{composerId:p,textLength:s?.length??0,autoSubmitted:o,autoSubmitDelayMs:o?u:void 0}}),Dn(TuS);',
+    marker: "[CCURSOR_CHAT_OPEN_AUTOSUBMIT]",
   },
   {
     name: "Transport Request Initiation",

@@ -87,11 +87,21 @@ export function getAntigravityIDEDataDir(): string {
 
 /** Returns candidate paths for Cursor IDE workbench file */
 export function getCursorWorkbenchPath(): string | null {
-  const suffix = path.join(
+  const modernSuffix = path.join(
     "Resources",
     "app",
     "out",
     "vs",
+    "workbench",
+    "workbench.desktop.main.js"
+  )
+  const legacySuffix = path.join(
+    "Resources",
+    "app",
+    "out",
+    "vs",
+    "code",
+    "electron-sandbox",
     "workbench",
     "workbench.desktop.main.js"
   )
@@ -100,21 +110,40 @@ export function getCursorWorkbenchPath(): string | null {
 
   if (process.platform === "darwin") {
     candidates.push(
-      path.join("/Applications/Cursor.app/Contents", suffix),
-      path.join(os.homedir(), "Applications", "Cursor.app", "Contents", suffix)
+      path.join("/Applications/Cursor.app/Contents", modernSuffix),
+      path.join("/Applications/Cursor.app/Contents", legacySuffix),
+      path.join(
+        os.homedir(),
+        "Applications",
+        "Cursor.app",
+        "Contents",
+        modernSuffix
+      ),
+      path.join(
+        os.homedir(),
+        "Applications",
+        "Cursor.app",
+        "Contents",
+        legacySuffix
+      )
     )
   } else if (process.platform === "linux") {
     candidates.push(
-      path.join("/usr/share/cursor", suffix),
-      path.join("/opt/cursor", suffix),
-      path.join(os.homedir(), ".local", "share", "cursor", suffix)
+      path.join("/usr/share/cursor", modernSuffix),
+      path.join("/usr/share/cursor", legacySuffix),
+      path.join("/opt/cursor", modernSuffix),
+      path.join("/opt/cursor", legacySuffix),
+      path.join(os.homedir(), ".local", "share", "cursor", modernSuffix),
+      path.join(os.homedir(), ".local", "share", "cursor", legacySuffix)
     )
   } else if (process.platform === "win32") {
     const localAppData =
       process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local")
     candidates.push(
-      path.join(localAppData, "Programs", "cursor", suffix),
-      path.join(localAppData, "cursor", suffix)
+      path.join(localAppData, "Programs", "cursor", modernSuffix),
+      path.join(localAppData, "Programs", "cursor", legacySuffix),
+      path.join(localAppData, "cursor", modernSuffix),
+      path.join(localAppData, "cursor", legacySuffix)
     )
   }
 

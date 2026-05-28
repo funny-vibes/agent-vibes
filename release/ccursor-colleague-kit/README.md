@@ -7,7 +7,7 @@
 这个包提供两个入口：
 
 - `Open Cursor Official`：不走 CCursor 代理，使用 Cursor 官方账号和官方模型。
-- `Open Cursor with CCursor`：走本机 CCursor 代理，使用 Codex 配置里的 AI 中台。
+- `CCursor.app`：走本机 CCursor 代理，使用 Codex 配置里的 AI 中台。
 
 两个入口使用独立 Cursor profile，避免官方模型、AI 中台、扩展和登录态互相污染。
 
@@ -15,9 +15,9 @@
 
 1. 双击 `Install CCursor.command`
 2. 使用官方模型时，双击 `Open Cursor Official.command`
-3. 使用 AI 中台时，双击 `Open Cursor with CCursor.command`
+3. 使用 AI 中台时，双击 `CCursor.app`
 4. 启动器会先确认本机 bridge 健康，再打开 Cursor
-5. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
+5. 在 Cursor Agent 里选择 `Touka GPT-5.5`，发起一次真实任务测试
 
 ## Windows 安装
 
@@ -32,7 +32,7 @@
 同时打开两个窗口即可：
 
 - 官方窗口：从 `Open Cursor Official` 启动。这里使用 Cursor 官方模型。
-- 中台窗口：从 `Open Cursor with CCursor` 启动。这里使用你的 AI 中台模型。
+- 中台窗口：从 `CCursor.app` 启动。这里使用你的 AI 中台模型。
 
 不要用同一个 Cursor 窗口来回切。当前 CCursor 实现是在启动时给整个 Cursor 进程挂本地代理，所以同一实例内不适合同时混用官方链路和中台链路。
 
@@ -77,6 +77,8 @@ experimental_bearer_token = "..."
 ## 常见处理
 
 - 如果 macOS 阻止打开 `.command`，右键点击文件，选择打开。
-- 如果检查显示 bridge 未启动，重新运行 `Open Cursor with CCursor`；启动器会先尝试拉起 bridge。
-- 如果 Cursor 里仍然连接失败，完整退出 CCursor profile 窗口后重新用 `Open Cursor with CCursor` 打开。
+- 如果 `CCursor.app` 不存在，重新双击 `Install CCursor.command`，或双击 `Create CCursor App.command`。
+- 如果检查显示 bridge 未启动，重新运行 `CCursor.app`；启动器会先尝试拉起 bridge。
+- 如果 Cursor 里仍然连接失败，完整退出 CCursor profile 窗口后重新用 `CCursor.app` 打开。
+- 不要把 `Open Cursor with CCursor.command` 拖进 Cursor 或用 Cursor 打开；那会变成编辑脚本文件，不会启动 AI 中台窗口。
 - 如果需要 Cursor 官方模型，用 `Open Cursor Official`，不要从 CCursor 窗口里切回官方模型。

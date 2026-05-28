@@ -34,6 +34,7 @@ mkdir -p "$PACKAGE_DIR"
 
 cp "$VSIX" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Install CCursor.command" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Create CCursor App.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor Official.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor with CCursor.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Check CCursor.command" "$PACKAGE_DIR/"
@@ -47,10 +48,16 @@ cp "$KIT_DIR/lib/sync_codex_openai_compat.rb" "$PACKAGE_DIR/lib/"
 cp "$KIT_DIR/lib/Sync-CodexOpenAICompat.ps1" "$PACKAGE_DIR/lib/"
 
 chmod +x "$PACKAGE_DIR/Install CCursor.command" \
+  "$PACKAGE_DIR/Create CCursor App.command" \
   "$PACKAGE_DIR/Open Cursor Official.command" \
   "$PACKAGE_DIR/Open Cursor with CCursor.command" \
   "$PACKAGE_DIR/Check CCursor.command" \
   "$PACKAGE_DIR/lib/sync_codex_openai_compat.rb"
+
+(
+  cd "$PACKAGE_DIR"
+  ./Create\ CCursor\ App.command >/dev/null
+)
 
 (cd "$DIST_DIR" && zip -qr "$(basename "$ZIP_PATH")" "$(basename "$PACKAGE_DIR")")
 

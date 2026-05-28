@@ -37,7 +37,11 @@ echo "Reading Codex config and writing CCursor OpenAI-compatible account..."
 ruby "$SCRIPT_DIR/lib/sync_codex_openai_compat.rb"
 
 echo
+echo "Creating CCursor.app launcher..."
+"$SCRIPT_DIR/Create CCursor App.command"
+
+echo
 echo "Install finished."
 echo "Next:"
 echo "  - double-click 'Open Cursor Official.command' for Cursor official models"
-echo "  - double-click 'Open Cursor with CCursor.command' for your AI gateway"
+echo "  - double-click 'CCursor.app' for your AI gateway"
