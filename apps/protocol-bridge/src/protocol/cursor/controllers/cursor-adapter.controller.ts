@@ -52,6 +52,7 @@ import { connectRPCHandler } from "../connect-rpc-handler"
 import { CursorConnectStreamService } from "../cursor-connect-stream.service"
 import {
   appendRequestedCursorModels,
+  applyGptModelDisplayPrefix,
   buildCursorUsableModel,
 } from "../cursor-model-protocol"
 import { KvStorageService } from "../kv-storage.service"
@@ -99,6 +100,12 @@ export class CursorAdapterController {
     return this.codexService.getModelTier()
   }
 
+  private getGptModelDisplayPrefix(): string | null {
+    return this.openaiCompatService.isAvailable()
+      ? this.openaiCompatService.getDisplaySourceLabel()
+      : null
+  }
+
   private isCursorModelCurrentlyRoutable(modelId: string): boolean {
     // Kiro dynamically discovered models are always routable when Kiro is available.
     if (this.kiroService.supportsModel(modelId)) {
@@ -134,13 +141,16 @@ export class CursorAdapterController {
   }
 
   private buildCursorModels(customModelIds?: string[]) {
-    return appendRequestedCursorModels(
-      getCursorDisplayModels({
-        includeCodex: this.isGptBackendAvailable(),
-        codexModelTier: this.getCursorGptModelTier(),
-        extraModels: this.anthropicApiService.getCursorDisplayModels(),
-      }),
-      customModelIds
+    return applyGptModelDisplayPrefix(
+      appendRequestedCursorModels(
+        getCursorDisplayModels({
+          includeCodex: this.isGptBackendAvailable(),
+          codexModelTier: this.getCursorGptModelTier(),
+          extraModels: this.anthropicApiService.getCursorDisplayModels(),
+        }),
+        customModelIds
+      ),
+      this.getGptModelDisplayPrefix()
     ).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
   }
 

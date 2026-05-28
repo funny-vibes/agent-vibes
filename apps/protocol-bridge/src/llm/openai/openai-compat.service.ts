@@ -391,6 +391,8 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   proxyUrl?: string
   preferResponsesApi?: boolean
   maxContextTokens?: number
+  sourceProvider?: string
+  sourceModel?: string
   source: "env" | "file"
   stateKey: string
 }
@@ -404,6 +406,8 @@ interface OpenaiCompatAccountFileEntry {
   proxyUrl?: string
   preferResponsesApi?: boolean
   maxContextTokens?: number
+  sourceProvider?: string
+  sourceModel?: string
 }
 
 interface OpenaiCompatConfigFile {
@@ -484,6 +488,8 @@ export class OpenaiCompatService implements OnModuleInit {
     proxyUrl?: string
     preferResponsesApi?: boolean
     maxContextTokens?: number
+    sourceProvider?: string
+    sourceModel?: string
     source: "env" | "file"
   }): OpenaiCompatAccount {
     return {
@@ -493,6 +499,8 @@ export class OpenaiCompatService implements OnModuleInit {
       proxyUrl: params.proxyUrl,
       preferResponsesApi: params.preferResponsesApi,
       maxContextTokens: this.normalizeMaxContextTokens(params.maxContextTokens),
+      sourceProvider: params.sourceProvider,
+      sourceModel: params.sourceModel,
       source: params.source,
       stateKey: this.buildAccountStateKey(params.apiKey, params.baseUrl),
       cooldownUntil: 0,
@@ -981,6 +989,8 @@ export class OpenaiCompatService implements OnModuleInit {
                 proxyUrl: a.proxyUrl,
                 preferResponsesApi: a.preferResponsesApi === true,
                 maxContextTokens: a.maxContextTokens,
+                sourceProvider: a.sourceProvider,
+                sourceModel: a.sourceModel,
                 source: "file",
               })
             )
@@ -1141,6 +1151,37 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   checkAvailability(): Promise<boolean> {
     return Promise.resolve(this.isAvailable())
+  }
+
+  getDisplaySourceLabel(): string | null {
+    const account =
+      this.accounts.find(
+        (item) => !isAccountDisabled(item) && !!item.sourceProvider?.trim()
+      ) ||
+      this.accounts.find((item) => !isAccountDisabled(item)) ||
+      this.accounts[0]
+    const rawLabel =
+      account?.sourceProvider?.trim() || account?.label?.trim() || ""
+    if (!rawLabel) {
+      return null
+    }
+
+    const normalized = rawLabel.toLowerCase()
+    if (normalized.includes("touka")) {
+      return "Touka"
+    }
+    if (normalized.includes("skylink")) {
+      return "Skylink"
+    }
+    if (normalized.startsWith("codex-")) {
+      return rawLabel.slice("codex-".length).toUpperCase()
+    }
+
+    return rawLabel
+      .split(/[-_\s]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ")
   }
 
   getPoolStatus(): BackendPoolStatus {

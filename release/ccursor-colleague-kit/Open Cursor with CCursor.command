@@ -29,6 +29,31 @@ proxy_health() {
     "https://api2.cursor.sh/health" >/dev/null 2>&1
 }
 
+focus_ccursor_window() {
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    local pid
+    pid="$(pgrep -f "Cursor.*--user-data-dir=${CCURSOR_USER_DATA_DIR}.*--proxy-server=http://127.0.0.1:${CCURSOR_FORWARD_PROXY_PORT}" | head -n 1 || true)"
+    if [[ -n "$pid" ]]; then
+      osascript - "$pid" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  tell application "System Events"
+    set targetPid to item 1 of argv as integer
+    repeat with proc in (every process whose unix id is targetPid)
+      set frontmost of proc to true
+      if (count of windows of proc) > 0 then
+        perform action "AXRaise" of window 1 of proc
+      end if
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+      return
+    fi
+    sleep 1
+  done
+}
+
 runtime_ready() {
   bridge_health && proxy_health
 }
@@ -150,11 +175,23 @@ ensure_bridge_running
 
 echo
 echo "Opening Cursor through CCursor local proxy..."
-open -na "$CURSOR_APP" --args \
-  --user-data-dir="$CCURSOR_USER_DATA_DIR" \
-  --extensions-dir="$CCURSOR_EXTENSIONS_DIR" \
-  --proxy-server="http://127.0.0.1:${CCURSOR_FORWARD_PROXY_PORT}" \
+cursor_args=(
+  --user-data-dir="$CCURSOR_USER_DATA_DIR"
+  --extensions-dir="$CCURSOR_EXTENSIONS_DIR"
+  --proxy-server="http://127.0.0.1:${CCURSOR_FORWARD_PROXY_PORT}"
   --ignore-certificate-errors
+)
+
+if (( $# > 0 )); then
+  cursor_args+=("$@")
+else
+  echo "Tip: drag a project folder onto this launcher to open it in the AI gateway window."
+fi
+
+open -na "$CURSOR_APP" --args "${cursor_args[@]}"
+
+focus_ccursor_window
 
 echo
-echo "Cursor CCursor profile is starting. Run 'Check CCursor.command' if needed."
+echo "Cursor CCursor profile is starting. This is the AI gateway window."
+echo "Run 'Check CCursor.command' if needed."

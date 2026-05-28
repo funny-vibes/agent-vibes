@@ -96,6 +96,7 @@ import { ModelRouterService } from "../../../llm/shared/model-router.service"
 import { connectRPCHandler } from "../connect-rpc-handler"
 import {
   appendRequestedCursorModels,
+  applyGptModelDisplayPrefix,
   buildCursorAvailableModel,
   buildCursorModelLabel,
   buildCursorUsableModel,
@@ -290,6 +291,12 @@ export class AiserverMockController {
     return this.codexService.getModelTier()
   }
 
+  private getGptModelDisplayPrefix(): string | null {
+    return this.openaiCompatService.isAvailable()
+      ? this.openaiCompatService.getDisplaySourceLabel()
+      : null
+  }
+
   private isCursorModelCurrentlyRoutable(modelId: string): boolean {
     // Kiro dynamically discovered models are always routable when Kiro is available.
     if (this.kiroService.supportsModel(modelId)) {
@@ -405,14 +412,17 @@ export class AiserverMockController {
     includeLongContextModels?: boolean
     forAutomations?: boolean
   }) {
-    let models = appendRequestedCursorModels(
-      getCursorDisplayModels({
-        includeCodex: this.isGptBackendAvailable(),
-        codexModelTier: this.getCursorGptModelTier(),
-        excludeMaxNamedModels: options?.excludeMaxNamedModels ?? false,
-        extraModels: this.anthropicApiService.getCursorDisplayModels(),
-      }),
-      options?.additionalModelNames
+    let models = applyGptModelDisplayPrefix(
+      appendRequestedCursorModels(
+        getCursorDisplayModels({
+          includeCodex: this.isGptBackendAvailable(),
+          codexModelTier: this.getCursorGptModelTier(),
+          excludeMaxNamedModels: options?.excludeMaxNamedModels ?? false,
+          extraModels: this.anthropicApiService.getCursorDisplayModels(),
+        }),
+        options?.additionalModelNames
+      ),
+      this.getGptModelDisplayPrefix()
     )
 
     if (!options?.includeHiddenModels) {

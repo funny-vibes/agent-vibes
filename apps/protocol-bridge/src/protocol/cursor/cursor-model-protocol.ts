@@ -1192,6 +1192,34 @@ export function appendRequestedCursorModels(
   return merged
 }
 
+export function applyGptModelDisplayPrefix(
+  models: readonly CursorDisplayModel[],
+  prefix?: string | null
+): CursorDisplayModel[] {
+  const normalizedPrefix = prefix?.trim()
+  if (!normalizedPrefix) {
+    return [...models]
+  }
+
+  return models.map((model) => {
+    if (model.family !== "gpt") {
+      return model
+    }
+    if (
+      model.displayName.startsWith(`${normalizedPrefix} `) &&
+      model.shortName.startsWith(`${normalizedPrefix} `)
+    ) {
+      return model
+    }
+
+    return {
+      ...model,
+      displayName: `${normalizedPrefix} ${model.displayName}`,
+      shortName: `${normalizedPrefix} ${model.shortName}`,
+    }
+  })
+}
+
 export function buildCursorAvailableModel(
   model: CursorDisplayModel,
   namedModelSectionIndex: number,

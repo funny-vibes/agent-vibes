@@ -1,3 +1,8 @@
+param(
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$Paths
+)
+
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -153,12 +158,19 @@ Ensure-BridgeRunning
 
 Write-Host ""
 Write-Host "Opening Cursor through CCursor local proxy..."
-Start-Process -FilePath $CursorExe -ArgumentList @(
+$cursorArgs = @(
   "--user-data-dir=$CCursorUserDataDir",
   "--extensions-dir=$CCursorExtensionsDir",
   "--proxy-server=http://127.0.0.1:$CCursorForwardProxyPort",
   "--ignore-certificate-errors"
 )
+if ($Paths -and $Paths.Count -gt 0) {
+  $cursorArgs += $Paths
+} else {
+  Write-Host "Tip: pass a project folder path to this script to open it in the AI gateway window."
+}
+Start-Process -FilePath $CursorExe -ArgumentList $cursorArgs
 
 Write-Host ""
-Write-Host "Cursor CCursor profile is starting. Run 'Check CCursor.ps1' if needed."
+Write-Host "Cursor CCursor profile is starting. This is the AI gateway window."
+Write-Host "Run 'Check CCursor.ps1' if needed."
