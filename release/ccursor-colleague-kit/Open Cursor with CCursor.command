@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURSOR_APP="/Applications/Cursor.app"
+CURSOR_BIN="$CURSOR_APP/Contents/MacOS/Cursor"
 CCURSOR_HOME="${CCURSOR_HOME:-$HOME/.ccursor}"
 CCURSOR_USER_DATA_DIR="${CCURSOR_USER_DATA_DIR:-$HOME/.cursor-ccursor-profile}"
 CCURSOR_EXTENSIONS_DIR="${CCURSOR_EXTENSIONS_DIR:-$CCURSOR_USER_DATA_DIR/extensions}"
@@ -10,9 +11,17 @@ CCURSOR_BRIDGE_PORT="${CCURSOR_BRIDGE_PORT:-2026}"
 CCURSOR_FORWARD_PROXY_PORT="${CCURSOR_FORWARD_PROXY_PORT:-18080}"
 BRIDGE_LOG_PATH="${TMPDIR:-/tmp}/agent-vibes-bridge.log"
 BRIDGE_PLIST_PATH="$HOME/Library/LaunchAgents/com.ccursor.bridge.plist"
+FORWARDING_SCRIPT="$SCRIPT_DIR/scripts/setup-forwarding.js"
+if [[ ! -f "$FORWARDING_SCRIPT" && -f "$SCRIPT_DIR/../../apps/vscode-extension/scripts/setup-forwarding.js" ]]; then
+  FORWARDING_SCRIPT="$(cd "$SCRIPT_DIR/../.." && pwd)/apps/vscode-extension/scripts/setup-forwarding.js"
+fi
 
 if [[ ! -d "$CURSOR_APP" ]]; then
   echo "ERROR: Cursor.app not found at $CURSOR_APP"
+  exit 1
+fi
+if [[ ! -x "$CURSOR_BIN" ]]; then
+  echo "ERROR: Cursor binary not found at $CURSOR_BIN"
   exit 1
 fi
 
@@ -56,6 +65,11 @@ APPLESCRIPT
 
 runtime_ready() {
   bridge_health && proxy_health
+}
+
+forwarding_ready() {
+  [[ -f "$FORWARDING_SCRIPT" ]] || return 1
+  node "$FORWARDING_SCRIPT" status --port="$CCURSOR_BRIDGE_PORT" --json >/tmp/ccursor-forwarding-status.json 2>/dev/null
 }
 
 find_bridge_binary() {
@@ -174,12 +188,24 @@ echo
 ensure_bridge_running
 
 echo
+if forwarding_ready; then
+  echo "CCursor system forwarding: active"
+else
+  echo "WARN: CCursor system forwarding is not active."
+  echo "WARN: Cursor Agent may bypass the local proxy and use Cursor official servers."
+  echo "WARN: Run 'Enable CCursor Forwarding.command' once, then reopen this launcher."
+fi
+
+echo
 echo "Opening Cursor through CCursor local proxy..."
+proxy_url="http://127.0.0.1:${CCURSOR_FORWARD_PROXY_PORT}"
+no_proxy_value="localhost,127.0.0.1,::1"
 cursor_args=(
   --user-data-dir="$CCURSOR_USER_DATA_DIR"
   --extensions-dir="$CCURSOR_EXTENSIONS_DIR"
   --proxy-server="http://127.0.0.1:${CCURSOR_FORWARD_PROXY_PORT}"
   --ignore-certificate-errors
+  --new-window
 )
 
 if (( $# > 0 )); then
@@ -188,8 +214,18 @@ else
   echo "Tip: drag a project folder onto this launcher to open it in the AI gateway window."
 fi
 
-open -na "$CURSOR_APP" --args "${cursor_args[@]}"
+open -n -a "$CURSOR_APP" \
+  --env "HTTP_PROXY=$proxy_url" \
+  --env "HTTPS_PROXY=$proxy_url" \
+  --env "ALL_PROXY=$proxy_url" \
+  --env "http_proxy=$proxy_url" \
+  --env "https_proxy=$proxy_url" \
+  --env "all_proxy=$proxy_url" \
+  --env "NO_PROXY=$no_proxy_value" \
+  --env "no_proxy=$no_proxy_value" \
+  --args "${cursor_args[@]}"
 
+sleep 2
 focus_ccursor_window
 
 echo

@@ -1096,6 +1096,7 @@ async function getStatusPayload() {
 async function printStatusJson() {
   const payload = await getStatusPayload()
   console.log(JSON.stringify(payload, null, 2))
+  process.exit(payload.ok ? 0 : 2)
 }
 
 // ---------------------------------------------------------------------------

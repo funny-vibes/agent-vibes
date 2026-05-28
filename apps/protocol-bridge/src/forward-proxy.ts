@@ -1,5 +1,8 @@
 import { Logger } from "@nestjs/common"
+import * as fs from "fs"
 import * as net from "net"
+import * as os from "os"
+import * as path from "path"
 
 /**
  * HTTP forward proxy used to redirect Cursor agent traffic from a remote
@@ -70,6 +73,8 @@ export interface ForwardProxyOptions {
   maxRequestLineBytes?: number
   /** Idle timeout for the initial CONNECT handshake (ms). */
   handshakeTimeoutMs?: number
+  /** JSONL trace file for proxy routing diagnostics. */
+  traceFile?: string
 }
 
 /**
@@ -173,15 +178,25 @@ export class ForwardProxyServer {
   private readonly logger = new Logger(ForwardProxyServer.name)
   private readonly server: net.Server
   private readonly options: Required<ForwardProxyOptions>
+  private readonly traceFile: string
 
   constructor(options: ForwardProxyOptions) {
+    const defaultLogDir =
+      process.env.AGENT_VIBES_LOG_DIR ||
+      path.join(os.tmpdir(), "agent-vibes-logs")
+
     this.options = {
       port: options.port ?? 18080,
       bridgePort: options.bridgePort,
       bindHost: options.bindHost ?? "127.0.0.1",
       maxRequestLineBytes: options.maxRequestLineBytes ?? 16 * 1024,
       handshakeTimeoutMs: options.handshakeTimeoutMs ?? 15_000,
+      traceFile:
+        options.traceFile ||
+        process.env.FORWARD_PROXY_TRACE_FILE ||
+        path.join(defaultLogDir, "forward_proxy_trace.jsonl"),
     }
+    this.traceFile = this.options.traceFile
 
     this.server = net.createServer((socket) => this.handleConnection(socket))
     this.server.on("error", (err) => {
@@ -189,6 +204,19 @@ export class ForwardProxyServer {
         `Forward proxy server error: ${err instanceof Error ? err.message : String(err)}`
       )
     })
+  }
+
+  private appendTrace(event: Record<string, unknown>): void {
+    try {
+      fs.mkdirSync(path.dirname(this.traceFile), { recursive: true })
+      fs.appendFileSync(
+        this.traceFile,
+        JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n",
+        "utf8"
+      )
+    } catch {
+      // Trace logging must never break proxy traffic.
+    }
   }
 
   async start(): Promise<void> {
@@ -286,10 +314,23 @@ export class ForwardProxyServer {
     const upstreamHost = targetIsCursor ? BRIDGE_HOST : request.host
     const upstreamPort = targetIsCursor ? this.options.bridgePort : request.port
 
-    this.logger.debug(
-      `CONNECT ${request.host}:${request.port} → ${upstreamHost}:${upstreamPort}` +
-        (targetIsCursor ? " (cursor splice)" : "")
-    )
+    const routeMessage =
+      `CONNECT ${request.host}:${request.port} -> ${upstreamHost}:${upstreamPort}` +
+      (targetIsCursor ? " (cursor splice)" : "")
+    this.appendTrace({
+      event: "connect",
+      host: request.host,
+      port: request.port,
+      upstreamHost,
+      upstreamPort,
+      cursorSplice: targetIsCursor,
+      clientAddress: clientSocket.remoteAddress,
+    })
+    if (targetIsCursor) {
+      this.logger.warn(routeMessage)
+    } else {
+      this.logger.debug(routeMessage)
+    }
 
     const upstream = net.createConnection(
       { host: upstreamHost, port: upstreamPort },

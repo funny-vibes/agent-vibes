@@ -1378,11 +1378,15 @@ export function buildCursorModelLabel(
       model.displayName
     ) ||
     model.shortName
+  const shortLabel =
+    model.family === "gpt" && projectedShortLabel !== model.displayName
+      ? `${model.displayName} ${projectedShortLabel}`.trim()
+      : projectedShortLabel
 
   return create(GetModelLabelsResponse_ModelLabelSchema, {
     name: model.name,
     label: model.displayName,
-    shortLabel: projectedShortLabel,
+    shortLabel,
     supportsAgent: true,
   })
 }

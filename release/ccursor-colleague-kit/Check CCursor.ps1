@@ -21,6 +21,8 @@ $OfficialExtensionsDir = if ($env:CURSOR_OFFICIAL_EXTENSIONS_DIR) {
 } else {
   Join-Path $OfficialUserDataDir "extensions"
 }
+$CCursorBridgePort = if ($env:CCURSOR_BRIDGE_PORT) { [int]$env:CCURSOR_BRIDGE_PORT } else { 2026 }
+$ForwardingScript = Join-Path $ScriptDir "scripts\setup-forwarding.js"
 
 Write-Host "Checking Codex config..."
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "lib\Sync-CodexOpenAICompat.ps1") -CheckOnly
@@ -84,6 +86,34 @@ Write-Host "Official profile data: $OfficialUserDataDir"
 Write-Host "Official profile extensions: $OfficialExtensionsDir"
 Write-Host "CCursor profile data: $CCursorUserDataDir"
 Write-Host "CCursor profile extensions: $CCursorExtensionsDir"
+
+Write-Host ""
+Write-Host "Checking CCursor system forwarding..."
+if (Test-Path -LiteralPath $ForwardingScript) {
+  $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+  if ($node) {
+    $statusOutput = & $node $ForwardingScript status "--port=$CCursorBridgePort" --json 2>$null
+    if ($statusOutput) {
+      $forwarding = ($statusOutput -join "`n") | ConvertFrom-Json
+      $checks = $forwarding.checks
+      if ($LASTEXITCODE -eq 0) {
+        Write-Host "Forwarding: active"
+      } else {
+        Write-Host "WARN: forwarding is not active"
+      }
+      Write-Host "Forwarding checks: hosts=$($checks.hosts) loopback=$($checks.loopbackAlias) backend=$($checks.backendConfigured) e2e=$($checks.endToEndReachable)"
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARN: run 'Enable CCursor Forwarding.ps1' as Administrator so Cursor Agent traffic cannot bypass the local bridge."
+      }
+    } else {
+      Write-Host "WARN: forwarding status check failed"
+    }
+  } else {
+    Write-Host "WARN: node not found; forwarding status skipped"
+  }
+} else {
+  Write-Host "WARN: forwarding script missing. Reinstall the full CCursor colleague kit."
+}
 
 Write-Host ""
 Write-Host "Checking CCursor bridge..."

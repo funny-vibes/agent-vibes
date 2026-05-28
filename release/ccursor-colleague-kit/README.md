@@ -14,18 +14,22 @@
 ## macOS 安装
 
 1. 双击 `Install CCursor.command`
-2. 使用官方模型时，双击 `Open Cursor Official.command`
-3. 使用 AI 中台时，双击 `CCursor.app`
-4. 启动器会先确认本机 bridge 健康，再打开 Cursor
-5. 在 Cursor Agent 里选择 `Touka GPT-5.5`，发起一次真实任务测试
+2. 双击 `Enable CCursor Forwarding.command`，输入一次 macOS 管理员密码
+3. 使用官方模型时，双击 `Open Cursor Official.command`
+4. 使用 AI 中台时，双击 `CCursor.app`
+5. 启动器会先确认本机 bridge/proxy 健康，再打开 Cursor
+6. 在 Cursor Agent 里选择 `Touka GPT-5.5`，发起一次真实任务测试
+
+`Enable CCursor Forwarding.command` 的作用是把 Cursor Agent 相关域名在系统层转到本机 bridge。Cursor 新版里一部分 Agent 请求可能由 extension host 直接发起，不一定遵守普通 HTTP proxy；没有这一步，模型列表可能看起来正常，但真正执行仍可能走 Cursor 官方链路。
 
 ## Windows 安装
 
 1. 右键 `Install CCursor.ps1`，选择 `Run with PowerShell`
-2. 使用官方模型时，右键 `Open Cursor Official.ps1`，选择 `Run with PowerShell`
-3. 使用 AI 中台时，右键 `Open Cursor with CCursor.ps1`，选择 `Run with PowerShell`
-4. 启动器会先确认本机 bridge 健康，再打开 Cursor
-5. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
+2. 右键 `Enable CCursor Forwarding.ps1`，选择 `Run with PowerShell`，同意管理员权限
+3. 使用官方模型时，右键 `Open Cursor Official.ps1`，选择 `Run with PowerShell`
+4. 使用 AI 中台时，右键 `Open Cursor with CCursor.ps1`，选择 `Run with PowerShell`
+5. 启动器会先确认本机 bridge/proxy 健康，再打开 Cursor
+6. 在 Cursor Agent 里选择 `gpt-5.5`，发起一次真实任务测试
 
 ## 如何同时使用官方模型和 AI 中台
 
@@ -48,6 +52,7 @@ Windows 右键 `Check CCursor.ps1`，选择 `Run with PowerShell`。
 - 是否已写入 `~/.ccursor/data/openai-compat-accounts.json`
 - CCursor 账号是否使用稳定的 Chat Completions 路径：`preferResponsesApi=false`
 - 默认 Cursor 和隔离 CCursor profile 是否已安装 `local-ai.ccursor`
+- CCursor 系统 forwarding 是否已启用，端到端是否能到本地 bridge
 - CCursor bridge 是否在 `https://localhost:2026` 正常运行
 - Cursor 代理 `http://127.0.0.1:18080` 是否可达
 
@@ -78,6 +83,7 @@ experimental_bearer_token = "..."
 
 - 如果 macOS 阻止打开 `.command`，右键点击文件，选择打开。
 - 如果 `CCursor.app` 不存在，重新双击 `Install CCursor.command`，或双击 `Create CCursor App.command`。
+- 如果检查显示 forwarding 未启用，先双击 `Enable CCursor Forwarding.command`，输入管理员密码，然后完全退出 CCursor 窗口再重新打开。
 - 如果检查显示 bridge 未启动，重新运行 `CCursor.app`；启动器会先尝试拉起 bridge。
 - 如果 Cursor 里仍然连接失败，完整退出 CCursor profile 窗口后重新用 `CCursor.app` 打开。
 - 不要把 `Open Cursor with CCursor.command` 拖进 Cursor 或用 Cursor 打开；那会变成编辑脚本文件，不会启动 AI 中台窗口。

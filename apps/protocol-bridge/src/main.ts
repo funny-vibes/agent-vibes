@@ -49,7 +49,9 @@ async function bootstrap() {
     : ["warn", "error"]
 
   // ── File Logging (debug mode only) ─────────────────────────────────
-  const logDir = path.join(os.tmpdir(), "agent-vibes-logs")
+  const logDir =
+    process.env.AGENT_VIBES_LOG_DIR ||
+    path.join(os.tmpdir(), "agent-vibes-logs")
   fs.mkdirSync(logDir, { recursive: true })
 
   const timestampForFilename = () =>

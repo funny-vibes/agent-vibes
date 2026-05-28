@@ -31,6 +31,7 @@ $CCursorForwardProxyPort = if ($env:CCURSOR_FORWARD_PROXY_PORT) {
 } else {
   18080
 }
+$ForwardingScript = Join-Path $ScriptDir "scripts\setup-forwarding.js"
 New-Item -ItemType Directory -Force -Path $CCursorUserDataDir, $CCursorExtensionsDir, (Join-Path $CCursorHome "logs") | Out-Null
 
 function Find-CursorExe {
@@ -95,6 +96,18 @@ function Test-RuntimeReady {
   return (Test-BridgeHealth) -and (Test-ProxyHealth)
 }
 
+function Test-ForwardingReady {
+  if (-not (Test-Path -LiteralPath $ForwardingScript)) {
+    return $false
+  }
+  $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+  if (-not $node) {
+    return $false
+  }
+  & $node $ForwardingScript status "--port=$CCursorBridgePort" --json *> $null
+  return $LASTEXITCODE -eq 0
+}
+
 function Find-BridgeExe {
   $candidate = Get-ChildItem -LiteralPath $CCursorExtensionsDir -Recurse -Filter "agent-vibes-bridge.exe" -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match "\\bridge\\win32-x64\\agent-vibes-bridge\.exe$" } |
@@ -157,12 +170,31 @@ Write-Host ""
 Ensure-BridgeRunning
 
 Write-Host ""
+if (Test-ForwardingReady) {
+  Write-Host "CCursor system forwarding: active"
+} else {
+  Write-Host "WARN: CCursor system forwarding is not active."
+  Write-Host "WARN: Cursor Agent may bypass the local proxy and use Cursor official servers."
+  Write-Host "WARN: Run 'Enable CCursor Forwarding.ps1' once as Administrator, then reopen this launcher."
+}
+
+Write-Host ""
 Write-Host "Opening Cursor through CCursor local proxy..."
+$proxyUrl = "http://127.0.0.1:$CCursorForwardProxyPort"
+$env:HTTP_PROXY = $proxyUrl
+$env:HTTPS_PROXY = $proxyUrl
+$env:ALL_PROXY = $proxyUrl
+$env:http_proxy = $proxyUrl
+$env:https_proxy = $proxyUrl
+$env:all_proxy = $proxyUrl
+$env:NO_PROXY = "localhost,127.0.0.1,::1"
+$env:no_proxy = $env:NO_PROXY
 $cursorArgs = @(
   "--user-data-dir=$CCursorUserDataDir",
   "--extensions-dir=$CCursorExtensionsDir",
   "--proxy-server=http://127.0.0.1:$CCursorForwardProxyPort",
-  "--ignore-certificate-errors"
+  "--ignore-certificate-errors",
+  "--new-window"
 )
 if ($Paths -and $Paths.Count -gt 0) {
   $cursorArgs += $Paths

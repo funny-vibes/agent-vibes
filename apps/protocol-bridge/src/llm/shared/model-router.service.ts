@@ -135,14 +135,12 @@ export class ModelRouterService {
     }
     if (this.codexAvailable && this.openaiCompatAvailable) {
       this.logger.log(
-        "  GPT/O-series models  -> Codex backend (priority, OpenAI-compatible fallback)"
+        "  GPT/O-series models  -> OpenAI-compatible backend (priority, Codex fallback)"
       )
     } else if (this.codexAvailable) {
       this.logger.log("  GPT/O-series models  -> Codex backend")
     } else if (this.openaiCompatAvailable) {
-      this.logger.log(
-        "  GPT/O-series models  -> OpenAI-compatible backend (fallback only)"
-      )
+      this.logger.log("  GPT/O-series models  -> OpenAI-compatible backend")
     } else {
       this.logger.log(
         "  GPT/O-series models  -> ERROR (no GPT backend configured)"
@@ -242,21 +240,21 @@ export class ModelRouterService {
     const openaiCompatAvailable = this.getOpenaiCompatAvailability()
     const codexAvailable = this.getCodexAvailability()
 
-    // Codex first, openai-compat as fallback
-    if (codexAvailable && this.doesCodexSupportModel(target.model)) {
-      candidates.push({
-        backend: "codex",
-        model: target.model,
-        isThinking: target.isThinking,
-      })
-    }
-
+    // Prefer the user-configured OpenAI-compatible gateway when present.
     if (
       openaiCompatAvailable &&
       this.doesOpenaiCompatSupportModel(target.model)
     ) {
       candidates.push({
         backend: "openai-compat",
+        model: target.model,
+        isThinking: target.isThinking,
+      })
+    }
+
+    if (codexAvailable && this.doesCodexSupportModel(target.model)) {
+      candidates.push({
+        backend: "codex",
         model: target.model,
         isThinking: target.isThinking,
       })
@@ -512,7 +510,7 @@ export class ModelRouterService {
 
     // 1. Known model with registry entry
     if (entry) {
-      // GPT family → codex (priority) > openai-compat
+      // GPT family → OpenAI-compatible gateway (priority) > Codex
       if (entry.family === "gpt") {
         if (gptCandidates) {
           const route = gptCandidates.primary
@@ -593,7 +591,7 @@ export class ModelRouterService {
       return route
     }
 
-    // 3. GPT family -> codex > openai-compat
+    // 3. GPT family -> OpenAI-compatible gateway > Codex
     if (family === "gpt") {
       if (gptCandidates) {
         const route = gptCandidates.primary

@@ -4,6 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CCURSOR_USER_DATA_DIR="${CCURSOR_USER_DATA_DIR:-$HOME/.cursor-ccursor-profile}"
 CCURSOR_EXTENSIONS_DIR="${CCURSOR_EXTENSIONS_DIR:-$CCURSOR_USER_DATA_DIR/extensions}"
+CCURSOR_BRIDGE_PORT="${CCURSOR_BRIDGE_PORT:-2026}"
+FORWARDING_SCRIPT="$SCRIPT_DIR/scripts/setup-forwarding.js"
+if [[ ! -f "$FORWARDING_SCRIPT" && -f "$SCRIPT_DIR/../../apps/vscode-extension/scripts/setup-forwarding.js" ]]; then
+  FORWARDING_SCRIPT="$(cd "$SCRIPT_DIR/../.." && pwd)/apps/vscode-extension/scripts/setup-forwarding.js"
+fi
 OFFICIAL_USER_DATA_DIR="${CURSOR_OFFICIAL_USER_DATA_DIR:-$HOME/.cursor-official-profile}"
 OFFICIAL_EXTENSIONS_DIR="${CURSOR_OFFICIAL_EXTENSIONS_DIR:-$OFFICIAL_USER_DATA_DIR/extensions}"
 
@@ -61,8 +66,36 @@ echo "CCursor profile data: $CCURSOR_USER_DATA_DIR"
 echo "CCursor profile extensions: $CCURSOR_EXTENSIONS_DIR"
 
 echo
+echo "Checking CCursor system forwarding..."
+if [[ -f "$FORWARDING_SCRIPT" ]]; then
+  if node "$FORWARDING_SCRIPT" status --port="$CCURSOR_BRIDGE_PORT" --json >/tmp/ccursor-forwarding-status.json 2>/tmp/ccursor-forwarding-status.err; then
+    ruby -rjson -e '
+data = JSON.parse(File.read("/tmp/ccursor-forwarding-status.json"))
+checks = data["checks"] || {}
+puts "Forwarding: active"
+puts "Forwarding checks: hosts=#{checks["hosts"]} loopback=#{checks["loopbackAlias"]} backend=#{checks["backendConfigured"]} e2e=#{checks["endToEndReachable"]}"
+'
+  else
+    if [[ -s /tmp/ccursor-forwarding-status.json ]]; then
+      ruby -rjson -e '
+data = JSON.parse(File.read("/tmp/ccursor-forwarding-status.json"))
+checks = data["checks"] || {}
+puts "WARN: forwarding is not active"
+puts "WARN: checks hosts=#{checks["hosts"]} loopback=#{checks["loopbackAlias"]} backend=#{checks["backendConfigured"]} e2e=#{checks["endToEndReachable"]}"
+'
+    else
+      echo "WARN: forwarding status check failed"
+      cat /tmp/ccursor-forwarding-status.err 2>/dev/null || true
+    fi
+    echo "WARN: run 'Enable CCursor Forwarding.command' so Cursor Agent traffic cannot bypass the local bridge."
+  fi
+else
+  echo "WARN: forwarding script missing. Reinstall the full CCursor colleague kit."
+fi
+
+echo
 echo "Checking CCursor bridge..."
-if curl -sk --max-time 5 https://localhost:2026/pool/status >/tmp/ccursor-pool-status.json; then
+if curl -sk --max-time 5 "https://localhost:${CCURSOR_BRIDGE_PORT}/pool/status" >/tmp/ccursor-pool-status.json; then
   ruby -rjson -e '
 data = JSON.parse(File.read("/tmp/ccursor-pool-status.json"))
 pool = data.dig("backends", "openaiCompat") || data["openaiCompat"] || {}

@@ -34,11 +34,15 @@ mkdir -p "$PACKAGE_DIR"
 
 cp "$VSIX" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Install CCursor.command" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Enable CCursor Forwarding.command" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Disable CCursor Forwarding.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Create CCursor App.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor Official.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor with CCursor.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Check CCursor.command" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Install CCursor.ps1" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Enable CCursor Forwarding.ps1" "$PACKAGE_DIR/"
+cp "$KIT_DIR/Disable CCursor Forwarding.ps1" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor Official.ps1" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Open Cursor with CCursor.ps1" "$PACKAGE_DIR/"
 cp "$KIT_DIR/Check CCursor.ps1" "$PACKAGE_DIR/"
@@ -46,13 +50,22 @@ cp "$KIT_DIR/README.md" "$PACKAGE_DIR/"
 mkdir -p "$PACKAGE_DIR/lib"
 cp "$KIT_DIR/lib/sync_codex_openai_compat.rb" "$PACKAGE_DIR/lib/"
 cp "$KIT_DIR/lib/Sync-CodexOpenAICompat.ps1" "$PACKAGE_DIR/lib/"
+mkdir -p "$PACKAGE_DIR/scripts"
+cp "$ROOT_DIR/apps/vscode-extension/scripts/setup-forwarding.js" "$PACKAGE_DIR/scripts/"
+cp "$ROOT_DIR/apps/vscode-extension/scripts/platform.js" "$PACKAGE_DIR/scripts/"
+cp "$ROOT_DIR/apps/vscode-extension/scripts/tcp-relay.js" "$PACKAGE_DIR/scripts/"
 
 chmod +x "$PACKAGE_DIR/Install CCursor.command" \
+  "$PACKAGE_DIR/Enable CCursor Forwarding.command" \
+  "$PACKAGE_DIR/Disable CCursor Forwarding.command" \
   "$PACKAGE_DIR/Create CCursor App.command" \
   "$PACKAGE_DIR/Open Cursor Official.command" \
   "$PACKAGE_DIR/Open Cursor with CCursor.command" \
   "$PACKAGE_DIR/Check CCursor.command" \
-  "$PACKAGE_DIR/lib/sync_codex_openai_compat.rb"
+  "$PACKAGE_DIR/lib/sync_codex_openai_compat.rb" \
+  "$PACKAGE_DIR/scripts/setup-forwarding.js" \
+  "$PACKAGE_DIR/scripts/platform.js" \
+  "$PACKAGE_DIR/scripts/tcp-relay.js"
 
 (
   cd "$PACKAGE_DIR"
