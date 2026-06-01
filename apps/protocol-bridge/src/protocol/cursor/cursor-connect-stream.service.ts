@@ -6752,6 +6752,7 @@ ${raw}
       markerFound: boolean
       contentStartIdx: number
       lastSentRawLen: number
+      lastHeartbeatAt: number
     } | null = null
     let isInThinkingBlock = false
     let thinkingStartTime = 0
@@ -6846,6 +6847,7 @@ ${raw}
                 markerFound: false,
                 contentStartIdx: 0,
                 lastSentRawLen: 0,
+                lastHeartbeatAt: Date.now(),
               }
             } else {
               editStreamState = null
@@ -6884,6 +6886,12 @@ ${raw}
             currentToolCall.inputJson += delta.partial_json || ""
 
             if (editStreamState) {
+              const now = Date.now()
+              if (now - editStreamState.lastHeartbeatAt >= 5_000) {
+                editStreamState.lastHeartbeatAt = now
+                yield this.grpcService.createHeartbeatResponse()
+              }
+
               const json = currentToolCall.inputJson
               if (!editStreamState.markerFound) {
                 for (const key of [
@@ -6891,6 +6899,8 @@ ${raw}
                   '"new_text": "',
                   '"file_text":"',
                   '"file_text": "',
+                  '"replace":"',
+                  '"replace": "',
                 ]) {
                   const idx = json.indexOf(key)
                   if (idx >= 0) {
@@ -7251,7 +7261,13 @@ ${raw}
   private isEditToolInvocation(toolName: string): boolean {
     const normalized = toolName.trim().toLowerCase()
     if (!normalized) return false
-    if (normalized === "edit" || normalized === "edit_file") return true
+    if (
+      normalized === "edit" ||
+      normalized === "edit_file" ||
+      normalized === "edit_file_v2"
+    ) {
+      return true
+    }
 
     const definitionKey = resolveCursorToolDefinitionKey(toolName)
     if (!definitionKey) return false
@@ -21390,7 +21406,9 @@ ${raw}
       : execDispatchResolution.target
     const deferredToolFamily = dispatchErrorMessage
       ? undefined
-      : execDispatchTarget && canonicalToolName === "generate_image"
+      : execDispatchTarget &&
+          (canonicalToolName === "generate_image" ||
+            this.isEditToolInvocation(execDispatchTarget.toolName))
         ? undefined
         : this.normalizeDeferredToolFamily(canonicalToolName)
     const historyToolName =
@@ -22886,7 +22904,14 @@ ${raw}
     input: Record<string, unknown>,
     dispatchTarget: ExecDispatchTarget
   ): AsyncGenerator<Buffer> {
-    if (this.isEditToolInvocation(dispatchTarget.toolName)) {
+    const editInvocation = this.isEditToolInvocation(dispatchTarget.toolName)
+    this.logger.debug(
+      `Dispatching tool ${toolCall.id}: tool=${dispatchTarget.toolName}, ` +
+        `is_edit=${editInvocation}, path=${String(
+          (dispatchTarget.input as ToolInputWithPath).path || ""
+        )}`
+    )
+    if (editInvocation) {
       const typedInput = dispatchTarget.input as ToolInputWithPath
       const editPath = String(typedInput.path || "")
 
@@ -22898,6 +22923,10 @@ ${raw}
         conversationId,
         toolCall.id,
         editPath
+      )
+      this.logger.debug(
+        `Edit ${toolCall.id} path-slot acquire: ` +
+          `acquired=${acquireResult.acquired}, path="${editPath || "(empty)"}"`
       )
 
       if (!acquireResult.acquired) {
@@ -22958,6 +22987,10 @@ ${raw}
     const allowedWorkspaceRoots =
       this.sessionManager.listAllowedWorkspaceRoots(conversationId)
     if (allowedWorkspaceRoots.length === 0) {
+      this.logger.warn(
+        `Edit ${toolCallId} failed: missing workspace root ` +
+          `(session_root=${session.projectContext?.rootPath || "(none)"})`
+      )
       this.toolExecutionCoordinator.markRunning(conversationId, toolCallId)
       yield* this.emitInlineToolResult(
         conversationId,
@@ -23032,6 +23065,7 @@ ${raw}
     this.toolExecutionCoordinator.markRunning(conversationId, toolCallId)
 
     if (!resolvedHostPath) {
+      this.logger.warn(`Edit ${toolCallId} failed: missing path`)
       yield* this.emitInlineToolResult(
         conversationId,
         toolCallId,
@@ -23048,6 +23082,10 @@ ${raw}
         allowedWorkspaceRoots
       )
     ) {
+      this.logger.warn(
+        `Edit ${toolCallId} refused outside workspace roots: ` +
+          `path=${resolvedHostPath}; roots=${allowedWorkspaceRoots.join(", ")}`
+      )
       yield* this.emitInlineToolResult(
         conversationId,
         toolCallId,
@@ -23058,6 +23096,10 @@ ${raw}
     }
 
     if (pendingToolCall?.editApplyWarning) {
+      this.logger.warn(
+        `Edit ${toolCallId} apply failed before write: ` +
+          pendingToolCall.editApplyWarning
+      )
       yield* this.emitInlineToolResult(
         conversationId,
         toolCallId,
@@ -23074,6 +23116,7 @@ ${raw}
         writeFileSync(resolvedHostPath, nextContent, "utf8")
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
+        this.logger.warn(`Edit ${toolCallId} write failed: ${message}`)
         yield* this.emitInlineToolResult(
           conversationId,
           toolCallId,
@@ -23183,6 +23226,32 @@ ${raw}
         session,
         activeToolCall,
         preparedTool.input
+      )
+      return this.sessionManager
+        .getPendingToolCallIds(conversationId)
+        .includes(activeToolCall.id)
+        ? "waiting_for_result"
+        : "completed_inline"
+    }
+
+    if (this.isEditToolInvocation(preparedTool.protocolToolName)) {
+      const editDispatchTarget = preparedTool.execDispatchTarget || {
+        toolName: preparedTool.protocolToolName,
+        input: preparedTool.protocolToolInput,
+        toolFamilyHint: preparedTool.protocolToolFamilyHint,
+      }
+      this.logger.debug(
+        `Executing edit tool ${activeToolCall.id}: ` +
+          `protocol=${preparedTool.protocolToolName}, ` +
+          `has_exec_target=${Boolean(preparedTool.execDispatchTarget)}, ` +
+          `dispatch=${editDispatchTarget.toolName}`
+      )
+      yield* this.dispatchExecMessagesForTool(
+        conversationId,
+        session,
+        activeToolCall,
+        preparedTool.input,
+        editDispatchTarget
       )
       return this.sessionManager
         .getPendingToolCallIds(conversationId)
@@ -25267,6 +25336,19 @@ ${raw}
         exitCode,
         signal || undefined
       )
+      if (exitCwd && path.isAbsolute(exitCwd)) {
+        const registeredRoot = this.sessionManager.addAdditionalWorkspaceRoot(
+          conversationId,
+          exitCwd,
+          "session"
+        )
+        if (registeredRoot) {
+          this.logger.debug(
+            `Registered shell cwd as workspace root for ${conversationId}: ` +
+              registeredRoot.path
+          )
+        }
+      }
 
       // Get accumulated output
       const shellOutput = this.sessionManager.getShellOutput(

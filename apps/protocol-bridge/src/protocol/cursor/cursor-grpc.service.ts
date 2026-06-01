@@ -2181,6 +2181,31 @@ export class CursorGrpcService {
   }
 
   private detectToolFamily(toolName: string): ToolFamily {
+    const normalizedAlias = toolName.trim().toLowerCase()
+    switch (normalizedAlias) {
+      case "read_file":
+      case "read_file_v2":
+        return "read"
+      case "edit":
+      case "edit_file":
+      case "edit_file_v2":
+        return "edit"
+      case "list_directory":
+      case "list_dir":
+      case "ls":
+        return "ls"
+      case "delete_file":
+        return "delete"
+      case "grep_search":
+      case "ripgrep_search":
+      case "ripgrep_raw_search":
+        return "grep"
+      case "run_terminal_command":
+      case "run_terminal_command_v2":
+      case "shell":
+        return "shell"
+    }
+
     const definitionKey = resolveCursorToolDefinitionKey(toolName)
     if (definitionKey) {
       switch (definitionKey) {
