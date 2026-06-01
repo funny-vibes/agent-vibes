@@ -196,6 +196,7 @@ api_key, key_source = resolve_api_key(provider)
 model = config["model"].to_s.strip
 model = provider["model"].to_s.strip if model.empty?
 model = DEFAULT_MODEL if model.empty?
+allowed_models = [model.downcase.strip].reject(&:empty?)
 
 label = "codex-#{provider_name}"
 account = {
@@ -206,7 +207,8 @@ account = {
   "maxContextTokens" => DEFAULT_CONTEXT_TOKENS,
   "managedBy" => MANAGED_BY,
   "sourceProvider" => provider_name,
-  "sourceModel" => model
+  "sourceModel" => model,
+  "allowedModels" => allowed_models
 }
 
 ccursor_home = ENV.fetch("CCURSOR_HOME", File.join(Dir.home, ".ccursor"))
@@ -237,6 +239,7 @@ summary = {
   "apiKey" => "[hidden]",
   "destination" => dest_path,
   "accountLabel" => label,
+  "allowedModels" => allowed_models,
   "preferResponsesApi" => DEFAULT_PREFER_RESPONSES_API,
   "protocol" => "chat_completions",
   "wouldWrite" => !(options[:check_only] || options[:dry_run])
@@ -262,6 +265,7 @@ else
   puts "Base URL: #{summary["baseUrl"]}"
   puts "API key: #{summary["apiKey"]} (#{summary["keySource"]})"
   puts "CCursor account: #{summary["accountLabel"]}"
+  puts "Allowed models: #{summary["allowedModels"].join(", ")}"
   puts "Protocol: Chat Completions (preferResponsesApi=#{summary["preferResponsesApi"]})"
   puts "Destination: #{summary["destination"]}"
   puts "Backup: #{summary["backup"]}" if summary["backup"]

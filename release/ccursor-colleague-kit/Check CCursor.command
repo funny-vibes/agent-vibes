@@ -27,6 +27,11 @@ managed = accounts.select { |item| item.is_a?(Hash) && item["managedBy"] == "ccu
 abort("ERROR: no ccursor-colleague-kit account found in #{path}") if managed.empty?
 managed.each do |item|
   puts "Account: #{item["label"]} #{item["baseUrl"]} responses=#{item["preferResponsesApi"]}"
+  allowed_models = item["allowedModels"].is_a?(Array) ? item["allowedModels"].map(&:to_s).map(&:strip).reject(&:empty?) : []
+  if allowed_models.empty?
+    abort("ERROR: #{item["label"]} has no allowedModels. Rerun Install CCursor.command so the AI gateway window only exposes the Codex-configured model.")
+  end
+  puts "Allowed models: #{allowed_models.join(", ")}"
   if item["preferResponsesApi"] != false
     abort("ERROR: #{item["label"]} uses preferResponsesApi=#{item["preferResponsesApi"]}. Rerun Install CCursor.command to switch to the stable Chat Completions path.")
   end

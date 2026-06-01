@@ -275,6 +275,7 @@ if ([string]::IsNullOrWhiteSpace($Model)) {
   $Model = $DefaultModel
 }
 $Model = $Model.Trim()
+$AllowedModels = @($Model.ToLowerInvariant().Trim()) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
 $Label = "codex-$ProviderName"
 $Account = [ordered]@{
@@ -286,6 +287,7 @@ $Account = [ordered]@{
   managedBy = $ManagedBy
   sourceProvider = $ProviderName
   sourceModel = $Model
+  allowedModels = $AllowedModels
 }
 
 $CCursorHome = if ($env:CCURSOR_HOME) { $env:CCURSOR_HOME } else { Join-Path $HOME ".ccursor" }
@@ -325,6 +327,7 @@ $Output = [ordered]@{
   apiKey = "[hidden]"
   destination = $DestPath
   accountLabel = $Label
+  allowedModels = $AllowedModels
   preferResponsesApi = $DefaultPreferResponsesApi
   protocol = "chat_completions"
   wouldWrite = -not ($CheckOnly -or $DryRun)
@@ -352,6 +355,7 @@ if ($Json) {
   Write-Host "Base URL: $($Output.baseUrl)"
   Write-Host "API key: [hidden] ($($Output.keySource))"
   Write-Host "CCursor account: $($Output.accountLabel)"
+  Write-Host "Allowed models: $($Output.allowedModels -join ', ')"
   Write-Host "Protocol: Chat Completions (preferResponsesApi=$($Output.preferResponsesApi))"
   Write-Host "Destination: $($Output.destination)"
   if ($Output.backup) {

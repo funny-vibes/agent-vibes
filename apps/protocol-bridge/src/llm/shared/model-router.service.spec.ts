@@ -41,4 +41,23 @@ describe("ModelRouterService", () => {
       model: "gpt-5.5",
     })
   })
+
+  it("falls back to Codex when OpenAI-compatible allowlist rejects the model", () => {
+    const router = new ModelRouterService()
+    router.setGptAvailabilityProviders({
+      codex: () => true,
+      openaiCompat: () => true,
+      codexSupportsModel: () => true,
+      openaiCompatSupportsModel: (model) => model === "gpt-5.5",
+    })
+
+    expect(router.resolveModel("gpt-5.5")).toMatchObject({
+      backend: "openai-compat",
+      model: "gpt-5.5",
+    })
+    expect(router.resolveModel("gpt-5.4")).toMatchObject({
+      backend: "codex",
+      model: "gpt-5.4",
+    })
+  })
 })

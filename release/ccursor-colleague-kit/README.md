@@ -4,6 +4,8 @@
 
 默认走 OpenAI Chat Completions 协议，也就是 `preferResponsesApi=false`。当前 Skylink AI 中台的 Responses API 在大上下文/流式场景下不稳定，安装包会主动避开这条路径。
 
+安装脚本会把 Codex 当前 `model` 写入 `allowedModels`。CCursor 中台窗口只展示和路由这个模型，避免同事在中台窗口误选 Cursor 官方模型或 AI 中台未配置的模型。
+
 这个包提供两个入口：
 
 - `Open Cursor Official`：不走 CCursor 代理，使用 Cursor 官方账号和官方模型。
@@ -51,6 +53,7 @@ Windows 右键 `Check CCursor.ps1`，选择 `Run with PowerShell`。
 - 是否能读取 `~/.codex/config.toml`
 - 是否已写入 `~/.ccursor/data/openai-compat-accounts.json`
 - CCursor 账号是否使用稳定的 Chat Completions 路径：`preferResponsesApi=false`
+- CCursor 账号是否带有模型白名单：`allowedModels`
 - 默认 Cursor 和隔离 CCursor profile 是否已安装 `local-ai.ccursor`
 - CCursor 系统 forwarding 是否已启用，端到端是否能到本地 bridge
 - CCursor bridge 是否在 `https://localhost:2026` 正常运行

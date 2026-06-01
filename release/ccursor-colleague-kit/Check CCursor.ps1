@@ -52,6 +52,14 @@ if ($Managed.Count -eq 0) {
 
 foreach ($item in $Managed) {
   Write-Host "Account: $($item.label) $($item.baseUrl) responses=$($item.preferResponsesApi)"
+  $allowedModels = @($item.allowedModels) |
+    ForEach-Object { [string]$_ } |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  if ($allowedModels.Count -eq 0) {
+    throw "$($item.label) has no allowedModels. Rerun Install CCursor.ps1 so the AI gateway window only exposes the Codex-configured model."
+  }
+  Write-Host "Allowed models: $($allowedModels -join ', ')"
   if ($item.preferResponsesApi -ne $false) {
     throw "$($item.label) uses preferResponsesApi=$($item.preferResponsesApi). Rerun Install CCursor.ps1 to switch to the stable Chat Completions path."
   }
