@@ -878,7 +878,7 @@ export class MessagesService implements OnModuleInit {
 
       if (resolved.family === "gpt") {
         if (this.openaiCompatService.isAvailable()) {
-          return true
+          return this.openaiCompatService.supportsModel(resolved.cloudCodeId)
         }
 
         return this.codexService.supportsModel(modelId)
