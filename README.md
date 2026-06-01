@@ -106,6 +106,26 @@ native client compatibility for Cursor and native upstream fidelity for Antigrav
 
 ## Quick Start
 
+### Keep Cursor Official Models And Agent Vibes Models Side By Side
+
+Agent Vibes forwarding is system-level. If it is enabled globally, every Cursor
+window may route Cursor agent traffic to the local bridge. To keep Cursor's
+official models and your Agent Vibes gateway available at the same time, use
+separate Cursor profiles:
+
+```bash
+# Cursor official account/models, no Agent Vibes proxy
+./scripts/launchers/Open\ Cursor\ Official.command
+
+# Isolated Agent Vibes profile through the local forward proxy
+./scripts/launchers/Open\ Cursor\ with\ Agent\ Vibes.command
+```
+
+The official launcher uses `~/.cursor-official-profile`. The Agent Vibes
+launcher uses `~/.cursor-agent-vibes-profile` and `--proxy-server` pointing to
+`127.0.0.1:18080`. Install the VSIX into the Agent Vibes profile before using
+that window.
+
 ### Install Option 1: Prompt Install (Recommended for non-developers)
 
 Copy the prompt below and send it to any LLM (ChatGPT / Claude / Gemini, etc.).

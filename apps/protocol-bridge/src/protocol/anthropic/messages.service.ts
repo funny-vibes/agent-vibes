@@ -126,7 +126,8 @@ export class MessagesService implements OnModuleInit {
       codex: () => this.codexService.isAvailable(),
       openaiCompat: () => this.openaiCompatService.isAvailable(),
       codexSupportsModel: (model) => this.codexService.supportsModel(model),
-      openaiCompatSupportsModel: () => this.openaiCompatService.isAvailable(),
+      openaiCompatSupportsModel: (model) =>
+        this.openaiCompatService.supportsModel(model),
     })
     this.modelRouter.setClaudeAvailabilityProvider((model) =>
       this.anthropicApiService.supportsModel(model)
@@ -1066,7 +1067,7 @@ export class MessagesService implements OnModuleInit {
 
       if (resolved.family === "gpt") {
         if (this.openaiCompatService.isAvailable()) {
-          return true
+          return this.openaiCompatService.supportsModel(resolved.cloudCodeId)
         }
 
         return this.codexService.supportsModel(modelId)

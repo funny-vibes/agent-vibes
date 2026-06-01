@@ -96,6 +96,25 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
 
 ## 快速开始
 
+### 同时保留 Cursor 官方模型和 Agent Vibes 中台模型
+
+Agent Vibes forwarding 是系统级配置。如果全局启用，所有 Cursor 窗口的
+Agent 流量都可能进入本地 bridge。要同时保留 Cursor 官方模型和自己的
+Agent Vibes 中台模型，请使用独立 Cursor profile：
+
+```bash
+# Cursor 官方账号和官方模型，不走 Agent Vibes 代理
+./scripts/launchers/Open\ Cursor\ Official.command
+
+# 独立 Agent Vibes profile，通过本地 forward proxy 访问中台
+./scripts/launchers/Open\ Cursor\ with\ Agent\ Vibes.command
+```
+
+官方启动器使用 `~/.cursor-official-profile`。Agent Vibes 启动器使用
+`~/.cursor-agent-vibes-profile`，并通过 `--proxy-server` 指向
+`127.0.0.1:18080`。使用中台窗口前，请先把 VSIX 安装到这个 Agent Vibes
+profile。
+
 ### 安装方式一：Prompt 安装（推荐非开发者使用）
 
 把下面这段 Prompt 发给任意大模型（ChatGPT / Claude / Gemini 等），

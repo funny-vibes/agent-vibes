@@ -391,6 +391,7 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   proxyUrl?: string
   preferResponsesApi?: boolean
   maxContextTokens?: number
+  allowedModels?: string[]
   source: "env" | "file"
   stateKey: string
 }
@@ -404,6 +405,7 @@ interface OpenaiCompatAccountFileEntry {
   proxyUrl?: string
   preferResponsesApi?: boolean
   maxContextTokens?: number
+  allowedModels?: string[]
 }
 
 interface OpenaiCompatConfigFile {
@@ -477,6 +479,44 @@ export class OpenaiCompatService implements OnModuleInit {
     return Math.floor(parsed)
   }
 
+  private normalizeModelId(value: string): string {
+    return value.toLowerCase().trim()
+  }
+
+  private normalizeAllowedModels(value: unknown): string[] | undefined {
+    if (!Array.isArray(value)) {
+      return undefined
+    }
+
+    const seen = new Set<string>()
+    const models: string[] = []
+    for (const item of value) {
+      if (typeof item !== "string") {
+        continue
+      }
+      const normalized = this.normalizeModelId(item)
+      if (!normalized || seen.has(normalized)) {
+        continue
+      }
+      seen.add(normalized)
+      models.push(normalized)
+    }
+
+    return models.length > 0 ? models : undefined
+  }
+
+  private accountSupportsModel(
+    account: OpenaiCompatAccount,
+    model?: string
+  ): boolean {
+    const normalized = model ? this.normalizeModelId(model) : ""
+    if (!normalized || !account.allowedModels?.length) {
+      return true
+    }
+
+    return account.allowedModels.includes(normalized)
+  }
+
   private buildAccountRecord(params: {
     label?: string
     apiKey: string
@@ -484,6 +524,7 @@ export class OpenaiCompatService implements OnModuleInit {
     proxyUrl?: string
     preferResponsesApi?: boolean
     maxContextTokens?: number
+    allowedModels?: string[]
     source: "env" | "file"
   }): OpenaiCompatAccount {
     return {
@@ -493,6 +534,7 @@ export class OpenaiCompatService implements OnModuleInit {
       proxyUrl: params.proxyUrl,
       preferResponsesApi: params.preferResponsesApi,
       maxContextTokens: this.normalizeMaxContextTokens(params.maxContextTokens),
+      allowedModels: this.normalizeAllowedModels(params.allowedModels),
       source: params.source,
       stateKey: this.buildAccountStateKey(params.apiKey, params.baseUrl),
       cooldownUntil: 0,
@@ -981,6 +1023,7 @@ export class OpenaiCompatService implements OnModuleInit {
                 proxyUrl: a.proxyUrl,
                 preferResponsesApi: a.preferResponsesApi === true,
                 maxContextTokens: a.maxContextTokens,
+                allowedModels: a.allowedModels,
                 source: "file",
               })
             )
@@ -1001,23 +1044,42 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private nextAccount(model?: string): OpenaiCompatAccount {
     const targetModel = model || ""
+    const candidateAccounts = this.accounts.filter((account) =>
+      this.accountSupportsModel(account, targetModel)
+    )
     const result = pickAvailableAccount(
-      this.accounts,
+      candidateAccounts,
       targetModel,
       this.accountIndex
     )
     if (result) {
-      this.accountIndex = (result.index + 1) % this.accounts.length
+      const globalIndex = this.accounts.indexOf(result.account)
+      this.accountIndex =
+        globalIndex >= 0
+          ? (globalIndex + 1) % this.accounts.length
+          : (this.accountIndex + 1) % this.accounts.length
       return result.account
     }
 
-    const disabledCount = this.accounts.filter((account) =>
+    const disabledCount = candidateAccounts.filter((account) =>
       isAccountDisabled(account)
     ).length
-    const coolingCount = this.accounts.length - disabledCount
+    const coolingCount = candidateAccounts.length - disabledCount
     const info = targetModel
-      ? getEarliestRecovery(this.accounts, targetModel)
-      : getEarliestRecovery(this.accounts, "")
+      ? getEarliestRecovery(candidateAccounts, targetModel)
+      : getEarliestRecovery(candidateAccounts, "")
+
+    if (targetModel && candidateAccounts.length === 0) {
+      throw new BackendAccountPoolUnavailableError(
+        `No OpenAI-compat account is allowed to use model ${targetModel}.`,
+        {
+          backend: "openai-compat",
+          disabledCount: 0,
+          coolingCount: 0,
+          permanent: true,
+        }
+      )
+    }
 
     if (info) {
       const retrySeconds = Math.ceil(info.retryAfterMs / 1000)
@@ -1052,11 +1114,27 @@ export class OpenaiCompatService implements OnModuleInit {
     return this.accounts.some((account) => !isAccountDisabled(account))
   }
 
+  supportsModel(model: string): boolean {
+    const normalized = this.normalizeModelId(model)
+    if (!normalized) {
+      return false
+    }
+
+    return this.accounts.some(
+      (account) =>
+        !isAccountDisabled(account) &&
+        this.accountSupportsModel(account, normalized)
+    )
+  }
+
   getConfiguredMaxContextTokens(model?: string): number | undefined {
     let resolved: number | undefined
 
     for (const account of this.accounts) {
       if (isAccountDisabled(account)) {
+        continue
+      }
+      if (!this.accountSupportsModel(account, model)) {
         continue
       }
       if (model && !isAccountAvailableForModel(account, model)) {
@@ -1117,6 +1195,13 @@ export class OpenaiCompatService implements OnModuleInit {
         existing.maxContextTokens = account.maxContextTokens
         changed = true
       }
+      if (
+        JSON.stringify(existing.allowedModels || []) !==
+        JSON.stringify(account.allowedModels || [])
+      ) {
+        existing.allowedModels = account.allowedModels
+        changed = true
+      }
 
       if (changed) {
         changedCount++
@@ -1159,6 +1244,7 @@ export class OpenaiCompatService implements OnModuleInit {
         baseUrl: account.baseUrl,
         proxyUrl: account.proxyUrl,
         maxContextTokens: account.maxContextTokens,
+        allowedModels: account.allowedModels || [],
         modelCooldowns,
       }
     })

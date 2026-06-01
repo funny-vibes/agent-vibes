@@ -5,6 +5,7 @@ node_modules
 dist
 .playwright-mcp
 .turbo
+.cache
 .cursor
 cursor.log
 .log/
@@ -50,4 +51,3 @@ apps/vscode-extension/*.vsix
 apps/vscode-extension/bridge/**
 !apps/vscode-extension/bridge/
 !apps/vscode-extension/bridge/README.md
-
