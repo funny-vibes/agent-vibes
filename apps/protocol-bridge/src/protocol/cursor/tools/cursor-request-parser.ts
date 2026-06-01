@@ -100,6 +100,14 @@ export interface ParsedToolResult {
     }
   }
   inlineExtraData?: {
+    beforeContent?: string
+    afterContent?: string
+    editSuccess?: {
+      linesAdded?: number
+      linesRemoved?: number
+      diffString?: string
+      message?: string
+    }
     shellResult?: {
       stdout?: string
       stderr?: string

@@ -40,4 +40,27 @@ describe("ModelRouterService", () => {
       model: "gpt-5.4",
     })
   })
+
+  it("routes Cursor gpt-5 display alias to OpenAI-compatible gpt-5.5", () => {
+    const router = new ModelRouterService()
+    router.setGptAvailabilityProviders({
+      codex: () => false,
+      openaiCompat: () => true,
+      codexSupportsModel: () => false,
+      openaiCompatSupportsModel: (model) =>
+        model === "gpt-5" || model === "gpt-5.5",
+    })
+
+    expect(router.getGptBackendCandidates("gpt-5")).toMatchObject({
+      primary: {
+        backend: "openai-compat",
+        model: "gpt-5.5",
+      },
+      fallbacks: [],
+    })
+    expect(router.resolveModel("gpt-5")).toMatchObject({
+      backend: "openai-compat",
+      model: "gpt-5.5",
+    })
+  })
 })

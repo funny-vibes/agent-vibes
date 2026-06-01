@@ -2,7 +2,15 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
 import { spawn, spawnSync } from "child_process"
 import * as crypto from "crypto"
-import { closeSync, openSync, readFileSync, readSync, statSync } from "fs"
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "fs"
 import * as os from "os"
 import * as path from "path"
 import {
@@ -22871,13 +22879,13 @@ ${raw}
    * 导致 read_result/write_result 永远到不了 detach 出口、形成死锁。
    */
 
-  private *dispatchExecMessagesForTool(
+  private async *dispatchExecMessagesForTool(
     conversationId: string,
     session: ChatSession,
     toolCall: ActiveToolCall,
     input: Record<string, unknown>,
     dispatchTarget: ExecDispatchTarget
-  ): Generator<Buffer> {
+  ): AsyncGenerator<Buffer> {
     if (this.isEditToolInvocation(dispatchTarget.toolName)) {
       const typedInput = dispatchTarget.input as ToolInputWithPath
       const editPath = String(typedInput.path || "")
@@ -22901,7 +22909,12 @@ ${raw}
         return
       }
 
-      yield* this.dispatchEditReadArgs(conversationId, toolCall.id, editPath)
+      yield* this.dispatchEditReadArgs(
+        conversationId,
+        session,
+        toolCall.id,
+        editPath
+      )
       return
     }
 
@@ -22925,33 +22938,175 @@ ${raw}
   }
 
   /**
-   * 派发 edit_file_v2 串行协议第一步（readArgs），并注册 execId。
+   * Dispatch edit_file_v2 by computing the complete target file text in the
+   * bridge, then asking Cursor to write it.
    *
-   * 适用场景：
-   *  1. dispatch 阶段刚 acquire 成功的 edit。
-   *  2. 一个 edit 完成（detach 释放槽）后，由 picker 出队的下一个 edit。
+   * Cursor Agent CLI accepts plain read_file ExecServerMessage envelopes, but
+   * stalls when an editToolCall lifecycle is paired with a readArgs first step.
+   * Keeping the read in-process avoids that protocol deadlock while preserving
+   * Cursor as the writer of record through writeArgs/write_result.
    */
-  private *dispatchEditReadArgs(
+  private async *dispatchEditReadArgs(
     conversationId: string,
+    session: ChatSession,
     toolCallId: string,
     editPath: string
-  ): Generator<Buffer> {
-    const readExecId = this.sessionManager.nextExecId(conversationId)
-    const readExecMsg = this.grpcService.createReadExecMessage(
-      toolCallId,
-      editPath,
-      readExecId
+  ): AsyncGenerator<Buffer> {
+    const pendingToolCall = session?.pendingToolCalls.get(toolCallId)
+    const typedInput = (pendingToolCall?.toolInput || {}) as ToolInputWithPath
+    const resolvedEditPath = String(typedInput.path || editPath || "")
+    const allowedWorkspaceRoots =
+      this.sessionManager.listAllowedWorkspaceRoots(conversationId)
+    if (allowedWorkspaceRoots.length === 0) {
+      this.toolExecutionCoordinator.markRunning(conversationId, toolCallId)
+      yield* this.emitInlineToolResult(
+        conversationId,
+        toolCallId,
+        "[edit error] No workspace root is available for this conversation; refusing to write from the bridge process cwd.",
+        { status: "error", message: "missing workspace root" }
+      )
+      return
+    }
+    const primaryWorkspaceRoot = allowedWorkspaceRoots[0] as string
+
+    const resolvedHostPath = resolvedEditPath
+      ? path.isAbsolute(resolvedEditPath)
+        ? normalizePathForBoundaryCheck(resolvedEditPath)
+        : normalizePathForBoundaryCheck(
+            path.resolve(primaryWorkspaceRoot, resolvedEditPath)
+          )
+      : ""
+
+    const snapshot = resolvedEditPath
+      ? this.sessionManager.getLatestReadSnapshot(
+          conversationId,
+          resolvedEditPath,
+          {
+            requireCoverage: false,
+          }
+        )
+      : undefined
+    let beforeContent = snapshot?.content ?? ""
+    if (
+      beforeContent.length === 0 &&
+      resolvedHostPath &&
+      this.isPathWithinAllowedWorkspaceRoots(
+        conversationId,
+        resolvedHostPath,
+        allowedWorkspaceRoots
+      )
+    ) {
+      try {
+        beforeContent = readFileSync(resolvedHostPath, "utf8")
+      } catch (error) {
+        const hasCreateContent =
+          typeof typedInput.file_text === "string" ||
+          typeof typedInput.replace === "string" ||
+          typeof typedInput.new_text === "string"
+        if (!hasCreateContent) {
+          const message = error instanceof Error ? error.message : String(error)
+          this.logger.warn(
+            `Edit ${toolCallId} could not read "${resolvedHostPath}" before write: ${message}; using empty content`
+          )
+        }
+      }
+    } else if (beforeContent.length === 0 && resolvedHostPath) {
+      this.logger.warn(
+        `Edit ${toolCallId} host read skipped because path is outside allowed workspace roots: ${resolvedHostPath}`
+      )
+    }
+
+    if (pendingToolCall) {
+      pendingToolCall.beforeContent = beforeContent
+      const computedEdit = this.applyEditInputToFileText(
+        beforeContent,
+        typedInput
+      )
+      pendingToolCall.editApplyWarning = computedEdit.warning
+      pendingToolCall.editFailureContext = computedEdit.failureContext
+      pendingToolCall.afterContent = computedEdit.fileText
+      pendingToolCall.editNoopReason = computedEdit.noopReason
+    }
+
+    const nextContent = pendingToolCall?.afterContent ?? beforeContent
+    this.toolExecutionCoordinator.markRunning(conversationId, toolCallId)
+
+    if (!resolvedHostPath) {
+      yield* this.emitInlineToolResult(
+        conversationId,
+        toolCallId,
+        "[edit error] Missing path",
+        { status: "error", message: "missing path" }
+      )
+      return
+    }
+
+    if (
+      !this.isPathWithinAllowedWorkspaceRoots(
+        conversationId,
+        resolvedHostPath,
+        allowedWorkspaceRoots
+      )
+    ) {
+      yield* this.emitInlineToolResult(
+        conversationId,
+        toolCallId,
+        `[edit error] Path must stay within one of the allowed working directories: ${resolvedEditPath}`,
+        { status: "error", message: "path outside workspace" }
+      )
+      return
+    }
+
+    if (pendingToolCall?.editApplyWarning) {
+      yield* this.emitInlineToolResult(
+        conversationId,
+        toolCallId,
+        this.buildEditFailureToolResultContent(conversationId, pendingToolCall)
+          .content,
+        { status: "error", message: pendingToolCall.editApplyWarning }
+      )
+      return
+    }
+
+    if (!pendingToolCall?.editNoopReason) {
+      try {
+        mkdirSync(path.dirname(resolvedHostPath), { recursive: true })
+        writeFileSync(resolvedHostPath, nextContent, "utf8")
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          `[edit error] ${message}`,
+          { status: "error", message }
+        )
+        return
+      }
+    }
+
+    const content = pendingToolCall?.editNoopReason
+      ? `[edit applied: no-op]\npath: ${resolvedEditPath}\nreason: ${pendingToolCall.editNoopReason}`
+      : `[edit applied]\npath: ${resolvedEditPath}\nbytes: ${nextContent.length}`
+    this.logger.log(
+      `Applied edit tool ${toolCallId} on path "${resolvedEditPath}" in bridge-owned file writer (${nextContent.length} bytes)`
     )
-    this.sessionManager.registerPendingToolExecId(
+    yield* this.emitInlineToolResult(
       conversationId,
       toolCallId,
-      readExecId
+      content,
+      { status: "success" },
+      undefined,
+      "inline_edit_result",
+      {
+        beforeContent,
+        afterContent: nextContent,
+        editSuccess: this.buildEditSuccessExtraData(
+          resolvedEditPath,
+          beforeContent,
+          nextContent
+        ),
+      }
     )
-    this.toolExecutionCoordinator.markRunning(conversationId, toolCallId)
-    this.logger.log(
-      `Sending readArgs for edit tool ${toolCallId} on path "${editPath}" (串行协议第一步, execId=${readExecId})`
-    )
-    yield readExecMsg
   }
 
   /**
@@ -22961,10 +23116,10 @@ ${raw}
    * 设计上保证此调用是幂等且无副作用安全的：若没有队头，pick 返回 undefined，
    * 不 yield 任何消息。
    */
-  private *dispatchNextQueuedEditForPath(
+  private async *dispatchNextQueuedEditForPath(
     conversationId: string,
     path: string
-  ): Generator<Buffer> {
+  ): AsyncGenerator<Buffer> {
     const next = this.sessionManager.pickNextEditForPath(conversationId, path)
     if (!next) return
 
@@ -22983,7 +23138,14 @@ ${raw}
     this.logger.log(
       `Dequeued edit ${next.toolCallId} on path "${path}" for dispatch`
     )
-    yield* this.dispatchEditReadArgs(conversationId, next.toolCallId, path)
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) return
+    yield* this.dispatchEditReadArgs(
+      conversationId,
+      session,
+      next.toolCallId,
+      path
+    )
   }
 
   private async *executePreparedToolInvocation(

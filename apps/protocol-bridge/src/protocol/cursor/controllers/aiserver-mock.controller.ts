@@ -294,7 +294,11 @@ export class AiserverMockController {
 
     if (resolved.family === "gpt") {
       if (this.openaiCompatService.isAvailable()) {
-        return this.openaiCompatService.supportsModel(resolved.cloudCodeId)
+        return (
+          this.openaiCompatService.supportsModel(resolved.cloudCodeId) ||
+          (resolved.cloudCodeId === "gpt-5" &&
+            this.openaiCompatService.supportsModel("gpt-5.5"))
+        )
       }
 
       return this.codexService.supportsModel(modelId)

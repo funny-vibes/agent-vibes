@@ -105,7 +105,11 @@ export class CursorAdapterController {
 
     if (resolved.family === "gpt") {
       if (this.openaiCompatService.isAvailable()) {
-        return this.openaiCompatService.supportsModel(resolved.cloudCodeId)
+        return (
+          this.openaiCompatService.supportsModel(resolved.cloudCodeId) ||
+          (resolved.cloudCodeId === "gpt-5" &&
+            this.openaiCompatService.supportsModel("gpt-5.5"))
+        )
       }
 
       return this.codexService.supportsModel(modelId)
@@ -201,9 +205,9 @@ export class CursorAdapterController {
 
   private schedulePreferredCodexWarmup(models: Array<{ name: string }>): void {
     const preferredModel =
-      models.find((model) => model.name === "gpt-5.5")?.name ||
-      models.find((model) => model.name === "gpt-5.4")?.name ||
       models.find((model) => model.name === "gpt-5")?.name ||
+      models.find((model) => model.name === "gpt-5.4")?.name ||
+      models.find((model) => model.name === "gpt-5.5")?.name ||
       models[0]?.name
     this.scheduleCodexWarmupForCursorModel(
       preferredModel,

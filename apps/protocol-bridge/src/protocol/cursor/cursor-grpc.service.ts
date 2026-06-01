@@ -2149,7 +2149,7 @@ export class CursorGrpcService {
               path,
               fileText: newContent,
               toolCallId,
-              returnFileContentAfterWrite: false,
+              returnFileContentAfterWrite: true,
             }),
           },
         }),

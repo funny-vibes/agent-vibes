@@ -1098,7 +1098,7 @@ export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
 ]
 
 const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
-  "gpt-5.5",
+  "gpt-5",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5.3-codex",

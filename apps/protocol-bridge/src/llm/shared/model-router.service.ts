@@ -241,6 +241,12 @@ export class ModelRouterService {
     const candidates: ModelRouteResult[] = []
     const openaiCompatAvailable = this.getOpenaiCompatAvailability()
     const codexAvailable = this.getCodexAvailability()
+    const openaiCompatModel =
+      target.model === "gpt-5" &&
+      openaiCompatAvailable &&
+      this.doesOpenaiCompatSupportModel("gpt-5.5")
+        ? "gpt-5.5"
+        : target.model
 
     // Codex first, openai-compat as fallback
     if (codexAvailable && this.doesCodexSupportModel(target.model)) {
@@ -253,11 +259,11 @@ export class ModelRouterService {
 
     if (
       openaiCompatAvailable &&
-      this.doesOpenaiCompatSupportModel(target.model)
+      this.doesOpenaiCompatSupportModel(openaiCompatModel)
     ) {
       candidates.push({
         backend: "openai-compat",
-        model: target.model,
+        model: openaiCompatModel,
         isThinking: target.isThinking,
       })
     }
@@ -520,7 +526,7 @@ export class ModelRouterService {
             ? ` | fallback=${gptCandidates.fallbacks.map((candidate) => candidate.backend).join(",")}`
             : ""
           this.logger.log(
-            `[ROUTE] ${cursorModel} -> ${route.backend} | ${entry.cloudCodeId}${fallbackSuffix}`
+            `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
           )
           return route
         }
