@@ -101,6 +101,8 @@ interface ChatCompletionRequest {
   [key: string]: unknown
 }
 
+const SKYLINK_ONLY_BASE_URL = "https://skylink-gateway.com/api/v1"
+
 function supportsOpenAiCompatReasoning(modelName: string): boolean {
   const normalized = modelName.toLowerCase().trim()
   return (
@@ -551,20 +553,28 @@ export class OpenaiCompatService implements OnModuleInit {
     allowedModels?: string[]
     source: "env" | "file"
   }): OpenaiCompatAccount {
+    const baseUrl = this.normalizeAccountBaseUrl(params.baseUrl)
     return {
       label: params.label,
       apiKey: params.apiKey,
-      baseUrl: params.baseUrl,
+      baseUrl,
       proxyUrl: params.proxyUrl,
       preferResponsesApi: params.preferResponsesApi,
       serviceTier: normalizeOpenAiCompatServiceTier(params.serviceTier),
       maxContextTokens: this.normalizeMaxContextTokens(params.maxContextTokens),
       allowedModels: this.normalizeAllowedModels(params.allowedModels),
       source: params.source,
-      stateKey: this.buildAccountStateKey(params.apiKey, params.baseUrl),
+      stateKey: this.buildAccountStateKey(params.apiKey, baseUrl),
       cooldownUntil: 0,
       modelStates: new Map(),
     }
+  }
+
+  private normalizeAccountBaseUrl(baseUrl: string): string {
+    if (process.env.AGENT_VIBES_SKYLINK_ONLY === "true") {
+      return SKYLINK_ONLY_BASE_URL
+    }
+    return baseUrl
   }
 
   private pruneAccountState(
