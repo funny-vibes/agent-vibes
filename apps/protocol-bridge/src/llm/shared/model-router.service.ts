@@ -46,6 +46,7 @@ export interface GptBackendCandidates {
 @Injectable()
 export class ModelRouterService {
   private readonly logger = new Logger(ModelRouterService.name)
+  private static readonly DEFAULT_CURSOR_MODEL = "gpt-5.5"
 
   private googleAvailable = false
   private codexAvailable = false
@@ -504,12 +505,21 @@ export class ModelRouterService {
     return trimmed
   }
 
+  private resolveCursorDefaultModel(model: string): string {
+    const stripped = this.stripVendorPrefix(model)
+    if (stripped.toLowerCase().trim() !== "default") {
+      return stripped
+    }
+
+    return ModelRouterService.DEFAULT_CURSOR_MODEL
+  }
+
   /**
    * Resolve model to appropriate backend.
    * Uses unified model-registry for all name resolution.
    */
   resolveModel(cursorModel: string): ModelRouteResult {
-    const stripped = this.stripVendorPrefix(cursorModel)
+    const stripped = this.resolveCursorDefaultModel(cursorModel)
     const normalized = stripped.toLowerCase().trim()
     const family = detectModelFamily(normalized)
     const entry = resolveCloudCodeModel(normalized)
@@ -526,7 +536,7 @@ export class ModelRouterService {
             ? ` | fallback=${gptCandidates.fallbacks.map((candidate) => candidate.backend).join(",")}`
             : ""
           this.logger.log(
-            `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
+            `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}${stripped !== cursorModel ? ` (resolved=${stripped})` : ""}`
           )
           return route
         }

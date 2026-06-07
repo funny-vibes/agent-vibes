@@ -63,4 +63,19 @@ describe("ModelRouterService", () => {
       model: "gpt-5.5",
     })
   })
+
+  it("routes Cursor default model intent to OpenAI-compatible gpt-5.5", () => {
+    const router = new ModelRouterService()
+    router.setGptAvailabilityProviders({
+      codex: () => false,
+      openaiCompat: () => true,
+      codexSupportsModel: () => false,
+      openaiCompatSupportsModel: (model) => model === "gpt-5.5",
+    })
+
+    expect(router.resolveModel("default")).toMatchObject({
+      backend: "openai-compat",
+      model: "gpt-5.5",
+    })
+  })
 })
