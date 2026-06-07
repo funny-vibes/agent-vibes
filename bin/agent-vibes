@@ -5,6 +5,7 @@
  * Usage:
  *   agent-vibes                          Start the gateway server
  *   agent-vibes cert                     Generate SSL certificates
+ *   agent-vibes self-managed install     Install BYOK Cursor Agent gateway
  *   agent-vibes sync --ide|--tools [--accounts-file PATH]
  *                                         Sync Antigravity credentials
  *   agent-vibes sync --claude [--accounts-file PATH]
@@ -67,6 +68,10 @@ Configuration:
   All sync commands support:
     --accounts-file PATH              Write to a specific accounts JSON file
   Cursor:
+    agent-vibes self-managed install     Install BYOK Cursor Agent gateway
+    agent-vibes self-managed configure   Configure OpenAI-compatible account
+    agent-vibes self-managed status      Show self-managed gateway status
+    agent-vibes self-managed uninstall   Remove self-managed gateway services
     agent-vibes cert                  Generate SSL certificates (requires mkcert)
     agent-vibes forward hosts         Print /etc/hosts entries
     agent-vibes forward on            Enable port forwarding (requires sudo)
@@ -490,6 +495,10 @@ if (command === "forward") {
   } else {
     nodeScript("scripts/proxy/setup-forwarding.js", [subCmd])
   }
+}
+
+if (command === "self-managed") {
+  nodeScript("scripts/self-managed/cursor-agent-gateway.js", args.slice(1))
 }
 
 if (command === "capture") {
