@@ -133,6 +133,27 @@ function normalizeOpenAiCompatReasoningEffort(effort: string): string {
   }
 }
 
+function normalizeOpenAiCompatServiceTier(
+  rawValue?: string | null
+): string | undefined {
+  const normalized = rawValue?.trim().toLowerCase()
+  if (!normalized) {
+    return undefined
+  }
+
+  switch (normalized.replace(/[^a-z0-9]+/g, "_")) {
+    case "priority":
+    case "fast":
+    case "true":
+    case "on":
+    case "enabled":
+    case "1":
+      return "priority"
+    default:
+      return normalized
+  }
+}
+
 function convertOpenAiCompatBudgetToEffort(budgetTokens: number): string {
   if (budgetTokens < 0) return normalizeOpenAiCompatReasoningEffort("auto")
   if (budgetTokens === 0) return normalizeOpenAiCompatReasoningEffort("none")
@@ -390,6 +411,7 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   baseUrl: string
   proxyUrl?: string
   preferResponsesApi?: boolean
+  serviceTier?: string
   maxContextTokens?: number
   allowedModels?: string[]
   source: "env" | "file"
@@ -404,6 +426,7 @@ interface OpenaiCompatAccountFileEntry {
   baseUrl?: string
   proxyUrl?: string
   preferResponsesApi?: boolean
+  serviceTier?: string
   maxContextTokens?: number
   allowedModels?: string[]
 }
@@ -523,6 +546,7 @@ export class OpenaiCompatService implements OnModuleInit {
     baseUrl: string
     proxyUrl?: string
     preferResponsesApi?: boolean
+    serviceTier?: string
     maxContextTokens?: number
     allowedModels?: string[]
     source: "env" | "file"
@@ -533,6 +557,7 @@ export class OpenaiCompatService implements OnModuleInit {
       baseUrl: params.baseUrl,
       proxyUrl: params.proxyUrl,
       preferResponsesApi: params.preferResponsesApi,
+      serviceTier: normalizeOpenAiCompatServiceTier(params.serviceTier),
       maxContextTokens: this.normalizeMaxContextTokens(params.maxContextTokens),
       allowedModels: this.normalizeAllowedModels(params.allowedModels),
       source: params.source,
@@ -905,6 +930,7 @@ export class OpenaiCompatService implements OnModuleInit {
     const envProxyUrl = this.configService
       .get<string>("OPENAI_COMPAT_PROXY_URL", "")
       .trim()
+    const envServiceTier = this.getEnvServiceTier()
     const envMaxContextTokens = this.normalizeMaxContextTokens(
       this.configService.get<number>("OPENAI_COMPAT_MAX_CONTEXT_TOKENS")
     )
@@ -921,6 +947,7 @@ export class OpenaiCompatService implements OnModuleInit {
             apiKey: envApiKey,
             baseUrl: envBaseUrl,
             proxyUrl: envProxyUrl || undefined,
+            serviceTier: envServiceTier,
             maxContextTokens: envMaxContextTokens,
             source: "env",
           })
@@ -985,6 +1012,7 @@ export class OpenaiCompatService implements OnModuleInit {
    * Load all accounts from openai-compat-accounts.json.
    */
   private loadAllAccountsFromFile(): OpenaiCompatAccount[] {
+    const envServiceTier = this.getEnvServiceTier()
     const configPaths = getAccountConfigPathCandidates(
       "openai-compat-accounts.json"
     )
@@ -1022,6 +1050,7 @@ export class OpenaiCompatService implements OnModuleInit {
                 baseUrl: a.baseUrl,
                 proxyUrl: a.proxyUrl,
                 preferResponsesApi: a.preferResponsesApi === true,
+                serviceTier: a.serviceTier ?? envServiceTier,
                 maxContextTokens: a.maxContextTokens,
                 allowedModels: a.allowedModels,
                 source: "file",
@@ -1036,6 +1065,13 @@ export class OpenaiCompatService implements OnModuleInit {
     }
 
     return []
+  }
+
+  private getEnvServiceTier(): string {
+    return (
+      this.configService.get<string>("OPENAI_COMPAT_SERVICE_TIER", "").trim() ||
+      this.configService.get<string>("CODEX_SERVICE_TIER", "").trim()
+    )
   }
 
   /**
@@ -1288,6 +1324,19 @@ export class OpenaiCompatService implements OnModuleInit {
     } catch (e) {
       this.logger.error(`Failed to create proxy agent: ${(e as Error).message}`)
       return undefined
+    }
+  }
+
+  private applyServiceTier(
+    request: Record<string, unknown>,
+    account: OpenaiCompatAccount,
+    requestedServiceTier?: string
+  ): void {
+    const serviceTier =
+      normalizeOpenAiCompatServiceTier(requestedServiceTier) ||
+      account.serviceTier
+    if (serviceTier) {
+      request.service_tier = serviceTier
     }
   }
 
@@ -2018,9 +2067,10 @@ export class OpenaiCompatService implements OnModuleInit {
     const request = this.translateRequest(dto, false)
     const url = this.buildUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, false)
+    this.applyServiceTier(request, account, dto.service_tier)
 
     this.logger.log(
-      `[OpenAI-Compat] Non-stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}`
+      `[OpenAI-Compat] Non-stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}, service_tier=${JSON.stringify(request.service_tier || null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -2278,9 +2328,10 @@ export class OpenaiCompatService implements OnModuleInit {
     const request = this.translateRequest(dto, true)
     const url = this.buildUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, true)
+    this.applyServiceTier(request, account, dto.service_tier)
 
     this.logger.log(
-      `[OpenAI-Compat] Stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}`
+      `[OpenAI-Compat] Stream request: model=${request.model}, url=${url}, reasoning=${JSON.stringify(request.reasoning || null)}, service_tier=${JSON.stringify(request.service_tier || null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -2978,12 +3029,13 @@ export class OpenaiCompatService implements OnModuleInit {
       string,
       unknown
     >
+    this.applyServiceTier(codexRequest, account, dto.service_tier)
     const url = this.buildResponsesUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, true)
     const requestBody = JSON.stringify(codexRequest)
 
     this.logger.log(
-      `[OpenAI-Compat/Responses] Stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify(codexRequest.reasoning || null)}`
+      `[OpenAI-Compat/Responses] Stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify(codexRequest.reasoning || null)}, service_tier=${JSON.stringify(codexRequest.service_tier || null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -3209,12 +3261,13 @@ export class OpenaiCompatService implements OnModuleInit {
       string,
       unknown
     >
+    this.applyServiceTier(codexRequest, account, dto.service_tier)
     const url = this.buildResponsesUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, true) // Responses API always streams
     const requestBody = JSON.stringify(codexRequest)
 
     this.logger.log(
-      `[OpenAI-Compat/Responses] Non-stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify(codexRequest.reasoning || null)}`
+      `[OpenAI-Compat/Responses] Non-stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify(codexRequest.reasoning || null)}, service_tier=${JSON.stringify(codexRequest.service_tier || null)}`
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {

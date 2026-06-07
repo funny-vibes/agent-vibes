@@ -79,6 +79,9 @@ Options:
                                (or set SKYLINK_API_KEY / OPENAI_COMPAT_API_KEY)
   --responses-mode MODE        auto | always | never (default: auto)
   --prefer-responses           Prefer /responses for this account
+  --fast                       Request priority/fast service tier (default)
+  --no-fast                    Do not request priority service tier
+  --service-tier TIER          Explicit service tier (fast maps to priority)
   --max-context-tokens N       Optional account context limit
   --skip-build                 Do not run npm run build during install
   --skip-cert                  Do not run agent-vibes cert during install
@@ -100,6 +103,30 @@ function option(name, fallback) {
 
 function hasFlag(name) {
   return args.includes(name)
+}
+
+function normalizeServiceTier(rawValue) {
+  const normalized = String(rawValue || "")
+    .trim()
+    .toLowerCase()
+  if (!normalized) return undefined
+  switch (normalized.replace(/[^a-z0-9]+/g, "_")) {
+    case "priority":
+    case "fast":
+    case "true":
+    case "on":
+    case "enabled":
+    case "1":
+      return "priority"
+    case "none":
+    case "off":
+    case "false":
+    case "disabled":
+    case "0":
+      return undefined
+    default:
+      return normalized
+  }
 }
 
 function ensureDir(dir) {
@@ -232,6 +259,16 @@ function configureAccount() {
   )
   const preferResponses =
     hasFlag("--prefer-responses") || responsesMode === "always"
+  const serviceTier = hasFlag("--no-fast")
+    ? undefined
+    : normalizeServiceTier(
+        option(
+          "--service-tier",
+          process.env.OPENAI_COMPAT_SERVICE_TIER ||
+            process.env.CODEX_SERVICE_TIER ||
+            "priority"
+        )
+      )
   const maxContextTokens = option("--max-context-tokens")
 
   if (!apiKey) {
@@ -240,7 +277,7 @@ function configureAccount() {
         "Missing API key. Pass --api-key or set SKYLINK_API_KEY / OPENAI_COMPAT_API_KEY."
       )
     }
-    writeSelfConfig({ responsesMode, port: BRIDGE_PORT })
+    writeSelfConfig({ responsesMode, serviceTier, port: BRIDGE_PORT })
     console.log(
       `${YELLOW}⊘${NC} No API key provided; kept existing accounts file`
     )
@@ -259,6 +296,7 @@ function configureAccount() {
     apiKey,
     preferResponsesApi: preferResponses,
   }
+  if (serviceTier) account.serviceTier = serviceTier
   if (maxContextTokens) account.maxContextTokens = Number(maxContextTokens)
 
   const idx = data.accounts.findIndex((item) => item.label === label)
@@ -270,6 +308,7 @@ function configureAccount() {
   })
   writeSelfConfig({
     responsesMode,
+    serviceTier,
     port: BRIDGE_PORT,
     accountsPath: ACCOUNTS_PATH,
   })
@@ -278,6 +317,9 @@ function configureAccount() {
   )
   console.log(
     `${GREEN}✓${NC} Responses mode: ${responsesMode}${preferResponses ? " (account prefers /responses)" : ""}`
+  )
+  console.log(
+    `${GREEN}✓${NC} Service tier: ${serviceTier || "default"}${serviceTier === "priority" ? " (fast)" : ""}`
   )
 }
 
@@ -391,6 +433,7 @@ function installMacServices() {
     AGENT_VIBES_DATA_DIR: DATA_DIR,
     AGENT_VIBES_OPENAI_COMPAT_ACCOUNTS_PATH: ACCOUNTS_PATH,
     OPENAI_COMPAT_USE_RESPONSES_API: cfg.responsesMode || "auto",
+    OPENAI_COMPAT_SERVICE_TIER: cfg.serviceTier || "",
     PORT: String(BRIDGE_PORT),
   }
   writeLaunchdPlist(
@@ -425,6 +468,7 @@ function writeWindowsLaunchers() {
       `set "AGENT_VIBES_DATA_DIR=${DATA_DIR}"`,
       `set "AGENT_VIBES_OPENAI_COMPAT_ACCOUNTS_PATH=${ACCOUNTS_PATH}"`,
       `set "OPENAI_COMPAT_USE_RESPONSES_API=${cfg.responsesMode || "auto"}"`,
+      `set "OPENAI_COMPAT_SERVICE_TIER=${cfg.serviceTier || ""}"`,
       `set "PORT=${BRIDGE_PORT}"`,
       `"${node}" "${main}" >> "${path.join(LOG_DIR, "protocol-bridge.out.log")}" 2>> "${path.join(LOG_DIR, "protocol-bridge.err.log")}"`,
       "",
@@ -489,6 +533,7 @@ Description=Agent Vibes protocol bridge
 Environment=AGENT_VIBES_DATA_DIR=${DATA_DIR}
 Environment=AGENT_VIBES_OPENAI_COMPAT_ACCOUNTS_PATH=${ACCOUNTS_PATH}
 Environment=OPENAI_COMPAT_USE_RESPONSES_API=${cfg.responsesMode || "auto"}
+Environment=OPENAI_COMPAT_SERVICE_TIER=${cfg.serviceTier || ""}
 Environment=PORT=${BRIDGE_PORT}
 ExecStart=${node} ${main}
 Restart=always
@@ -618,10 +663,12 @@ function summarizeAccounts() {
   if (!fs.existsSync(ACCOUNTS_PATH)) return []
   try {
     const data = JSON.parse(fs.readFileSync(ACCOUNTS_PATH, "utf8"))
+    const cfg = readSelfConfig()
     return (data.accounts || []).map((account) => ({
       label: account.label,
       baseUrl: account.baseUrl,
       preferResponsesApi: account.preferResponsesApi === true,
+      serviceTier: account.serviceTier || cfg.serviceTier,
       hasApiKey: Boolean(account.apiKey),
     }))
   } catch {
@@ -660,7 +707,7 @@ async function status() {
   console.log(`  Accounts:     ${payload.accounts.length}`)
   for (const account of payload.accounts) {
     console.log(
-      `    - ${account.label || "(unnamed)"} ${DIM}${account.baseUrl || ""}${NC} responses=${account.preferResponsesApi ? "prefer" : "default"} key=${account.hasApiKey ? "yes" : "no"}`
+      `    - ${account.label || "(unnamed)"} ${DIM}${account.baseUrl || ""}${NC} responses=${account.preferResponsesApi ? "prefer" : "default"} tier=${account.serviceTier || "default"} key=${account.hasApiKey ? "yes" : "no"}`
     )
   }
 }
