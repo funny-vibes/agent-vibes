@@ -839,6 +839,8 @@ export class CursorConnectStreamService {
   private lastHeartbeatLog = 0
   private readonly HEARTBEAT_LOG_INTERVAL = 60000 // Log heartbeat once per minute
   private readonly KEEPALIVE_INTERVAL = 10000 // 每10秒发送心跳
+  private readonly SUBAGENT_EXEC_RESULT_TIMEOUT_MS = 10 * 60 * 1000
+  private readonly SUBAGENT_MCP_EXEC_RESULT_TIMEOUT_MS = 120 * 1000
   // 历史消息截断默认值（当 Cursor 未传预算参数时兜底）
   private readonly DEFAULT_HISTORY_MAX_TOKENS = 166_000
   // Cloud Code 输入 hard cap（从报错与流量观测验证）
@@ -14703,7 +14705,16 @@ ${raw}
           const waitPromise = this.subagentExecBridge.awaitResult(
             conversationId,
             ctx.subagentId,
-            tc.id
+            tc.id,
+            {
+              timeoutMs:
+                innerToolFamilyHint === "mcp"
+                  ? this.SUBAGENT_MCP_EXEC_RESULT_TIMEOUT_MS
+                  : this.SUBAGENT_EXEC_RESULT_TIMEOUT_MS,
+              timeoutMessage:
+                `[SubAgent] Timed out waiting for Cursor IDE to return ` +
+                `${tc.name} (${tc.id}) for ${ctx.subagentId}.`,
+            }
           )
           try {
             // Yield the ExecServerMessage on the parent BiDi stream so the
@@ -14752,24 +14763,26 @@ ${raw}
             // Implementation: Promise.race the bridge waiter against a
             // timeout token; on timeout yield a heartbeat and re-race
             // until the real waiter wins.
+            type ExecWaitWinner =
+              | { kind: "result"; value: SubagentExecResult }
+              | { kind: "error"; error: unknown }
+              | { kind: "heartbeat" }
+            const settledWaitPromise: Promise<ExecWaitWinner> =
+              waitPromise.then(
+                (value) => ({ kind: "result" as const, value }),
+                (error) => ({ kind: "error" as const, error })
+              )
             let execResult: SubagentExecResult | undefined
             const HEARTBEAT_MS = this.KEEPALIVE_INTERVAL
             while (true) {
-              type RaceWinner =
-                | { kind: "result"; value: SubagentExecResult }
-                | { kind: "heartbeat" }
               let timeoutHandle: NodeJS.Timeout | undefined
-              const heartbeatToken = new Promise<RaceWinner>((resolve) => {
-                timeoutHandle = setTimeout(
-                  () => resolve({ kind: "heartbeat" as const }),
-                  HEARTBEAT_MS
-                )
+              const heartbeatToken = new Promise<ExecWaitWinner>((resolve) => {
+                timeoutHandle = setTimeout(() => {
+                  resolve({ kind: "heartbeat" as const })
+                }, HEARTBEAT_MS)
               })
-              const winner: RaceWinner = await Promise.race([
-                waitPromise.then((value) => ({
-                  kind: "result" as const,
-                  value,
-                })),
+              const winner = await Promise.race([
+                settledWaitPromise,
                 heartbeatToken,
               ])
               if (timeoutHandle) {
@@ -14778,6 +14791,9 @@ ${raw}
               if (winner.kind === "result") {
                 execResult = winner.value
                 break
+              }
+              if (winner.kind === "error") {
+                throw winner.error
               }
               this.logger.debug(
                 `[SubAgent] Heartbeat while waiting for exec result ` +
