@@ -162,7 +162,10 @@ export class ChatGptWebProtocolService {
   async createChatCompletion(
     req: OpenAiChatCompletionRequest
   ): Promise<OpenAiChatCompletionResponse> {
-    const messages = normalizeChatMessages(req.messages)
+    const messages = withResponseFormat(
+      normalizeChatMessages(req.messages),
+      req.response_format
+    )
     const thread = this.threadFromRequest(req)
     const id = `chatcmpl-${randomId()}`
 
@@ -193,7 +196,9 @@ export class ChatGptWebProtocolService {
           index: 0,
           message: {
             role: "assistant",
-            content: text,
+            // A JSON-mode caller parses this directly, and the web backend
+            // still tends to fence its answer however the prompt asks.
+            content: req.response_format ? unfenceJson(text) : text,
             ...(reasoning ? { reasoning_content: reasoning } : {}),
           },
           finish_reason: "stop",
@@ -211,7 +216,12 @@ export class ChatGptWebProtocolService {
   async *createChatCompletionStream(
     req: OpenAiChatCompletionRequest
   ): AsyncGenerator<string, void, unknown> {
-    const messages = normalizeChatMessages(req.messages)
+    // Deltas cannot be unfenced after the fact, so the instruction carries the
+    // whole contract here: it forbids the fence rather than stripping it.
+    const messages = withResponseFormat(
+      normalizeChatMessages(req.messages),
+      req.response_format
+    )
     const thread = this.threadFromRequest(req)
     const id = `chatcmpl-${randomId()}`
     const created = Math.floor(Date.now() / 1_000)
@@ -460,6 +470,58 @@ function normalizeChatMessages(
     if (content) normalized.push({ role, content })
   }
   return normalized
+}
+
+/**
+ * ChatGPT Web has no structured-output mode: upstream ignores
+ * `response_format` outright, so a `json_schema` caller receives prose — or a
+ * bare scalar where it asked for an object — and fails to parse it. The
+ * contract is restored the only way this backend honours, as an instruction
+ * the model reads, and the schema travels with it so `strict` still means
+ * something.
+ *
+ * The instruction rides on the last user message rather than a system turn of
+ * its own: a continuing thread resends only that message, so a separate turn
+ * would be dropped on every request after the first.
+ */
+function withResponseFormat(
+  messages: ChatGptWebMessage[],
+  format: OpenAiChatCompletionRequest["response_format"]
+): ChatGptWebMessage[] {
+  const type = typeof format?.type === "string" ? format.type : ""
+  if (type !== "json_object" && type !== "json_schema") return messages
+
+  const lines = [
+    "Respond with a single JSON value and nothing else.",
+    "Do not wrap it in a code fence and do not add commentary around it.",
+  ]
+  const schema = (format as { json_schema?: { schema?: unknown } })?.json_schema
+    ?.schema
+  if (type === "json_schema" && schema) {
+    lines.push(
+      "The JSON must validate against this schema:",
+      JSON.stringify(schema)
+    )
+  }
+  const instruction = lines.join("\n")
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]!.role !== "user") continue
+    const carried = messages.slice()
+    carried[index] = {
+      role: "user",
+      content: `${messages[index]!.content}\n\n${instruction}`,
+    }
+    return carried
+  }
+  return [...messages, { role: "user", content: instruction }]
+}
+
+/** Strip a fence the model added anyway, so the caller can parse directly. */
+function unfenceJson(text: string): string {
+  const trimmed = text.trim()
+  const fenced = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n?```$/i.exec(trimmed)
+  return fenced ? fenced[1]!.trim() : trimmed
 }
 
 function normalizeResponsesInput(
