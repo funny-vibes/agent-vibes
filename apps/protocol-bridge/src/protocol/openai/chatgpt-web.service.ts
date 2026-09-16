@@ -494,13 +494,21 @@ function withResponseFormat(
   const lines = [
     "Respond with a single JSON value and nothing else.",
     "Do not wrap it in a code fence and do not add commentary around it.",
+    "Escape newlines and other control characters inside string values.",
   ]
   const schema = (format as { json_schema?: { schema?: unknown } })?.json_schema
     ?.schema
   if (type === "json_schema" && schema) {
     lines.push(
       "The JSON must validate against this schema:",
-      JSON.stringify(schema)
+      JSON.stringify(schema),
+      // Observed: asked for one `drill` object the model wanted to give two, so
+      // it wrote `"drill":{…},{…}` — a second object where the next property
+      // name belonged, which no parser accepts. Cardinality needs saying out
+      // loud, because this backend treats the schema as advice either way.
+      "Match the structure exactly. Where the schema declares an object, emit" +
+        " exactly one object; only an array may hold several entries. Never" +
+        " place a second value after one that is already complete."
     )
   }
   const instruction = lines.join("\n")
