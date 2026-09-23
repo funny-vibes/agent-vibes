@@ -650,6 +650,21 @@ const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
     ownedBy: "openai",
     displayName: "GPT 5.3 Codex Spark",
   },
+  "gpt-6-sol": {
+    createdAt: 1790121600,
+    ownedBy: "openai",
+    displayName: "GPT 6 Sol",
+  },
+  "gpt-6-luna": {
+    createdAt: 1790121600,
+    ownedBy: "openai",
+    displayName: "GPT 6 Luna",
+  },
+  "gpt-6-astra": {
+    createdAt: 1790121600,
+    ownedBy: "openai",
+    displayName: "GPT 6 Astra",
+  },
   "gpt-5.6-sol": {
     createdAt: 1783555200,
     ownedBy: "openai",
