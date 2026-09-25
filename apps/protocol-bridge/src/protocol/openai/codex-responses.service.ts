@@ -28,6 +28,27 @@ interface StoredResponse {
   output_json: string
 }
 
+/**
+ * A terminal Responses frame carries the whole response, `output` included:
+ * clients such as the OpenAI Agents SDK read a turn's final output only from
+ * `response.completed`. The codex backend leaves that `output` empty and sends
+ * the items on the intermediate `response.output_item.done` events, so the
+ * frame is completed from those before it leaves the bridge — the same
+ * backfill `CodexWebSocketService.sendViaWebSocket` applies to non-streaming
+ * calls. Without it a streaming caller sees a turn with no output and asks the
+ * model again, until its turn limit.
+ */
+export function withTerminalOutput(
+  response: Record<string, unknown>,
+  collected: readonly Record<string, unknown>[]
+): Record<string, unknown> {
+  return Array.isArray(response.output) && response.output.length
+    ? response
+    : collected.length
+      ? { ...response, output: [...collected] }
+      : response
+}
+
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 const MAX_HISTORY_BYTES = 32 * 1024 * 1024
 
@@ -73,12 +94,7 @@ export class CodexResponsesService {
         undefined,
         "stream_closed"
       )
-    return {
-      ...response,
-      ...(Array.isArray(response.output) && response.output.length
-        ? {}
-        : { output }),
-    }
+    return withTerminalOutput(response, output)
   }
 
   async *stream(
@@ -191,6 +207,11 @@ export class CodexResponsesService {
         ].includes(String(event.type))
       ) {
         terminal = true
+        if (event.response && typeof event.response === "object")
+          event.response = withTerminalOutput(
+            event.response as Record<string, unknown>,
+            output
+          )
         const response = event.response as Record<string, unknown>
         if (!response || typeof response.id !== "string")
           throw new CodexApiError(
@@ -207,9 +228,7 @@ export class CodexResponsesService {
             model,
             response.id,
             input,
-            Array.isArray(response.output) && response.output.length
-              ? response.output
-              : output
+            Array.isArray(response.output) ? response.output : output
           )
         }
         yield `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`

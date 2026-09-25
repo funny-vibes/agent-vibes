@@ -7,6 +7,7 @@ import { SocksProxyAgent } from "socks-proxy-agent"
 import { CodexService } from "./codex.service"
 import type { CodexRealtimeAccountLease } from "./codex-realtime-account"
 import { UpstreamRequestAbortedError } from "../shared/abort-signal"
+import type { ChatGptWebImage } from "./chatgpt-web-image"
 import {
   ChatGptWebSessionError,
   ChatGptWebSessionStore,
@@ -33,6 +34,9 @@ import {
  *   - Custom `tools` in the request body are silently ignored by upstream —
  *     there is no native function calling here. A system message, however, is
  *     honoured, which is what makes prompt-directed behaviour possible.
+ *   - There is no inline image: bytes go to the account's file store first
+ *     (`backend-api/files`), and the message names the result through a
+ *     `multimodal_text` content block. See `attachImages` below.
  */
 
 const ORIGIN = "https://chatgpt.com"
@@ -50,6 +54,29 @@ const CITATION_MARKERS = /\u{E200}[\s\S]*?\u{E201}|[\u{E200}-\u{E206}]/gu
 export interface ChatGptWebMessage {
   readonly role: "system" | "user" | "assistant"
   readonly content: string
+  /**
+   * Images attached to this message, already decoded.
+   *
+   * Left out for the text-only turns that are nearly all of them, which is
+   * what keeps their payload exactly what it was before images existed.
+   */
+  readonly images?: readonly ChatGptWebImage[]
+}
+
+/** One image after upstream has taken the bytes and named them. */
+interface ChatGptWebAttachment {
+  readonly fileId: string
+  readonly assetPointer: string
+  readonly name: string
+  readonly size: number
+  readonly mimeType: string
+  readonly width: number
+  readonly height: number
+}
+
+/** A message with its images turned into ids upstream will accept. */
+interface AttachedMessage extends ChatGptWebMessage {
+  readonly attachments?: readonly ChatGptWebAttachment[]
 }
 
 export interface ChatGptWebRequest {
@@ -149,14 +176,20 @@ export class ChatGptWebConversationService {
     return lease
   }
 
-  private async headers(
+  private baseHeaders(
     lease: CodexRealtimeAccountLease
   ): Promise<Record<string, string>> {
-    const base = await this.sessions.baseHeaders(
+    return this.sessions.baseHeaders(
       lease.accountKey,
       lease.accessToken,
       accountIdFromToken(lease.accessToken)
     )
+  }
+
+  private async headers(
+    lease: CodexRealtimeAccountLease,
+    base: Record<string, string>
+  ): Promise<Record<string, string>> {
     const sentinel = await this.sessions.sentinelHeaders(lease.accountKey, base)
     // No device-id override here: baseHeaders already carries the `oai-did`
     // upstream handed back during the handshake, and header and cookie
@@ -334,7 +367,13 @@ export class ChatGptWebConversationService {
     }
 
     const lease = await this.lease()
-    const body = this.buildPayload(slug, req.messages, req.thinkingEffort, {
+    const base = await this.baseHeaders(lease)
+    // Uploaded before the turn opens, never alongside it: the message can only
+    // name a file the account's store already holds. An upload that fails
+    // throws from here rather than sending the turn anyway — an answer to a
+    // question whose picture went missing is worse than no answer at all.
+    const carried = await this.attachImages(lease, base, req.messages)
+    const body = this.buildPayload(slug, carried, req.thinkingEffort, {
       conversationId: req.conversationId,
       parentMessageId: req.parentMessageId,
     })
@@ -343,7 +382,7 @@ export class ChatGptWebConversationService {
     try {
       response = await fetch(`${ORIGIN}/backend-api/conversation`, {
         method: "POST",
-        headers: await this.headers(lease),
+        headers: await this.headers(lease, base),
         body: JSON.stringify(body),
         dispatcher: this.proxyDispatcher(lease),
         signal: req.signal,
@@ -386,9 +425,177 @@ export class ChatGptWebConversationService {
     return response.body
   }
 
+  /**
+   * Put every attached image on the account's file store, and hand back the
+   * same messages with ids upstream will accept in their place.
+   *
+   * Three calls per image, which is what the web app itself makes: ask for an
+   * upload slot, PUT the bytes to the signed URL that comes back, then tell
+   * the backend the upload finished. Text-only messages pass straight
+   * through and make no calls at all.
+   */
+  private async attachImages(
+    lease: CodexRealtimeAccountLease,
+    base: Record<string, string>,
+    messages: readonly ChatGptWebMessage[]
+  ): Promise<readonly AttachedMessage[]> {
+    if (!messages.some((message) => message.images?.length)) return messages
+
+    const carried: AttachedMessage[] = []
+    for (const message of messages) {
+      if (!message.images?.length) {
+        carried.push(message)
+        continue
+      }
+      const attachments: ChatGptWebAttachment[] = []
+      for (const image of message.images) {
+        attachments.push(await this.uploadImage(lease, base, image))
+      }
+      carried.push({ ...message, attachments })
+    }
+    return carried
+  }
+
+  private async uploadImage(
+    lease: CodexRealtimeAccountLease,
+    base: Record<string, string>,
+    image: ChatGptWebImage
+  ): Promise<ChatGptWebAttachment> {
+    const size = image.bytes.byteLength
+    // `width`/`height` ride along with the slot request because upstream
+    // stores them against the file; the asset pointer in the message repeats
+    // them, and a mismatch is what makes the web UI render a broken tile.
+    const slot = (await this.fileCall(lease, base, "files", {
+      file_name: image.fileName,
+      file_size: size,
+      use_case: "multimodal",
+      mime_type: image.mimeType,
+      width: image.width,
+      height: image.height,
+    })) as { file_id?: unknown; upload_url?: unknown }
+
+    const fileId = typeof slot.file_id === "string" ? slot.file_id : ""
+    const uploadUrl = typeof slot.upload_url === "string" ? slot.upload_url : ""
+    if (!fileId || !uploadUrl) {
+      // A 200 that names neither is upstream's fault, not the account's, but
+      // the lease is open and something has to settle it.
+      lease.reject(502, "file upload slot missing file_id or upload_url")
+      throw new ChatGptWebError(
+        502,
+        "chatgpt_web_upload_failed",
+        `ChatGPT Web offered no upload slot for ${image.fileName}`
+      )
+    }
+
+    let put: Response
+    try {
+      put = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "content-type": image.mimeType,
+          // The signed URL points at blob storage, which refuses a PUT that
+          // does not say what kind of blob it is holding.
+          "x-ms-blob-type": "BlockBlob",
+          "x-ms-version": "2020-04-08",
+          // Deliberately no authorization and no cookie: the signature in the
+          // URL is the whole credential, and the account's bearer has no
+          // business being sent to a storage host.
+        },
+        body: image.bytes,
+        dispatcher: this.proxyDispatcher(lease),
+        signal: AbortSignal.timeout(this.sessions.settings.requestTimeoutMs),
+      } as RequestInit)
+    } catch (error) {
+      // Abandoned rather than rejected throughout this block: the PUT goes to
+      // blob storage, which has no opinion about the account. Charging it
+      // would cool down a healthy account over a storage hiccup, and with a
+      // one-account pool the next request would have nowhere to go.
+      lease.abandon()
+      throw new ChatGptWebError(
+        502,
+        "chatgpt_web_upload_failed",
+        `Uploading ${image.fileName} to ChatGPT Web failed: ${describe(error)}`
+      )
+    }
+    if (!put.ok) {
+      const detail = (await put.text().catch(() => "")).slice(0, 300)
+      lease.abandon()
+      throw new ChatGptWebError(
+        502,
+        "chatgpt_web_upload_failed",
+        `Uploading ${image.fileName} to ChatGPT Web returned ${put.status}: ${detail}`
+      )
+    }
+
+    await this.fileCall(
+      lease,
+      base,
+      `files/${encodeURIComponent(fileId)}/uploaded`,
+      {}
+    )
+
+    // The id is the one thing worth having when an image arrives but the
+    // model does not see it: it says which scheme the pointer was built with.
+    this.logger.debug(
+      `Uploaded ${image.fileName} (${size} bytes) to ChatGPT Web as ${fileId}`
+    )
+    return {
+      fileId,
+      assetPointer: assetPointer(fileId),
+      name: image.fileName,
+      size,
+      mimeType: image.mimeType,
+      width: image.width,
+      height: image.height,
+    }
+  }
+
+  /**
+   * One JSON call against the file store, with the lease settled on failure.
+   *
+   * The sentinel token is not fetched for these: it is single-use and gates
+   * `conversation` alone, and spending one here would leave the turn itself
+   * without one.
+   */
+  private async fileCall(
+    lease: CodexRealtimeAccountLease,
+    base: Record<string, string>,
+    path: string,
+    body: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    let response: Response
+    try {
+      response = await fetch(`${ORIGIN}/backend-api/${path}`, {
+        method: "POST",
+        headers: { ...base, accept: "application/json" },
+        body: JSON.stringify(body),
+        dispatcher: this.proxyDispatcher(lease),
+        signal: AbortSignal.timeout(this.sessions.settings.requestTimeoutMs),
+      } as RequestInit)
+    } catch (error) {
+      lease.reject(502, describe(error))
+      throw new ChatGptWebError(
+        502,
+        "chatgpt_web_upload_failed",
+        `ChatGPT Web file upload (${path}) failed: ${describe(error)}`
+      )
+    }
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).slice(0, 300)
+      if (response.status === 403) this.sessions.invalidate(lease.accountKey)
+      lease.reject(response.status, detail)
+      throw new ChatGptWebError(
+        response.status === 401 ? 401 : 502,
+        "chatgpt_web_upload_failed",
+        `ChatGPT Web file upload (${path}) returned ${response.status}: ${detail}`
+      )
+    }
+    return (await response.json().catch(() => ({}))) as Record<string, unknown>
+  }
+
   private buildPayload(
     slug: string,
-    messages: readonly ChatGptWebMessage[],
+    messages: readonly AttachedMessage[],
     thinkingEffort?: string | null,
     thread?: {
       conversationId?: string | null
@@ -404,9 +611,12 @@ export class ChatGptWebConversationService {
         id: crypto.randomUUID(),
         author: { role: message.role },
         create_time: now,
-        content: { content_type: "text", parts: [message.content] },
+        content: messageContent(message),
         metadata: {
           serialization_metadata: { custom_symbol_offsets: [] },
+          ...(message.attachments?.length
+            ? { attachments: message.attachments.map(attachmentRecord) }
+            : {}),
           ...(hint ? { system_hints: [hint] } : {}),
         },
       })),
@@ -474,6 +684,39 @@ export class ChatGptWebConversationService {
         if (typeof event.conversation_id === "string")
           conversationId = event.conversation_id
 
+        // Upstream reports a refusal inside a perfectly ordinary 200 stream:
+        //
+        //   {"message":null,"conversation_id":"…","error":"Our systems have
+        //    detected unusual activity coming from your system. …"}
+        //
+        // Dropping it — which is what `if (!message) continue` did, since these
+        // frames carry `message: null` — left the turn to run to `[DONE]` with
+        // nothing emitted, and the caller received an empty assistant message
+        // with `finish_reason: "stop"`. A caller cannot tell that apart from a
+        // model that genuinely answered with nothing, so a blocked account
+        // looked like a model quirk: one consumer spent a morning tracing
+        // "why is the assistant returning an empty string" through three
+        // codebases before opening this stream and reading the sentence that
+        // had been here all along.
+        //
+        // Say it instead. 429 when the wording is a rate or activity limit so
+        // clients back off rather than retry, 502 otherwise.
+        const upstreamError =
+          typeof event.error === "string" && event.error.trim()
+            ? event.error.trim()
+            : undefined
+        if (upstreamError) {
+          const throttled =
+            /unusual activity|rate limit|too many|cooldown|quota/i.test(
+              upstreamError
+            )
+          throw new ChatGptWebError(
+            throttled ? 429 : 502,
+            throttled ? "chatgpt_web_throttled" : "chatgpt_web_upstream_error",
+            upstreamError
+          )
+        }
+
         const message = event.message as Record<string, unknown> | undefined
         if (!message) continue
 
@@ -531,6 +774,68 @@ function accountIdFromToken(accessToken: string): string {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * How a message says what it is carrying.
+ *
+ * A text-only message keeps the `text` block it has always sent, byte for
+ * byte. Only a message with an image switches to `multimodal_text`, where the
+ * pointers come first and the prompt last — the order the web app uses, and
+ * the one the model reads as "here is a picture, now the question about it".
+ */
+function messageContent(message: AttachedMessage): Record<string, unknown> {
+  if (!message.attachments?.length) {
+    return { content_type: "text", parts: [message.content] }
+  }
+  return {
+    content_type: "multimodal_text",
+    parts: [
+      ...message.attachments.map((attachment) => ({
+        content_type: "image_asset_pointer",
+        asset_pointer: attachment.assetPointer,
+        size_bytes: attachment.size,
+        width: attachment.width,
+        height: attachment.height,
+      })),
+      message.content,
+    ],
+  }
+}
+
+/**
+ * The same file again, in the shape the message metadata wants it.
+ *
+ * Upstream needs both: the part in `parts` is what the model is shown, and
+ * this record is what the thread renders as an attachment chip. A message
+ * carrying only one of the two arrives half-formed.
+ */
+function attachmentRecord(
+  attachment: ChatGptWebAttachment
+): Record<string, unknown> {
+  return {
+    id: attachment.fileId,
+    size: attachment.size,
+    name: attachment.name,
+    mime_type: attachment.mimeType,
+    width: attachment.width,
+    height: attachment.height,
+    source: "local",
+  }
+}
+
+/**
+ * The scheme an asset pointer uses to name a file.
+ *
+ * ChatGPT changed both at once: the older `file-…` ids are addressed as
+ * `file-service://`, the newer `file_…` ones as `sediment://`. Reading the
+ * scheme off the id upstream just handed back keeps either working without a
+ * version to keep in step.
+ */
+function assetPointer(fileId: string): string {
+  return fileId.startsWith("file_")
+    ? `sediment://${fileId}`
+    : `file-service://${fileId}`
 }
 
 /** Pull renderable text out of a message's content block. */
