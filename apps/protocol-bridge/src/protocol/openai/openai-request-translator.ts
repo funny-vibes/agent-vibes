@@ -275,6 +275,12 @@ export function translateOpenAiChatToCreateMessage(
     dto.output_config = { effort: req.reasoning_effort }
   }
 
+  // service_tier ("fast", "priority", ...) is carried as-is; the backend
+  // decides what it means (Codex reads "fast" as its priority tier).
+  if (typeof req.service_tier === "string" && req.service_tier) {
+    dto.service_tier = req.service_tier
+  }
+
   return dto
 }
 
@@ -369,6 +375,7 @@ export function translateOpenAiResponseToCreateMessage(
     temperature: req.temperature,
     top_p: req.top_p,
     reasoning_effort: req.reasoning?.effort,
+    service_tier: req.service_tier,
   })
 }
 

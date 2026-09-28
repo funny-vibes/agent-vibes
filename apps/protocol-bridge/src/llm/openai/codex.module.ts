@@ -7,6 +7,7 @@ import { CodexClientIdentityService } from "./codex-client-identity.service"
 import { CodexWebSocketService } from "./codex-websocket.service"
 import { CodexService } from "./codex.service"
 import { ChatGptWebRealtimeService } from "./chatgpt-web-realtime.service"
+import { CodexVoiceCallService } from "./codex-voice-call.service"
 import { ChatGptWebVoiceTransport } from "./chatgpt-web-transport"
 import { ChatGptWebSessionStore } from "./chatgpt-web-session"
 import { ChatGptWebConversationService } from "./chatgpt-web-conversation.service"
@@ -22,6 +23,7 @@ import { ChatGptWebCursorBridge } from "./chatgpt-web-cursor-bridge.service"
     CodexService,
     ChatGptWebVoiceTransport,
     ChatGptWebRealtimeService,
+    CodexVoiceCallService,
     ChatGptWebSessionStore,
     ChatGptWebConversationService,
     ChatGptWebCursorBridge,
@@ -33,6 +35,7 @@ import { ChatGptWebCursorBridge } from "./chatgpt-web-cursor-bridge.service"
     CodexWebSocketService,
     CodexService,
     ChatGptWebRealtimeService,
+    CodexVoiceCallService,
     ChatGptWebSessionStore,
     ChatGptWebConversationService,
     ChatGptWebCursorBridge,

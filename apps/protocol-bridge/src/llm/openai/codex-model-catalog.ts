@@ -153,9 +153,12 @@ export function getCodexModelProfile(
   scope?: string
 ): CodexModelProfile | undefined {
   if (scope)
-    return remote.has(scope)
-      ? remote.get(scope)!.get(model)
-      : bundled.get(model)
+    // An account's fetched catalog is an advertisement, not an authorization:
+    // 2026-09-23 the Codex API served `gpt-6-sol` for an account whose
+    // catalog did not list it, while this lookup refused the request before
+    // it was ever sent. Fall back to the bundled catalog so the upstream
+    // decides what it will serve; a model it really lacks still fails there.
+    return remote.get(scope)?.get(model) ?? bundled.get(model)
   const profiles = [...remote.values()].flatMap((c) =>
     c.has(model) ? [c.get(model)!] : []
   )

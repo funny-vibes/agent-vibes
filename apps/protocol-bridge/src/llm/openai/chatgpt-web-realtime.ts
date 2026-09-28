@@ -11,7 +11,7 @@ export interface ChatGptWebRealtimeCallRequest {
 export interface ChatGptWebRealtimeCallResult {
   callId: string
   sdp: string
-  transport: "chatgpt-web-voice"
+  transport: "chatgpt-web-voice" | "codex-voice"
 }
 
 export class ChatGptWebRealtimeRequestError extends Error {

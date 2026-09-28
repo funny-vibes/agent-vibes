@@ -205,7 +205,9 @@ import {
 import { isCodexRefreshTokenInvalidationMessage } from "./codex-token-refresh-policy"
 import {
   CHATGPT_WEB_REALTIME_POOL_MODEL,
+  CODEX_VOICE_POOL_MODEL,
   type CodexRealtimeAccountLease,
+  type CodexVoiceAccountLease,
   resolveChatGptWebDeviceId,
 } from "./codex-realtime-account"
 import {
@@ -580,6 +582,57 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   async acquireChatGptWebRealtimeAccount(
     excludedAccountKeys: ReadonlySet<string> = new Set()
   ): Promise<CodexRealtimeAccountLease | null> {
+    const leased = await this.leaseRealtimeSlot(
+      CHATGPT_WEB_REALTIME_POOL_MODEL,
+      "ChatGPT Web Realtime",
+      excludedAccountKeys
+    )
+    return leased?.lease ?? null
+  }
+
+  /**
+   * Lease one OAuth account for a Codex voice (GPT-Live) call — the voice
+   * Codex itself opens — with what a request to the account's Codex backend
+   * needs: its call endpoint, its identity headers and its proxy.
+   */
+  async acquireCodexVoiceAccount(
+    excludedAccountKeys: ReadonlySet<string> = new Set()
+  ): Promise<CodexVoiceAccountLease | null> {
+    const leased = await this.leaseRealtimeSlot(
+      CODEX_VOICE_POOL_MODEL,
+      "Codex voice",
+      excludedAccountKeys
+    )
+    if (!leased) return null
+    const { slot, lease } = leased
+    return {
+      ...lease,
+      callUrl: this.buildUrl(slot, "realtime/calls"),
+      headers: (accessToken) =>
+        buildCodexNonTurnHttpHeaders({
+          token: accessToken,
+          isApiKey: false,
+          accept: "application/json",
+          identity: {
+            version: this.identity.version(),
+            userAgent: this.identity.userAgent(),
+            originator: this.identity.originator(),
+          },
+          accountId: this.getSlotAccountId(slot),
+          workspaceId: slot.workspaceId,
+        }),
+      dispatcher: this.buildProxyDispatcher(slot),
+    }
+  }
+
+  private async leaseRealtimeSlot(
+    poolModel: string,
+    purpose: string,
+    excludedAccountKeys: ReadonlySet<string>
+  ): Promise<{
+    slot: CodexAccountSlot
+    lease: CodexRealtimeAccountLease
+  } | null> {
     const attempted = new Set(excludedAccountKeys)
     let inspected = 0
 
@@ -592,11 +645,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           return (
             !attempted.has(key) &&
             this.hasChatGptWebCredential(candidate) &&
-            isAccountAvailableForModel(
-              candidate,
-              CHATGPT_WEB_REALTIME_POOL_MODEL,
-              now
-            )
+            isAccountAvailableForModel(candidate, poolModel, now)
           )
         },
       })
@@ -610,7 +659,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         markAccountCooldown(
           slot,
           401,
-          CHATGPT_WEB_REALTIME_POOL_MODEL,
+          poolModel,
           undefined,
           this.getAccountLabel(slot)
         )
@@ -619,36 +668,39 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
       let settled = false
       return {
-        accountKey,
-        label: this.getAccountLabel(slot),
-        accessToken,
-        deviceId: resolveChatGptWebDeviceId(slot.deviceId, accountKey),
-        proxyUrl: slot.proxyUrl?.trim() || undefined,
-        refreshAccessToken: (reason) =>
-          this.tryRefreshSlotToken(slot, reason, {
-            allowOAuthOnApiKeySlot: true,
-          }),
-        accept: () => {
-          if (settled) return
-          settled = true
-          markAccountSuccess(slot, CHATGPT_WEB_REALTIME_POOL_MODEL)
-        },
-        abandon: () => {
-          settled = true
-        },
-        reject: (statusCode, detail, retryAfterSeconds) => {
-          if (settled) return
-          settled = true
-          markAccountCooldown(
-            slot,
-            statusCode,
-            CHATGPT_WEB_REALTIME_POOL_MODEL,
-            retryAfterSeconds?.toString(),
-            this.getAccountLabel(slot)
-          )
-          this.logger.warn(
-            `[Codex] ChatGPT Web Realtime rejected ${this.getAccountLabel(slot)}: HTTP ${statusCode}${detail ? ` ${detail.slice(0, 300)}` : ""}`
-          )
+        slot,
+        lease: {
+          accountKey,
+          label: this.getAccountLabel(slot),
+          accessToken,
+          deviceId: resolveChatGptWebDeviceId(slot.deviceId, accountKey),
+          proxyUrl: slot.proxyUrl?.trim() || undefined,
+          refreshAccessToken: (reason) =>
+            this.tryRefreshSlotToken(slot, reason, {
+              allowOAuthOnApiKeySlot: true,
+            }),
+          accept: () => {
+            if (settled) return
+            settled = true
+            markAccountSuccess(slot, poolModel)
+          },
+          abandon: () => {
+            settled = true
+          },
+          reject: (statusCode, detail, retryAfterSeconds) => {
+            if (settled) return
+            settled = true
+            markAccountCooldown(
+              slot,
+              statusCode,
+              poolModel,
+              retryAfterSeconds?.toString(),
+              this.getAccountLabel(slot)
+            )
+            this.logger.warn(
+              `[Codex] ${purpose} rejected ${this.getAccountLabel(slot)}: HTTP ${statusCode}${detail ? ` ${detail.slice(0, 300)}` : ""}`
+            )
+          },
         },
       }
     }

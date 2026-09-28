@@ -76,6 +76,7 @@ export interface OpenAiChatCompletionRequest {
   n?: number
   stop?: string | string[]
   reasoning_effort?: string
+  service_tier?: string
   response_format?: { type: string; [key: string]: unknown }
   [key: string]: unknown
 }
@@ -211,6 +212,7 @@ export interface OpenAiResponsesRequest {
   temperature?: number
   top_p?: number
   reasoning?: { effort?: string; summary?: string }
+  service_tier?: string
   parallel_tool_calls?: boolean
   previous_response_id?: string | null
   store?: boolean
