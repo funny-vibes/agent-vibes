@@ -421,7 +421,11 @@ void test("failed async jobs carry the provider error and unknown ids answer 404
 })
 
 void test("the job store bounds concurrency and evicts settled jobs", async () => {
-  const store = new ImageJobStore({ concurrency: 1, maxJobs: 2, ttlMs: 60_000 })
+  const store = new ImageJobStore().configure({
+    concurrency: 1,
+    maxJobs: 2,
+    ttlMs: 60_000,
+  })
   let release: () => void = () => {}
   const first = store.submit(
     () => new Promise((resolve) => (release = () => resolve({ n: 1 })))

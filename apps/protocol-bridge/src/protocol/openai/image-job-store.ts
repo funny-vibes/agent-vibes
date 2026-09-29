@@ -47,10 +47,13 @@ export class ImageJobStore {
   private readonly jobs = new Map<string, ImageJobRecord>()
   private readonly waiting: Array<() => void> = []
   private running = 0
-  private readonly options: ImageJobStoreOptions
+  // No constructor parameters: Nest would try to inject them. Tests tune the
+  // limits through configure().
+  private options: ImageJobStoreOptions = { ...DEFAULT_OPTIONS }
 
-  constructor(options: Partial<ImageJobStoreOptions> = {}) {
-    this.options = { ...DEFAULT_OPTIONS, ...options }
+  configure(options: Partial<ImageJobStoreOptions>): this {
+    this.options = { ...this.options, ...options }
+    return this
   }
 
   submit(run: () => Promise<Record<string, unknown>>): ImageJobRecord {
