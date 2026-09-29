@@ -97,6 +97,13 @@ import {
   decodeCodexStandaloneSearchResponse,
   type CodexStandaloneSearchRequest,
 } from "./codex-standalone-web-search"
+import {
+  buildCodexStandaloneImageRequest,
+  decodeCodexStandaloneImageResponse,
+  type CodexImageBackground,
+  type CodexImageReference,
+  type CodexStandaloneImageRequest,
+} from "./codex-standalone-image"
 import { buildCodexDispatchLogLine } from "./codex-dispatch-log-summary"
 import { resolveCodexPromptCacheKey } from "./codex-cache-identity-policy"
 import {
@@ -135,7 +142,6 @@ import {
 } from "./codex-rate-limit-summary"
 import {
   extractCodexCompletedUsage,
-  parseCodexSsePayload,
 } from "./codex-sse-parsing"
 import {
   buildCodexHttpRequestLogLine,
@@ -3033,21 +3039,26 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
   }
 
+  /**
+   * Generate or edit one image natively, the way the official Codex CLI's
+   * standalone image extension does: a direct `images/generations` or
+   * `images/edits` call on the Codex backend with `gpt-image-2`. It is not a
+   * Responses turn, so it does not spend the conversation quota; the backend
+   * meters it on its own `image_gen` limit. The result is always PNG data.
+   */
   async generateImage(input: {
     prompt: string
     model?: string
     conversationId?: string
-    outputFormat?: string
+    background?: CodexImageBackground
+    referenceImages?: readonly CodexImageReference[]
   }): Promise<{
     imageData: string
     revisedPrompt?: string
     status?: string
+    background?: CodexImageBackground
+    generationId?: string
   }> {
-    const prompt = input.prompt.trim()
-    if (!prompt) {
-      throw new Error("Image generation prompt is required")
-    }
-
     const requestedModel = input.model?.trim() || ""
     const modelName =
       requestedModel && this.hasSupportingAccount(requestedModel)
@@ -3055,27 +3066,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         : DEFAULT_CODEX_RATE_LIMIT_MODEL
     const conversationId =
       input.conversationId || `image-${crypto.randomUUID()}`
-    const upstreamIdentity = createCodexRootProviderIdentity()
-    const executionRequest = this.prepareBridgeNativeExecutionRequest({
+    const imageRequest = buildCodexStandaloneImageRequest({
+      prompt: input.prompt,
       model: modelName,
-      upstreamIdentity,
-      localProjectionKey: conversationId,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      tools: [
-        {
-          type: "image_generation",
-          name: "image_generation",
-          description: "Generate an image from the user prompt.",
-          output_format: input.outputFormat?.trim() || "png",
-        },
-      ],
-      parallelToolCalls: false,
-      textVerbosity: "low",
+      conversationId,
+      upstreamIdentity: createCodexRootProviderIdentity(),
+      background: input.background,
+      referenceImages: input.referenceImages,
     })
     this.onLiveRequestStart()
     try {
@@ -3084,74 +3081,112 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           scope: `codex:image-generation:${conversationId}:${crypto.randomUUID()}`,
           backend: "codex",
           model: modelName,
-          request: executionRequest,
+          request: imageRequest,
         },
         execute: (dispatch) =>
-          this.dispatchCodexServerToolRequest(dispatch, {
+          this.dispatchCodexStandaloneImageRequest(dispatch, {
             timeoutMs: 600_000,
           }),
       })
-      const fullBody = await response.text()
-      let imageData = ""
-      let revisedPrompt: string | undefined
-      let status: string | undefined
-
-      for (const line of fullBody.split("\n")) {
-        const payload = parseCodexSsePayload(line.trim())
-        const item =
-          payload?.type === "response.output_item.done" &&
-          payload.item &&
-          typeof payload.item === "object"
-            ? (payload.item as Record<string, unknown>)
-            : undefined
-        if (item?.type === "image_generation_call") {
-          if (typeof item.result === "string" && item.result.trim()) {
-            imageData = item.result.trim()
-          }
-          if (typeof item.revised_prompt === "string") {
-            revisedPrompt = item.revised_prompt
-          }
-          if (typeof item.status === "string") {
-            status = item.status
-          }
-        }
-
-        const responseOutput =
-          payload?.type === "response.completed" &&
-          payload.response &&
-          typeof payload.response === "object"
-            ? (payload.response as Record<string, unknown>).output
-            : undefined
-        if (Array.isArray(responseOutput)) {
-          for (const outputItem of responseOutput) {
-            if (
-              outputItem &&
-              typeof outputItem === "object" &&
-              (outputItem as Record<string, unknown>).type ===
-                "image_generation_call"
-            ) {
-              const record = outputItem as Record<string, unknown>
-              if (typeof record.result === "string" && record.result.trim()) {
-                imageData = record.result.trim()
-              }
-              if (typeof record.revised_prompt === "string") {
-                revisedPrompt = record.revised_prompt
-              }
-              if (typeof record.status === "string") {
-                status = record.status
-              }
-            }
-          }
-        }
+      const decoded = decodeCodexStandaloneImageResponse(await response.json())
+      return {
+        imageData: decoded.imageData,
+        status: "completed",
+        ...(decoded.revisedPrompt ? { revisedPrompt: decoded.revisedPrompt } : {}),
+        ...(decoded.background ? { background: decoded.background } : {}),
+        ...(decoded.generationId ? { generationId: decoded.generationId } : {}),
       }
-
-      if (!imageData) {
-        throw new Error("Codex image_generation completed without image data")
-      }
-
-      return { imageData, revisedPrompt, status }
     } finally {
       this.onLiveRequestEnd()
+    }
+  }
+
+  /** Complete one physical native `images/*` dispatch. */
+  private async dispatchCodexStandaloneImageRequest(
+    dispatch: ProviderPhysicalDispatch<CodexStandaloneImageRequest>,
+    options: CodexServerToolExecutionOptions
+  ): Promise<Response> {
+    assertProviderPhysicalDispatch({
+      dispatch,
+      backend: "codex",
+      label: "Codex standalone image dispatch",
+    })
+    const request = dispatch.request
+    if (request.model !== dispatch.attempt.model) {
+      throw new Error(
+        "Codex standalone image model does not match its physical attempt model"
+      )
+    }
+
+    const modelName = request.model
+    let slot: CodexAccountSlot | undefined
+    try {
+      options.signal?.throwIfAborted()
+      slot = this.selectRequestSlot(modelName, request.localProjectionKey, {
+        preferWarmPool: false,
+      })
+      const token = await this.getBearerToken(slot)
+      if (!token) {
+        throw new Error(
+          "Codex backend not configured: no API key or access token"
+        )
+      }
+
+      const headers = buildCodexNonTurnHttpHeaders({
+        token,
+        isApiKey: this.isApiKeyMode(slot),
+        accept: "application/json",
+        identity: {
+          version: this.identity.version(),
+          userAgent: this.identity.userAgent(),
+          originator: this.identity.originator(),
+        },
+        accountId: this.getSlotAccountId(slot),
+        workspaceId: slot.workspaceId,
+      })
+      // The official client tags every image call with the turn it belongs to.
+      headers["x-codex-image-turn-id"] = request.localProjectionKey
+      const timeoutSignal = AbortSignal.timeout(options.timeoutMs)
+      const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request.body),
+        signal: options.signal
+          ? AbortSignal.any([options.signal, timeoutSignal])
+          : timeoutSignal,
+      }
+      const dispatcher = this.buildProxyDispatcher(slot)
+      if (dispatcher) {
+        fetchOptions.dispatcher = dispatcher
+      }
+
+      const response = await fetch(
+        this.buildUrl(slot, request.endpoint),
+        fetchOptions
+      )
+      if (!response.ok) {
+        const errorBody = await response.text()
+        throw createCodexApiErrorFromBody(response.status, errorBody)
+      }
+
+      this.captureCodexRateLimitHeaders(
+        response.headers,
+        slot,
+        modelName,
+        "request"
+      )
+      await dispatch.lifecycle.accept({})
+      markAccountSuccess(slot, modelName)
+      return response
+    } catch (error) {
+      if (
+        dispatch.lifecycle.acceptanceStarted ||
+        isProviderAttemptRetryableError(error)
+      ) {
+        throw error
+      }
+      options.signal?.throwIfAborted()
+      throw await this.toRetryableCodexPhysicalFailure(error, modelName, slot)
     }
   }
 
