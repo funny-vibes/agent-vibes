@@ -311,7 +311,7 @@ void test("POST /v1/images/edits rejects missing, remote or oversized reference 
   assert.equal(await status({ prompt: "", image: PNG_DATA_URL }), 400)
 })
 
-void test("POST /v1/images/generations validates background and maps provider failures to 502", async () => {
+void test("POST /v1/images/generations validates background and maps provider failures to 500", async () => {
   const ok = fixture()
   const okController = new ImagesController(ok.service)
   const response = await okController.generate({
@@ -336,6 +336,6 @@ void test("POST /v1/images/generations validates background and maps provider fa
   await assert.rejects(
     new ImagesController(failing.service).generate({ prompt: "x" }),
     (error: unknown) =>
-      error instanceof HttpException && error.getStatus() === 502
+      error instanceof HttpException && error.getStatus() === 500
   )
 })

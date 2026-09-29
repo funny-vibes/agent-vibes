@@ -160,18 +160,24 @@ function toOpenAiResponse(
   }
 }
 
+/**
+ * Upstream failures answer 500, not 502: Cloudflare replaces an origin's
+ * 502/504 body with its own error page, which would hide the provider's
+ * message from callers reaching the bridge through a Worker or a proxied
+ * zone.
+ */
 function toGatewayError(error: unknown): HttpException {
   return new HttpException(
     {
       error: {
         message:
           error instanceof Error ? error.message : "Image generation failed",
-        type: "api_error",
+        type: "server_error",
         param: null,
         code: "image_generation_failed",
       },
     },
-    502
+    500
   )
 }
 
