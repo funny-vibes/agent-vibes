@@ -8,6 +8,7 @@ import { AnthropicModule } from "../anthropic/anthropic.module"
 import { ChatCompletionsController } from "./chat-completions.controller"
 import { ChatCompletionsService } from "./chat-completions.service"
 import { ChatGptWebProtocolService } from "./chatgpt-web.service"
+import { ImageJobStore } from "./image-job-store"
 import { ImagesController } from "./images.controller"
 import { RealtimeController } from "./realtime.controller"
 
@@ -30,6 +31,7 @@ import { RealtimeController } from "./realtime.controller"
     ChatCompletionsService,
     ChatGptWebProtocolService,
     CodexResponsesService,
+    ImageJobStore,
     RequiredApiKeyGuard,
   ],
 })

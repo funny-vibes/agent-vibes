@@ -1,12 +1,17 @@
 import {
   Body,
   Controller,
+  Get,
+  Headers,
   HttpCode,
   HttpException,
+  Param,
   Post,
+  Res,
   UseGuards,
 } from "@nestjs/common"
 import { ApiOperation, ApiSecurity, ApiTags } from "@nestjs/swagger"
+import type { FastifyReply } from "fastify"
 import {
   ImageGenerationService,
   type ImageGenerationReference,
@@ -18,6 +23,7 @@ import {
   type CodexImageBackground,
 } from "../../llm/openai/codex-standalone-image"
 import { RequiredApiKeyGuard } from "../../shared/required-api-key.guard"
+import { ImageJobStore, snapshotImageJob } from "./image-job-store"
 
 const MAX_PROMPT_LENGTH = 4_000
 const OUTPUT_FORMATS = new Set(["png", "jpeg", "webp"])
@@ -43,6 +49,23 @@ interface ParsedImageRequest {
   model?: string
   outputFormat: string
   background?: CodexImageBackground
+}
+
+/**
+ * A caller behind a proxy with a short request timeout asks for a job
+ * instead of waiting: `"async": true` in the body or `Prefer: respond-async`.
+ */
+function wantsJob(body: unknown, prefer: string | undefined): boolean {
+  const request =
+    body && typeof body === "object" ? (body as Record<string, unknown>) : {}
+  if (request.async === true) return true
+  return (
+    typeof prefer === "string" &&
+    prefer
+      .split(",")
+      .map((token) => token.trim().toLowerCase())
+      .includes("respond-async")
+  )
 }
 
 /**
@@ -185,26 +208,36 @@ function toGatewayError(error: unknown): HttpException {
  * OpenAI-compatible image generation over the pooled accounts: one picture
  * per request, returned inline as base64. `background: "transparent"` asks
  * Codex for genuine RGBA output; `edits` adds up to five inline reference
- * pictures.
+ * pictures. With `"async": true` (or `Prefer: respond-async`) the call
+ * answers 202 with a job id at once and `GET jobs/:id` returns the same
+ * payload once the picture exists, so a proxy timeout cannot cut a long
+ * generation short.
  */
 @ApiTags("OpenAI API")
 @Controller("v1/images")
 @UseGuards(RequiredApiKeyGuard)
 @ApiSecurity("api-key")
 export class ImagesController {
-  constructor(private readonly images: ImageGenerationService) {}
+  constructor(
+    private readonly images: ImageGenerationService,
+    private readonly jobs: ImageJobStore
+  ) {}
 
   @Post("generations")
   @HttpCode(200)
   @ApiOperation({ summary: "Generate one image from a prompt (b64_json)" })
-  async generate(@Body() body: unknown) {
+  async generate(
+    @Body() body: unknown,
+    @Headers("prefer") prefer?: string,
+    @Res({ passthrough: true }) reply?: FastifyReply
+  ) {
     const request = parseImageRequest(body)
-    try {
-      const result = await this.images.generateImage(request)
-      return toOpenAiResponse(result, request.outputFormat)
-    } catch (error) {
-      throw toGatewayError(error)
-    }
+    return this.respond(
+      () => this.images.generateImage(request),
+      request.outputFormat,
+      wantsJob(body, prefer),
+      reply
+    )
   }
 
   @Post("edits")
@@ -212,15 +245,60 @@ export class ImagesController {
   @ApiOperation({
     summary: "Generate one image from a prompt and inline reference images",
   })
-  async edit(@Body() body: unknown) {
+  async edit(
+    @Body() body: unknown,
+    @Headers("prefer") prefer?: string,
+    @Res({ passthrough: true }) reply?: FastifyReply
+  ) {
     const request = parseImageRequest(body)
     const referenceImages = parseReferenceImages(body)
-    try {
-      const result = await this.images.generateImage({
-        ...request,
-        referenceImages,
+    return this.respond(
+      () => this.images.generateImage({ ...request, referenceImages }),
+      request.outputFormat,
+      wantsJob(body, prefer),
+      reply
+    )
+  }
+
+  @Get("jobs/:id")
+  @ApiOperation({ summary: "Poll an asynchronous image job" })
+  job(@Param("id") id: string) {
+    const record = this.jobs.get(id)
+    if (!record) {
+      throw new HttpException(
+        {
+          error: {
+            message: `Unknown image job ${id}`,
+            type: "invalid_request_error",
+            param: "id",
+            code: "image_job_not_found",
+          },
+        },
+        404
+      )
+    }
+    return snapshotImageJob(record)
+  }
+
+  private async respond(
+    run: () => Promise<ImageGenerationResult>,
+    outputFormat: string,
+    asJob: boolean,
+    reply?: FastifyReply
+  ) {
+    if (asJob) {
+      const record = this.jobs.submit(async () => {
+        try {
+          return toOpenAiResponse(await run(), outputFormat)
+        } catch (error) {
+          throw toGatewayError(error)
+        }
       })
-      return toOpenAiResponse(result, request.outputFormat)
+      reply?.status(202)
+      return snapshotImageJob(record)
+    }
+    try {
+      return toOpenAiResponse(await run(), outputFormat)
     } catch (error) {
       throw toGatewayError(error)
     }

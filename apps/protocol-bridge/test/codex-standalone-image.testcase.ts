@@ -16,6 +16,10 @@ import {
   type ImageGenerationInput,
 } from "../src/llm/image-generation/image-generation.service"
 import { ImagesController } from "../src/protocol/openai/images.controller"
+import {
+  ImageJobStore,
+  snapshotImageJob,
+} from "../src/protocol/openai/image-job-store"
 
 Logger.overrideLogger(false)
 
@@ -252,7 +256,7 @@ void test("an exact aspect ratio still stays on Gemini and a gemini model hint l
 
 void test("POST /v1/images/edits decodes inline data URLs and reports background and generation id", async () => {
   const f = fixture()
-  const controller = new ImagesController(f.service)
+  const controller = new ImagesController(f.service, new ImageJobStore())
   const response = await controller.edit({
     prompt: "the chair behind the seat",
     background: true,
@@ -276,7 +280,10 @@ void test("POST /v1/images/edits decodes inline data URLs and reports background
 })
 
 void test("POST /v1/images/edits rejects missing, remote or oversized reference sets", async () => {
-  const controller = new ImagesController(fixture().service)
+  const controller = new ImagesController(
+    fixture().service,
+    new ImageJobStore()
+  )
   const status = async (body: unknown): Promise<number> => {
     try {
       await controller.edit(body)
@@ -313,7 +320,7 @@ void test("POST /v1/images/edits rejects missing, remote or oversized reference 
 
 void test("POST /v1/images/generations validates background and maps provider failures to 500", async () => {
   const ok = fixture()
-  const okController = new ImagesController(ok.service)
+  const okController = new ImagesController(ok.service, new ImageJobStore())
   const response = await okController.generate({
     prompt: "opaque plate",
     background: "opaque",
@@ -334,8 +341,110 @@ void test("POST /v1/images/generations validates background and maps provider fa
     },
   })
   await assert.rejects(
-    new ImagesController(failing.service).generate({ prompt: "x" }),
+    new ImagesController(failing.service, new ImageJobStore()).generate({
+      prompt: "x",
+    }),
     (error: unknown) =>
       error instanceof HttpException && error.getStatus() === 500
   )
+})
+
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+}
+
+void test("async image jobs answer 202 at once and settle with the same payload", async () => {
+  const f = fixture()
+  const store = new ImageJobStore()
+  const controller = new ImagesController(f.service, store)
+  let status = 0
+  const reply = {
+    status: (code: number) => (status = code),
+  } as unknown as import("fastify").FastifyReply
+  const submitted = await controller.edit(
+    {
+      prompt: "slow chair",
+      async: true,
+      image: PNG_DATA_URL,
+      background: "transparent",
+    },
+    undefined,
+    reply
+  )
+  assert.equal(status, 202)
+  assert.equal(submitted.object, "image.job")
+  assert.match(String(submitted.id), /^imgjob_[0-9a-f]{32}$/)
+  assert.ok(["queued", "running"].includes(String(submitted.status)))
+  await settle()
+  const done = controller.job(String(submitted.id))
+  assert.equal(done.status, "succeeded")
+  assert.equal(done.background, "transparent")
+  assert.equal(
+    (done.data as Array<Record<string, unknown>>)[0]?.b64_json,
+    "codex-image"
+  )
+  // Prefer: respond-async works the same way for generations.
+  const preferred = await controller.generate(
+    { prompt: "plate" },
+    "respond-async",
+    reply
+  )
+  assert.equal(preferred.object, "image.job")
+  await settle()
+  assert.equal(controller.job(String(preferred.id)).status, "succeeded")
+})
+
+void test("failed async jobs carry the provider error and unknown ids answer 404", async () => {
+  const failing = fixture({ codexFails: true })
+  Object.assign(failing.service, {
+    googleService: {
+      generateImage: () => Promise.reject(new Error("gemini fixture down")),
+    },
+  })
+  const controller = new ImagesController(failing.service, new ImageJobStore())
+  const submitted = await controller.generate({
+    prompt: "x",
+    async: true,
+  })
+  await settle()
+  const failed = controller.job(String(submitted.id))
+  assert.equal(failed.status, "failed")
+  const error = failed.error as Record<string, unknown>
+  assert.match(String(error.message), /codex fixture down/)
+  assert.equal(error.code, "image_generation_failed")
+  assert.throws(
+    () => controller.job("imgjob_missing"),
+    (thrown: unknown) =>
+      thrown instanceof HttpException && thrown.getStatus() === 404
+  )
+})
+
+void test("the job store bounds concurrency and evicts settled jobs", async () => {
+  const store = new ImageJobStore({ concurrency: 1, maxJobs: 2, ttlMs: 60_000 })
+  let release: () => void = () => {}
+  const first = store.submit(
+    () => new Promise((resolve) => (release = () => resolve({ n: 1 })))
+  )
+  const second = store.submit(() => Promise.resolve({ n: 2 }))
+  await settle()
+  assert.equal(first.status, "running")
+  assert.equal(second.status, "queued")
+  release()
+  await settle()
+  assert.equal(first.status, "succeeded")
+  assert.equal(second.status, "succeeded")
+  assert.deepEqual(snapshotImageJob(second), {
+    id: second.id,
+    object: "image.job",
+    status: "succeeded",
+    created: second.created,
+    n: 2,
+  })
+  store.submit(() => Promise.resolve({ n: 3 }))
+  await settle()
+  store.submit(() => Promise.resolve({ n: 4 }))
+  await settle()
+  assert.ok(store.size() <= 3)
+  assert.equal(store.get(first.id), undefined)
 })
