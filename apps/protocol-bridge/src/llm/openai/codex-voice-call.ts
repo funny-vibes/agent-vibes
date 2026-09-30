@@ -6,9 +6,46 @@
  * channel and answers with `delegation.context.append`.
  */
 
+/**
+ * The voices Codex voice speaks with, and its default. The Realtime API's
+ * voices (alloy, marin, …) belong to another model: Codex voice accepts a
+ * call naming one of them, then ends the session on connect with "Voice
+ * session access denied". A call naming no voice does not start either.
+ */
+export const CODEX_VOICE_VOICES: readonly string[] = [
+  "juniper",
+  "maple",
+  "spruce",
+  "ember",
+  "vale",
+  "breeze",
+  "arbor",
+  "sol",
+  "cove",
+]
+export const CODEX_VOICE_DEFAULT_VOICE = "cove"
+
 /** Sessions for these models go to Codex voice instead of ChatGPT Web. */
 export function isCodexVoiceSession(session: Record<string, unknown>): boolean {
   return typeof session.model === "string" && /^gpt-live/.test(session.model)
+}
+
+/**
+ * The voice to send: the caller's when Codex voice speaks with it, otherwise
+ * the default, reported as `replaced` so the substitution can be logged.
+ */
+export function resolveCodexVoice(session: Record<string, unknown>): {
+  voice: string
+  replaced?: string
+} {
+  const requested = requestedVoice(session)
+  if (requested && CODEX_VOICE_VOICES.includes(requested.toLowerCase())) {
+    return { voice: requested.toLowerCase() }
+  }
+  return {
+    voice: CODEX_VOICE_DEFAULT_VOICE,
+    ...(requested ? { replaced: requested } : {}),
+  }
 }
 
 /** The fields Codex voice accepts at call creation, in its own shape. */
@@ -19,8 +56,7 @@ export function buildCodexVoiceSession(
   if (typeof session.instructions === "string") {
     out.instructions = session.instructions
   }
-  const voice = requestedVoice(session)
-  if (voice) out.audio = { output: { voice } }
+  out.audio = { output: { voice: resolveCodexVoice(session).voice } }
   if (isRecord(session.delegation)) out.delegation = session.delegation
   if (Array.isArray(session.initial_items)) {
     out.initial_items = session.initial_items

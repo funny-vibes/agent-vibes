@@ -9,6 +9,7 @@ import {
   buildCodexVoiceSession,
   codexVoiceCallId,
   codexVoiceCallUrl,
+  resolveCodexVoice,
 } from "./codex-voice-call"
 import { CodexService } from "./codex.service"
 
@@ -37,6 +38,12 @@ export class CodexVoiceCallService {
       )
     }
 
+    const { voice, replaced } = resolveCodexVoice(request.session)
+    if (replaced) {
+      this.logger.warn(
+        `Codex voice does not speak with "${replaced}"; using "${voice}"`
+      )
+    }
     const body = JSON.stringify({
       sdp: request.sdp,
       session: buildCodexVoiceSession(request.session),
