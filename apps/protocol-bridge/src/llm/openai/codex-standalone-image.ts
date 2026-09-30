@@ -6,7 +6,8 @@ import type { CodexProviderIdentity } from "./codex-provider-identity"
  * `images/edits` when reference images are given) on the Codex backend, with
  * the fixed `gpt-image-2` model and a real `background` choice. The picture
  * comes back as `data[0].b64_json`; usage is metered on the backend's
- * separate `image_gen` limit rather than the conversation quota.
+ * separate image limit (`imagegen_premium` on Pro) rather than the
+ * conversation quota.
  */
 export const CODEX_IMAGE_MODEL = "gpt-image-2"
 export const CODEX_IMAGE_MAX_REFERENCES = 5

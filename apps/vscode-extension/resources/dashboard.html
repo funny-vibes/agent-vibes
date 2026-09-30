@@ -3179,6 +3179,13 @@
         }
       }
 
+      function formatLimitWindowSuffix(minutes) {
+        if (typeof minutes !== "number" || !(minutes > 0)) return ""
+        if (minutes % 1440 === 0) return " · " + minutes / 1440 + "d"
+        if (minutes >= 60) return " · " + Math.round(minutes / 60) + "h"
+        return " · " + minutes + "m"
+      }
+
       function renderCodexRateLimitRows(codexQuotaAcct) {
         var models = getCodexRateLimitModels(codexQuotaAcct)
         var selected = null
@@ -3198,31 +3205,57 @@
           selected && selected.effective
             ? selected.effective
             : getCodexEffectiveRateLimit(codexQuotaAcct)
-        if (!effective) return ""
+        var imageGen =
+          codexQuotaAcct && codexQuotaAcct.rateLimits
+            ? codexQuotaAcct.rateLimits.imageGen || null
+            : null
+        if (!effective && !imageGen) return ""
         var limits = []
         var h = ""
-        var sourceLabel =
-          effective.source === "request"
-            ? L("usage.sourceLive")
-            : L("usage.sourceProbe")
-        var modelLabel =
-          selected && selected.displayModel
-            ? selected.displayModel
-            : effective.displayModel || effective.model || "Unknown model"
-        h +=
-          '<div style="margin-top:var(--sp-2);font-size:var(--text-xs);color:var(--fg-3)">'
-        h +=
-          esc(L("quota.titlePrefix")) +
-          esc(modelLabel) +
-          " · " +
-          esc(sourceLabel)
-        h += "</div>"
-        if (effective.weekly)
-          limits.push({
-            label: L("quota.weeklyLimit"),
-            data: effective.weekly,
-            color: "#81c784",
-          })
+        if (effective) {
+          var sourceLabel =
+            effective.source === "request"
+              ? L("usage.sourceLive")
+              : L("usage.sourceProbe")
+          var modelLabel =
+            selected && selected.displayModel
+              ? selected.displayModel
+              : effective.displayModel || effective.model || "Unknown model"
+          h +=
+            '<div style="margin-top:var(--sp-2);font-size:var(--text-xs);color:var(--fg-3)">'
+          h +=
+            esc(L("quota.titlePrefix")) +
+            esc(modelLabel) +
+            " · " +
+            esc(sourceLabel)
+          h += "</div>"
+          if (effective.weekly)
+            limits.push({
+              label: L("quota.weeklyLimit"),
+              data: effective.weekly,
+              color: "#81c784",
+            })
+        }
+        if (imageGen) {
+          var imageWindows = [imageGen.primary, imageGen.secondary]
+          for (var wi = 0; wi < imageWindows.length; wi++) {
+            var imageWindow = imageWindows[wi]
+            if (!imageWindow) continue
+            limits.push({
+              label:
+                L("quota.imageGenLimit") +
+                formatLimitWindowSuffix(imageWindow.windowMinutes),
+              data: imageWindow,
+              color: "#64b5f6",
+            })
+          }
+          if (!imageGen.primary && !imageGen.secondary && imageGen.limitReached)
+            limits.push({
+              label: L("quota.imageGenLimit"),
+              data: { usedPercent: 100, resetsAt: imageGen.resetsAt },
+              color: "#64b5f6",
+            })
+        }
         for (var li = 0; li < limits.length; li++) {
           var lim = limits[li]
           var leftRaw = Math.max(0, 100 - lim.data.usedPercent)

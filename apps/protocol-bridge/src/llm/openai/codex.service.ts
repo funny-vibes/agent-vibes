@@ -68,6 +68,7 @@ import { BackendAccountStateStore } from "../shared/backend-account-state-store"
 import { PersistenceService } from "../../persistence"
 import {
   BackendPoolStatus,
+  type CodexImageGenLimitSnapshot,
   type CodexRateLimitAccountSummary,
   type CodexRateLimitModelSummary,
   type CodexRateLimitSnapshot,
@@ -98,6 +99,7 @@ import {
   type CodexStandaloneSearchRequest,
 } from "./codex-standalone-web-search"
 import {
+  CODEX_IMAGE_MODEL,
   buildCodexStandaloneImageRequest,
   decodeCodexStandaloneImageResponse,
   type CodexImageBackground,
@@ -120,6 +122,12 @@ import {
   parseCodexRateLimitHeaders,
 } from "./codex-rate-limit-headers"
 import {
+  isCodexImageLimitId,
+  parseCodexImageGenLimitError,
+  parseCodexImageGenLimitHeaders,
+  readCodexActiveLimit,
+} from "./codex-image-gen-limit"
+import {
   getAllCodexAccountsRateLimitedRetrySeconds,
   getCodexWeeklyQuotaCooldownUntil,
   getCodexWeeklyRateLimitWindow,
@@ -140,9 +148,7 @@ import {
   normalizeCodexRateLimitModelName,
   setCodexRateLimitSnapshot,
 } from "./codex-rate-limit-summary"
-import {
-  extractCodexCompletedUsage,
-} from "./codex-sse-parsing"
+import { extractCodexCompletedUsage } from "./codex-sse-parsing"
 import {
   buildCodexHttpRequestLogLine,
   summarizeCodexCompletedResponseForLogs,
@@ -300,6 +306,8 @@ interface CodexAccountSlot extends CooldownableAccount {
     string,
     Partial<Record<CodexRateLimitSource, CodexRateLimitSnapshot>>
   >
+  /** Latest reading of the separate limit that `images/*` calls spend. */
+  imageGenLimit?: CodexImageGenLimitSnapshot
 }
 
 interface CodexStreamDispatchOptions {
@@ -2021,7 +2029,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return getCodexRateLimitAccountSummary(
       account.rateLimitSnapshots,
       DEFAULT_CODEX_RATE_LIMIT_MODEL,
-      (normalizedModel) => this.getCodexDisplayModel(normalizedModel)
+      (normalizedModel) => this.getCodexDisplayModel(normalizedModel),
+      account.imageGenLimit
     )
   }
 
@@ -2792,6 +2801,80 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return selection.slot
   }
 
+  /**
+   * Pick an account for a standalone image call. The text model only gates
+   * which accounts can make the call; its cooldowns do not, because image
+   * generation spends its own limit. Holds on the image key still apply.
+   */
+  private selectImageRequestSlot(modelName: string): CodexAccountSlot {
+    if (this.accounts.length === 0) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+    const normalized = modelName.toLowerCase().trim()
+    if (!this.hasSupportingAccount(normalized)) {
+      throw new CodexApiError(
+        400,
+        `Model ${modelName} is not supported by the configured Codex account(s).`
+      )
+    }
+
+    const now = Date.now()
+    const slot = this.slotRouter.pickFromCurrentIndex({
+      candidates: this.accounts,
+      isSlotUsable: (candidate) =>
+        this.isImageSlotUsable(candidate, normalized, now),
+    })
+    if (slot) {
+      return slot
+    }
+
+    const retrySeconds = getAllCodexAccountsRateLimitedRetrySeconds(
+      this.accounts.map((candidate) =>
+        getCodexSlotRecoveryTimeForModel({
+          slot: candidate,
+          model: CODEX_IMAGE_MODEL,
+          now,
+          isModelSupported: (supported) =>
+            this.isModelSupportedBySlot(supported, normalized),
+          getWeeklyQuotaCooldownUntil: () => 0,
+        })
+      ),
+      now
+    )
+    throw new CodexApiError(
+      429,
+      `All Codex accounts are rate-limited for image generation. ` +
+        `Retry after ${retrySeconds} seconds.`,
+      retrySeconds
+    )
+  }
+
+  /** Look up, without advancing the rotation, an account for an image call. */
+  private findImageRequestSlot(modelName: string): CodexAccountSlot | null {
+    const now = Date.now()
+    const normalized = modelName.toLowerCase().trim()
+    return (
+      this.slotRouter.findFromCurrentIndex({
+        candidates: this.accounts,
+        isSlotUsable: (candidate) =>
+          this.isImageSlotUsable(candidate, normalized, now),
+      })?.account ?? null
+    )
+  }
+
+  private isImageSlotUsable(
+    slot: CodexAccountSlot,
+    normalizedModel: string,
+    now: number
+  ): boolean {
+    return (
+      this.isModelSupportedBySlot(slot, normalizedModel) &&
+      isAccountAvailableForModel(slot, CODEX_IMAGE_MODEL, now)
+    )
+  }
+
   private codexPhysicalErrorClass(error: unknown): BackendErrorClass {
     if (error instanceof CodexApiError) {
       if (error.errorClass) return error.errorClass
@@ -2810,7 +2893,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private async toRetryableCodexPhysicalFailure(
     error: unknown,
     modelName: string,
-    slot?: CodexAccountSlot
+    slot?: CodexAccountSlot,
+    options: {
+      readonly cooldownModels?: readonly string[]
+      /** Whether some account can take the next attempt right now. */
+      readonly hasUsableAccount?: () => boolean
+    } = {}
   ): Promise<ProviderAttemptRetryableError> {
     if (isProviderAttemptRetryableError(error)) {
       return error
@@ -2823,13 +2911,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     const statusCode =
       error instanceof CodexApiError ? error.getStatus() : undefined
-    const retryAfterMs =
-      error instanceof CodexApiError && error.retryAfterSeconds !== undefined
-        ? Math.min(
-            error.retryAfterSeconds * 1_000,
-            this.allRateLimitMaxWaitSeconds * 1_000
-          )
-        : undefined
 
     if (slot && statusCode !== undefined) {
       let refreshed = false
@@ -2840,17 +2921,35 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         ))
       }
       if (!refreshed) {
-        markAccountCooldown(
-          slot,
-          statusCode,
-          modelName,
-          error instanceof CodexApiError
-            ? error.retryAfterSeconds?.toString()
-            : undefined,
-          this.getAccountLabel(slot)
-        )
+        for (const cooldownModel of options.cooldownModels ?? [modelName]) {
+          markAccountCooldown(
+            slot,
+            statusCode,
+            cooldownModel,
+            error instanceof CodexApiError
+              ? error.retryAfterSeconds?.toString()
+              : undefined,
+            this.getAccountLabel(slot)
+          )
+        }
       }
     }
+
+    // A retry-after belongs to the account that sent it, which is now held.
+    // Wait it out only when no account can take the next attempt, the same
+    // case the all-accounts-limited error reports on its own.
+    const hasUsableAccount =
+      options.hasUsableAccount ??
+      (() => this.findNextAvailableAccount(modelName) !== null)
+    const retryAfterMs =
+      error instanceof CodexApiError &&
+      error.retryAfterSeconds !== undefined &&
+      !(slot && hasUsableAccount())
+        ? Math.min(
+            error.retryAfterSeconds * 1_000,
+            this.allRateLimitMaxWaitSeconds * 1_000
+          )
+        : undefined
 
     return new ProviderAttemptRetryableError(
       `Codex physical dispatch failed before acceptance: ${
@@ -3044,7 +3143,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * standalone image extension does: a direct `images/generations` or
    * `images/edits` call on the Codex backend with `gpt-image-2`. It is not a
    * Responses turn, so it does not spend the conversation quota; the backend
-   * meters it on its own `image_gen` limit. The result is always PNG data.
+   * meters it on its own image limit. The result is always PNG data.
    */
   async generateImage(input: {
     prompt: string
@@ -3092,7 +3191,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return {
         imageData: decoded.imageData,
         status: "completed",
-        ...(decoded.revisedPrompt ? { revisedPrompt: decoded.revisedPrompt } : {}),
+        ...(decoded.revisedPrompt
+          ? { revisedPrompt: decoded.revisedPrompt }
+          : {}),
         ...(decoded.background ? { background: decoded.background } : {}),
         ...(decoded.generationId ? { generationId: decoded.generationId } : {}),
       }
@@ -3120,11 +3221,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     const modelName = request.model
     let slot: CodexAccountSlot | undefined
+    // Image calls spend their own limit, so their holds go on the image key.
+    let cooldownModels: readonly string[] = [CODEX_IMAGE_MODEL]
     try {
       options.signal?.throwIfAborted()
-      slot = this.selectRequestSlot(modelName, request.localProjectionKey, {
-        preferWarmPool: false,
-      })
+      slot = this.selectImageRequestSlot(modelName)
       const token = await this.getBearerToken(slot)
       if (!token) {
         throw new Error(
@@ -3166,17 +3267,41 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
       if (!response.ok) {
         const errorBody = await response.text()
+        const activeLimit = readCodexActiveLimit(response.headers)
+        if (
+          response.status === 429 &&
+          activeLimit &&
+          !isCodexImageLimitId(activeLimit)
+        ) {
+          // Refused on a limit that conversation turns spend as well.
+          cooldownModels = [CODEX_IMAGE_MODEL, modelName]
+        }
+        const limitError = parseCodexImageGenLimitError(
+          response.status,
+          response.headers,
+          errorBody
+        )
+        if (limitError) {
+          this.setImageGenLimit(slot, limitError)
+        }
         throw createCodexApiErrorFromBody(response.status, errorBody)
       }
 
-      this.captureCodexRateLimitHeaders(
-        response.headers,
-        slot,
-        modelName,
-        "request"
-      )
+      // The x-codex-* headers describe whichever limit the call spent; only
+      // a shared one belongs in the text model's snapshot.
+      const imageGenReading = parseCodexImageGenLimitHeaders(response.headers)
+      if (imageGenReading) {
+        this.setImageGenLimit(slot, imageGenReading)
+      } else {
+        this.captureCodexRateLimitHeaders(
+          response.headers,
+          slot,
+          modelName,
+          "request"
+        )
+      }
       await dispatch.lifecycle.accept({})
-      markAccountSuccess(slot, modelName)
+      markAccountSuccess(slot, CODEX_IMAGE_MODEL)
       return response
     } catch (error) {
       if (
@@ -3186,7 +3311,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         throw error
       }
       options.signal?.throwIfAborted()
-      throw await this.toRetryableCodexPhysicalFailure(error, modelName, slot)
+      throw await this.toRetryableCodexPhysicalFailure(error, modelName, slot, {
+        cooldownModels,
+        hasUsableAccount: () => this.findImageRequestSlot(modelName) !== null,
+      })
     }
   }
 
@@ -5245,6 +5373,32 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     } catch {
       // Non-critical: silently ignore parse failures
+    }
+  }
+
+  /** Keep the newest image-limit reading for an account. */
+  private setImageGenLimit(
+    slot: CodexAccountSlot,
+    reading: CodexImageGenLimitSnapshot
+  ): void {
+    slot.imageGenLimit = reading
+    const windows = [
+      reading.primary && formatCodexRateLimitWindow("primary", reading.primary),
+      reading.secondary &&
+        formatCodexRateLimitWindow("secondary", reading.secondary),
+      reading.resetsAt &&
+        `resetAt=${new Date(reading.resetsAt * 1000).toISOString()}`,
+    ].filter(Boolean)
+    const message =
+      `[Codex][RateLimit] ${this.getAccountLabel(slot)}: ` +
+      `limit=${reading.limitName || "image"}, ` +
+      `source=${reading.source}, ` +
+      `${windows.length > 0 ? windows.join(", ") : "windows=unavailable"}` +
+      (reading.limitReached ? ", limit reached" : "")
+    if (reading.limitReached) {
+      this.logger.warn(message)
+    } else {
+      this.logger.log(message)
     }
   }
 
