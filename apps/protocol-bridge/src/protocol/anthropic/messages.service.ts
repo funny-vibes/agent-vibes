@@ -1,3 +1,4 @@
+import { GptRequestError } from "../../llm/shared/gpt-api-contract"
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import * as crypto from "crypto"
 import { type ContextAttachmentSnapshot } from "../../context"
@@ -629,7 +630,8 @@ export class MessagesService implements OnModuleInit {
     route: ModelRouteResult,
     forwardHeaders?: Record<string, string>,
     codexForwardHeaders?: CodexForwardHeaders,
-    attemptedBackends: Set<string> = new Set()
+    attemptedBackends: Set<string> = new Set(),
+    allowFallback = true
   ): Promise<AnthropicResponse> {
     attemptedBackends.add(route.backend)
 
@@ -665,6 +667,7 @@ export class MessagesService implements OnModuleInit {
       )
       return response
     } catch (error) {
+      if (!allowFallback) throw error
       const fallback = this.modelRouter.getFallbackRoute(
         dto.model,
         route.backend
@@ -864,7 +867,8 @@ export class MessagesService implements OnModuleInit {
     route: ModelRouteResult,
     forwardHeaders?: Record<string, string>,
     codexForwardHeaders?: CodexForwardHeaders,
-    attemptedBackends: Set<string> = new Set()
+    attemptedBackends: Set<string> = new Set(),
+    allowFallback = true
   ): AsyncGenerator<string, void, unknown> {
     attemptedBackends.add(route.backend)
     let responseBoundaryCrossed = false
@@ -905,6 +909,7 @@ export class MessagesService implements OnModuleInit {
       }
       return
     } catch (error) {
+      if (!allowFallback) throw error
       const fallback = this.modelRouter.getFallbackRoute(
         dto.model,
         route.backend
@@ -942,7 +947,8 @@ export class MessagesService implements OnModuleInit {
   async createMessage(
     dto: CreateMessageDto,
     forwardHeaders?: Record<string, string>,
-    codexForwardHeaders?: CodexForwardHeaders
+    codexForwardHeaders?: CodexForwardHeaders,
+    requiredBackend?: "codex"
   ): Promise<AnthropicResponse> {
     this.logger.log(
       `Request for model: ${dto.model}, stream: ${dto.stream || false}`
@@ -954,11 +960,19 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
+    if (requiredBackend && route.backend !== requiredBackend) {
+      throw new GptRequestError(
+        "The model is not available through provider: codex",
+        "model"
+      )
+    }
     return this.executeRoutedMessage(
       dto,
       route,
       forwardHeaders,
-      codexForwardHeaders
+      codexForwardHeaders,
+      new Set(),
+      !requiredBackend
     )
   }
 
@@ -968,7 +982,8 @@ export class MessagesService implements OnModuleInit {
   async *createMessageStream(
     dto: CreateMessageDto,
     forwardHeaders?: Record<string, string>,
-    codexForwardHeaders?: CodexForwardHeaders
+    codexForwardHeaders?: CodexForwardHeaders,
+    requiredBackend?: "codex"
   ): AsyncGenerator<string, void, unknown> {
     this.logger.log(`Streaming request for model: ${dto.model}`)
 
@@ -978,11 +993,19 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
+    if (requiredBackend && route.backend !== requiredBackend) {
+      throw new GptRequestError(
+        "The model is not available through provider: codex",
+        "model"
+      )
+    }
     yield* this.executeRoutedMessageStream(
       dto,
       route,
       forwardHeaders,
-      codexForwardHeaders
+      codexForwardHeaders,
+      new Set(),
+      !requiredBackend
     )
   }
 

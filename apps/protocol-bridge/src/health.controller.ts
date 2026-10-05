@@ -372,6 +372,23 @@ export class HealthController {
                     }
                   : null,
               })),
+              imageGen: rateLimits.imageGen
+                ? {
+                    source: rateLimits.imageGen.source,
+                    limitName: rateLimits.imageGen.limitName || null,
+                    limitReached: rateLimits.imageGen.limitReached ?? null,
+                    primary: serializeWindow(rateLimits.imageGen.primary),
+                    secondary: serializeWindow(rateLimits.imageGen.secondary),
+                    resetsAt: rateLimits.imageGen.resetsAt
+                      ? new Date(
+                          rateLimits.imageGen.resetsAt * 1000
+                        ).toISOString()
+                      : null,
+                    updatedAt: new Date(
+                      rateLimits.imageGen.updatedAt
+                    ).toISOString(),
+                  }
+                : null,
               updatedAt: rateLimits.updatedAt
                 ? new Date(rateLimits.updatedAt).toISOString()
                 : null,

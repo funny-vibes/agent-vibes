@@ -1,3 +1,11 @@
+import { isCodexVoiceSession } from "./codex-voice-call"
+import {
+  GptRequestError,
+  readGptProvider,
+  resolveGptHistoryPolicy,
+  type GptProvider,
+  type GptHistoryPolicy,
+} from "../shared/gpt-api-contract"
 const MAX_REALTIME_SDP_LENGTH = 1_000_000
 const MAX_REALTIME_SESSION_LENGTH = 64_000
 
@@ -6,12 +14,16 @@ export const DEFAULT_REALTIME_MODEL = "gpt-realtime"
 export interface ChatGptWebRealtimeCallRequest {
   sdp: string
   session: Record<string, unknown>
+  provider: GptProvider
+  historyPolicy: GptHistoryPolicy
 }
 
 export interface ChatGptWebRealtimeCallResult {
   callId: string
   sdp: string
-  transport: "chatgpt-web-voice"
+  transport: "chatgpt-web-voice" | "codex-voice"
+  /** Internal account binding; never serialize credentials to callers. */
+  accountKey?: string
 }
 
 export class ChatGptWebRealtimeRequestError extends Error {
@@ -114,10 +126,127 @@ export function normalizeChatGptWebRealtimeCallRequest(
     )
   }
 
-  return {
-    sdp: normalizeSdp(value.sdp),
-    session: normalizeSession(value.session),
+  if (value.session != null && !isRecord(value.session))
+    throw new GptRequestError("session must be a JSON object", "session")
+  const rawSession = isRecord(value.session) ? value.session : {}
+  for (const field of [
+    "provider",
+    "history_policy",
+    "allow_temporary_history",
+  ]) {
+    if (
+      value[field] !== undefined &&
+      rawSession[field] !== undefined &&
+      value[field] !== rawSession[field]
+    ) {
+      throw new GptRequestError(
+        `${field} conflicts with session.${field}`,
+        field
+      )
+    }
   }
+  const selected = readGptProvider(value.provider ?? rawSession.provider)
+  const session = normalizeSession(
+    selected === "codex" && rawSession.model === undefined
+      ? { ...rawSession, model: "gpt-live-1-codex" }
+      : value.session
+  )
+  const inferred = isCodexVoiceSession(session) ? "codex" : "chatgpt-web"
+  const provider = selected ?? inferred
+  if (
+    provider !== inferred ||
+    (provider === "chatgpt-web" && session.model !== "gpt-realtime")
+  ) {
+    throw new GptRequestError(
+      "Use gpt-live* for Codex voice and gpt-realtime for ChatGPT Web voice",
+      "session.model"
+    )
+  }
+  const historyPolicy = resolveGptHistoryPolicy(
+    {
+      history_policy: value.history_policy ?? rawSession.history_policy,
+      allow_temporary_history:
+        value.allow_temporary_history ?? rawSession.allow_temporary_history,
+    },
+    provider === "chatgpt-web"
+  )
+  const allowed = [
+    "type",
+    "model",
+    "voice",
+    "audio",
+    "provider",
+    "history_policy",
+    "allow_temporary_history",
+    ...(provider === "codex"
+      ? ["instructions", "delegation", "initial_items"]
+      : []),
+  ]
+  for (const field of Object.keys(session)) {
+    if (!allowed.includes(field))
+      throw new GptRequestError(
+        `Unsupported session.${field} for ${provider}`,
+        `session.${field}`
+      )
+  }
+  if (session.audio !== undefined) {
+    if (
+      !isRecord(session.audio) ||
+      Object.keys(session.audio).some((key) => key !== "output") ||
+      !isRecord(session.audio.output) ||
+      Object.keys(session.audio.output).some((key) => key !== "voice")
+    )
+      throw new GptRequestError(
+        "Only session.audio.output.voice is supported",
+        "session.audio"
+      )
+    if (
+      session.voice !== undefined &&
+      session.audio.output.voice !== undefined &&
+      session.voice !== session.audio.output.voice
+    )
+      throw new GptRequestError(
+        "session.voice conflicts with session.audio.output.voice",
+        "session.voice"
+      )
+  }
+  const requestedVoice =
+    session.voice ??
+    (isRecord(session.audio) && isRecord(session.audio.output)
+      ? session.audio.output.voice
+      : undefined)
+  if (
+    requestedVoice !== undefined &&
+    (typeof requestedVoice !== "string" || !requestedVoice.trim())
+  )
+    throw new GptRequestError(
+      "voice must be a non-empty string",
+      "session.voice"
+    )
+  if (
+    session.instructions !== undefined &&
+    typeof session.instructions !== "string"
+  )
+    throw new GptRequestError(
+      "instructions must be a string",
+      "session.instructions"
+    )
+  if (
+    session.initial_items !== undefined &&
+    !Array.isArray(session.initial_items)
+  )
+    throw new GptRequestError(
+      "initial_items must be an array",
+      "session.initial_items"
+    )
+  if (session.delegation !== undefined && !isRecord(session.delegation))
+    throw new GptRequestError(
+      "delegation must be an object",
+      "session.delegation"
+    )
+  for (const field of ["provider", "history_policy", "allow_temporary_history"])
+    delete session[field]
+  return { sdp: normalizeSdp(value.sdp), session, provider, historyPolicy }
 }
 
 function parseMultipartField(
@@ -182,13 +311,22 @@ export function parseRealtimeMultipartBody(
 
   return normalizeChatGptWebRealtimeCallRequest({
     sdp: fields.get("sdp"),
+    provider: fields.get("provider"),
+    history_policy: fields.get("history_policy"),
     session,
   })
 }
 
+/** Header metadata for SDP-only bodies; JSON and multipart carry their own options. */
+export interface RealtimeSdpOptions {
+  provider?: unknown
+  historyPolicy?: unknown
+}
+
 export function parseChatGptWebRealtimeCallRequest(
   body: unknown,
-  contentType: string
+  contentType: string,
+  sdpOptions: RealtimeSdpOptions = {}
 ): ChatGptWebRealtimeCallRequest {
   const normalizedContentType = contentType.toLowerCase()
   if (normalizedContentType.startsWith("multipart/form-data")) {
@@ -206,7 +344,11 @@ export function parseChatGptWebRealtimeCallRequest(
     normalizedContentType.startsWith("text/plain")
   ) {
     const sdp = Buffer.isBuffer(body) ? body.toString("utf8") : body
-    return normalizeChatGptWebRealtimeCallRequest({ sdp })
+    return normalizeChatGptWebRealtimeCallRequest({
+      sdp,
+      provider: sdpOptions.provider,
+      history_policy: sdpOptions.historyPolicy,
+    })
   }
 
   return normalizeChatGptWebRealtimeCallRequest(body)

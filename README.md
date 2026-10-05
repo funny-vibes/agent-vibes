@@ -14,23 +14,23 @@ English | [中文](README_zh.md)
 </p>
 
 <p align="center">
-  <strong>Unified Agent Gateway</strong> — Use
+  <strong>AI coding backends for Cursor</strong> — Connect
   <strong>Antigravity</strong>, <strong>Codex</strong>, and
-  <strong>Kiro (AWS)</strong> AI backends with
-  <strong>Claude Code CLI</strong> and <strong>Cursor IDE</strong>.
+  <strong>Kiro (AWS)</strong> to <strong>Cursor IDE</strong>,
+  with support for <strong>Claude Code CLI</strong>.
 </p>
 
 ## Overview
 
-Agent Vibes is a unified agent gateway for AI coding clients.
-It not only translates protocols between clients and backends,
-but also implements Cursor's native ConnectRPC/gRPC agent channel with the full streaming tool loop,
-while routing requests across Antigravity, Claude-compatible, Codex, OpenAI-compatible, and Kiro (AWS CodeWhisperer) backends.
+Agent Vibes connects Cursor to Antigravity, Codex, Claude-compatible, and Kiro backends
+through an extension and a local bridge. It supports streaming conversations and
+tool calls in Cursor Agent, with account management, model selection, and quota
+views. Claude Code CLI is also supported.
 
 **Clients** (front-end):
 
-- **Claude Code CLI** — Anthropic API
 - **Cursor IDE** — Protocol-compatible ConnectRPC/gRPC implementation
+- **Claude Code CLI** — Anthropic API
 
 **Backends** (back-end):
 
@@ -384,30 +384,6 @@ codex --login
 agent-vibes sync --codex
 ```
 
-The same Codex OAuth pool powers ChatGPT Web Live at
-`POST /v1/realtime/calls`. A synchronized OAuth account already contains the
-required access/refresh tokens. Optional Web Live account metadata belongs in
-the same `codex-accounts.json` entry:
-
-```json
-{
-  "accounts": [
-    {
-      "label": "chatgpt-plus",
-      "accessToken": "...",
-      "refreshToken": "...",
-      "accountId": "...",
-      "proxyUrl": "http://127.0.0.1:7897",
-      "deviceId": "58c4f084-baa7-43ed-897e-92497a1d26f0"
-    }
-  ]
-}
-```
-
-`deviceId` is optional; Agent Vibes derives a stable per-account value when it
-is absent. Web Live follows the Codex pool's token refresh, round-robin,
-per-account proxy, cooldown, disablement, hot reload, and persistence rules.
-
 - OpenAI-compatible file: `~/.agent-vibes/data/openai-compat-accounts.json`
 
 ```json
@@ -759,25 +735,26 @@ agent-vibes/
 
 ## API Endpoints
 
-| Path                           | Method | Protocol                 | Description              |
-| ------------------------------ | ------ | ------------------------ | ------------------------ |
-| `/v1/messages`                 | POST   | Anthropic API (SSE)      | Claude Code CLI          |
-| `/v1/messages/count_tokens`    | POST   | Anthropic API            | Count request tokens     |
-| `/v1/web-gpt/chat/completions` | POST   | OpenAI Chat API          | ChatGPT web quota (text) |
-| `/v1/web-gpt/responses`        | POST   | OpenAI Responses API     | ChatGPT web quota (text) |
-| `/v1/web-gpt/models`           | GET    | REST JSON                | Web model list           |
-| `/v1/realtime/calls`           | POST   | WebRTC SDP               | ChatGPT OAuth voice      |
-| `/agent.v1.AgentService/Run`   | POST   | ConnectRPC (HTTP/2 BiDi) | Cursor IDE (Agent mode)  |
-| `/v1/models`                   | GET    | REST JSON                | Anthropic model list     |
-| `/v1/anthropic/models`         | GET    | REST JSON                | List available models    |
-| `/health`                      | GET    | REST JSON                | Health check             |
-| `/docs`                        | GET    | Swagger UI               | API documentation        |
+The local bridge uses port `2026` by default.
 
-`/v1/realtime/calls` exchanges a browser WebRTC SDP offer for an SDP answer
-using a configured ChatGPT OAuth account. It never uses a Platform API key and
-requires `PROXY_API_KEY`. The WebRTC audio and ChatGPT Web Live events flow
-directly between the browser and ChatGPT after signaling. Accounts without Web
-Live availability receive a standard OpenAI error envelope.
+| Path                                 | Method               | Purpose                                          |
+| ------------------------------------ | -------------------- | ------------------------------------------------ |
+| `/agent.v1.AgentService/Run`         | POST                 | Cursor Agent conversations and tool calls        |
+| `/v1/messages`                       | POST                 | Claude Code / Anthropic-compatible conversations |
+| `/v1/messages/count_tokens`          | POST                 | Request token counting                           |
+| `/v1/chat/completions`               | POST                 | OpenAI Chat-compatible conversations             |
+| `/v1/responses`                      | POST                 | OpenAI Responses-compatible conversations        |
+| `/v1/web-gpt/chat/completions`       | POST                 | GPT Web conversations                            |
+| `/v1/web-gpt/responses`              | POST                 | GPT Web Responses                                |
+| `/v1/images/generations`             | POST                 | Image generation                                 |
+| `/v1/images/edits`                   | POST                 | Reference-image editing                          |
+| `/v1/images/jobs/{id}`               | GET                  | Image job status and results                     |
+| `/v1/realtime/calls`                 | POST                 | Create a voice connection                        |
+| `/v1/realtime/calls/{id}`            | GET / PATCH / DELETE | Voice session status, binding, and cleanup       |
+| `/v1/realtime/files/{fileId}`        | GET                  | Download Web voice-generated files               |
+| `/v1/models`, `/v1/anthropic/models` | GET                  | Model lists                                      |
+| `/v1/web-gpt/models`                 | GET                  | GPT Web model list                               |
+| `/health`                            | GET                  | Service health check                             |
 
 ## Tech Stack
 

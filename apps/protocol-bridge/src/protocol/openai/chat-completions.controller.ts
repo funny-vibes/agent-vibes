@@ -1,3 +1,9 @@
+import { ExplicitWebProviderGuard } from "../../shared/explicit-web-provider.guard"
+import {
+  GptRequestError,
+  readGptProvider,
+  resolveGptHistoryPolicy,
+} from "../../llm/shared/gpt-api-contract"
 import { once } from "node:events"
 import {
   Body,
@@ -43,13 +49,33 @@ import type {
  */
 @ApiTags("OpenAI API")
 @Controller("v1")
-@UseGuards(ApiKeyGuard)
+@UseGuards(ApiKeyGuard, ExplicitWebProviderGuard)
 @ApiSecurity("api-key")
 export class ChatCompletionsController {
   constructor(
     private readonly chatCompletionsService: ChatCompletionsService,
     private readonly chatGptWeb: ChatGptWebProtocolService
   ) {}
+
+  private validateProvider(
+    body: Record<string, unknown>,
+    fixedWeb = false
+  ): "codex" | "chatgpt-web" | undefined {
+    try {
+      const provider = readGptProvider(body.provider)
+      if (fixedWeb && provider && provider !== "chatgpt-web") {
+        throw new GptRequestError(
+          "This route requires provider: chatgpt-web",
+          "provider"
+        )
+      }
+      resolveGptHistoryPolicy(body, false)
+      return provider
+    } catch (error) {
+      const rendered = renderOpenAiError(error)
+      throw new HttpException(rendered.body, rendered.status)
+    }
+  }
 
   private buildMissingModelError(): HttpException {
     return new HttpException(
@@ -76,6 +102,10 @@ export class ChatCompletionsController {
     @Body() body: Record<string, unknown>,
     @Res({ passthrough: true }) res?: FastifyReply
   ) {
+    const provider = this.validateProvider(body)
+    if (provider === "chatgpt-web")
+      return this.createWebGptChatCompletion(body, res)
+    if (provider) res?.header("X-Agent-Vibes-Provider", provider)
     const req = body as unknown as OpenAiChatCompletionRequest
     if (typeof req?.model !== "string" || req.model.trim() === "") {
       throw this.buildMissingModelError()
@@ -108,6 +138,9 @@ export class ChatCompletionsController {
     @Res({ passthrough: true }) res?: FastifyReply,
     @Req() httpRequest?: FastifyRequest
   ) {
+    const provider = this.validateProvider(body)
+    if (provider === "chatgpt-web") return this.createWebGptResponse(body, res)
+    if (provider) res?.header("X-Agent-Vibes-Provider", provider)
     const req = body as unknown as OpenAiResponsesRequest
     if (typeof req?.model !== "string" || req.model.trim() === "") {
       throw this.buildMissingModelError()
@@ -188,6 +221,8 @@ export class ChatCompletionsController {
     @Body() body: Record<string, unknown>,
     @Res({ passthrough: true }) res?: FastifyReply
   ) {
+    this.validateProvider(body, true)
+    res?.header("X-Agent-Vibes-Provider", "chatgpt-web")
     const req = body as unknown as OpenAiResponsesRequest
     if (typeof req?.model !== "string" || req.model.trim() === "") {
       throw this.buildMissingModelError()
@@ -243,6 +278,8 @@ export class ChatCompletionsController {
     @Body() body: Record<string, unknown>,
     @Res({ passthrough: true }) res?: FastifyReply
   ) {
+    this.validateProvider(body, true)
+    res?.header("X-Agent-Vibes-Provider", "chatgpt-web")
     const req = body as unknown as OpenAiChatCompletionRequest
     if (typeof req?.model !== "string" || req.model.trim() === "") {
       throw this.buildMissingModelError()

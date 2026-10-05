@@ -404,16 +404,6 @@ export class CodexTurnContextManager {
     return context
   }
 
-  getActiveContext(
-    conversationId: string | undefined
-  ): CodexTurnContext | undefined {
-    const exactConversationId =
-      this.requireOptionalConversationId(conversationId)
-    return exactConversationId !== undefined
-      ? this.sessions.getActive(exactConversationId)
-      : undefined
-  }
-
   disposeContext(input: CodexTurnContextCacheScope): void {
     const conversationId = this.requireOptionalConversationId(
       input.conversationId
@@ -478,36 +468,6 @@ export class CodexTurnContextManager {
     request: Record<string, unknown>
   ): string | undefined {
     return context ? startCodexFullResponseChain(context, request) : undefined
-  }
-
-  captureResponse(
-    conversationId: string,
-    responseId: string,
-    itemsAdded: CodexInputItem[]
-  ): boolean {
-    const exactConversationId = this.requireConversationId(conversationId)
-    const exactResponseId = requireExactDurableIdentifier(
-      responseId,
-      "Codex response id"
-    )
-
-    const context = this.sessions.getActive(exactConversationId)
-    if (!context) return false
-
-    captureCodexTurnResponse(context, exactResponseId, itemsAdded)
-    this.sessions.touch(exactConversationId)
-    return true
-  }
-
-  resetResponseState(conversationId: string): string | undefined {
-    const exactConversationId = this.requireConversationId(conversationId)
-
-    const context = this.sessions.getActive(exactConversationId)
-    if (!context) return undefined
-
-    const previousResponseId = resetCodexTurnContinuationState(context)
-    this.sessions.touch(exactConversationId)
-    return previousResponseId
   }
 
   clearContinuationBaseline(
@@ -645,10 +605,6 @@ export class CodexTurnContextManager {
       resetCount,
       discardedActivePreviousResponseId,
     }
-  }
-
-  hasActiveContext(conversationId: string): boolean {
-    return this.hasContinuationState(conversationId)
   }
 
   hasContinuationState(

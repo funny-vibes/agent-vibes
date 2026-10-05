@@ -68,6 +68,7 @@ import { BackendAccountStateStore } from "../shared/backend-account-state-store"
 import { PersistenceService } from "../../persistence"
 import {
   BackendPoolStatus,
+  type CodexImageGenLimitSnapshot,
   type CodexRateLimitAccountSummary,
   type CodexRateLimitModelSummary,
   type CodexRateLimitSnapshot,
@@ -97,6 +98,14 @@ import {
   decodeCodexStandaloneSearchResponse,
   type CodexStandaloneSearchRequest,
 } from "./codex-standalone-web-search"
+import {
+  CODEX_IMAGE_MODEL,
+  buildCodexStandaloneImageRequest,
+  decodeCodexStandaloneImageResponse,
+  type CodexImageBackground,
+  type CodexImageReference,
+  type CodexStandaloneImageRequest,
+} from "./codex-standalone-image"
 import { buildCodexDispatchLogLine } from "./codex-dispatch-log-summary"
 import { resolveCodexPromptCacheKey } from "./codex-cache-identity-policy"
 import {
@@ -112,6 +121,12 @@ import {
   formatCodexRateLimitWindow,
   parseCodexRateLimitHeaders,
 } from "./codex-rate-limit-headers"
+import {
+  isCodexImageLimitId,
+  parseCodexImageGenLimitError,
+  parseCodexImageGenLimitHeaders,
+  readCodexActiveLimit,
+} from "./codex-image-gen-limit"
 import {
   getAllCodexAccountsRateLimitedRetrySeconds,
   getCodexWeeklyQuotaCooldownUntil,
@@ -133,10 +148,7 @@ import {
   normalizeCodexRateLimitModelName,
   setCodexRateLimitSnapshot,
 } from "./codex-rate-limit-summary"
-import {
-  extractCodexCompletedUsage,
-  parseCodexSsePayload,
-} from "./codex-sse-parsing"
+import { extractCodexCompletedUsage } from "./codex-sse-parsing"
 import {
   buildCodexHttpRequestLogLine,
   summarizeCodexCompletedResponseForLogs,
@@ -205,7 +217,9 @@ import {
 import { isCodexRefreshTokenInvalidationMessage } from "./codex-token-refresh-policy"
 import {
   CHATGPT_WEB_REALTIME_POOL_MODEL,
+  CODEX_VOICE_POOL_MODEL,
   type CodexRealtimeAccountLease,
+  type CodexVoiceAccountLease,
   resolveChatGptWebDeviceId,
 } from "./codex-realtime-account"
 import {
@@ -292,6 +306,8 @@ interface CodexAccountSlot extends CooldownableAccount {
     string,
     Partial<Record<CodexRateLimitSource, CodexRateLimitSnapshot>>
   >
+  /** Latest reading of the separate limit that `images/*` calls spend. */
+  imageGenLimit?: CodexImageGenLimitSnapshot
 }
 
 interface CodexStreamDispatchOptions {
@@ -580,6 +596,57 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   async acquireChatGptWebRealtimeAccount(
     excludedAccountKeys: ReadonlySet<string> = new Set()
   ): Promise<CodexRealtimeAccountLease | null> {
+    const leased = await this.leaseRealtimeSlot(
+      CHATGPT_WEB_REALTIME_POOL_MODEL,
+      "ChatGPT Web Realtime",
+      excludedAccountKeys
+    )
+    return leased?.lease ?? null
+  }
+
+  /**
+   * Lease one OAuth account for a Codex voice (GPT-Live) call — the voice
+   * Codex itself opens — with what a request to the account's Codex backend
+   * needs: its call endpoint, its identity headers and its proxy.
+   */
+  async acquireCodexVoiceAccount(
+    excludedAccountKeys: ReadonlySet<string> = new Set()
+  ): Promise<CodexVoiceAccountLease | null> {
+    const leased = await this.leaseRealtimeSlot(
+      CODEX_VOICE_POOL_MODEL,
+      "Codex voice",
+      excludedAccountKeys
+    )
+    if (!leased) return null
+    const { slot, lease } = leased
+    return {
+      ...lease,
+      callUrl: this.buildUrl(slot, "realtime/calls"),
+      headers: (accessToken) =>
+        buildCodexNonTurnHttpHeaders({
+          token: accessToken,
+          isApiKey: false,
+          accept: "application/json",
+          identity: {
+            version: this.identity.version(),
+            userAgent: this.identity.userAgent(),
+            originator: this.identity.originator(),
+          },
+          accountId: this.getSlotAccountId(slot),
+          workspaceId: slot.workspaceId,
+        }),
+      dispatcher: this.buildProxyDispatcher(slot),
+    }
+  }
+
+  private async leaseRealtimeSlot(
+    poolModel: string,
+    purpose: string,
+    excludedAccountKeys: ReadonlySet<string>
+  ): Promise<{
+    slot: CodexAccountSlot
+    lease: CodexRealtimeAccountLease
+  } | null> {
     const attempted = new Set(excludedAccountKeys)
     let inspected = 0
 
@@ -592,11 +659,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           return (
             !attempted.has(key) &&
             this.hasChatGptWebCredential(candidate) &&
-            isAccountAvailableForModel(
-              candidate,
-              CHATGPT_WEB_REALTIME_POOL_MODEL,
-              now
-            )
+            isAccountAvailableForModel(candidate, poolModel, now)
           )
         },
       })
@@ -610,7 +673,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         markAccountCooldown(
           slot,
           401,
-          CHATGPT_WEB_REALTIME_POOL_MODEL,
+          poolModel,
           undefined,
           this.getAccountLabel(slot)
         )
@@ -619,36 +682,39 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
       let settled = false
       return {
-        accountKey,
-        label: this.getAccountLabel(slot),
-        accessToken,
-        deviceId: resolveChatGptWebDeviceId(slot.deviceId, accountKey),
-        proxyUrl: slot.proxyUrl?.trim() || undefined,
-        refreshAccessToken: (reason) =>
-          this.tryRefreshSlotToken(slot, reason, {
-            allowOAuthOnApiKeySlot: true,
-          }),
-        accept: () => {
-          if (settled) return
-          settled = true
-          markAccountSuccess(slot, CHATGPT_WEB_REALTIME_POOL_MODEL)
-        },
-        abandon: () => {
-          settled = true
-        },
-        reject: (statusCode, detail, retryAfterSeconds) => {
-          if (settled) return
-          settled = true
-          markAccountCooldown(
-            slot,
-            statusCode,
-            CHATGPT_WEB_REALTIME_POOL_MODEL,
-            retryAfterSeconds?.toString(),
-            this.getAccountLabel(slot)
-          )
-          this.logger.warn(
-            `[Codex] ChatGPT Web Realtime rejected ${this.getAccountLabel(slot)}: HTTP ${statusCode}${detail ? ` ${detail.slice(0, 300)}` : ""}`
-          )
+        slot,
+        lease: {
+          accountKey,
+          label: this.getAccountLabel(slot),
+          accessToken,
+          deviceId: resolveChatGptWebDeviceId(slot.deviceId, accountKey),
+          proxyUrl: slot.proxyUrl?.trim() || undefined,
+          refreshAccessToken: (reason) =>
+            this.tryRefreshSlotToken(slot, reason, {
+              allowOAuthOnApiKeySlot: true,
+            }),
+          accept: () => {
+            if (settled) return
+            settled = true
+            markAccountSuccess(slot, poolModel)
+          },
+          abandon: () => {
+            settled = true
+          },
+          reject: (statusCode, detail, retryAfterSeconds) => {
+            if (settled) return
+            settled = true
+            markAccountCooldown(
+              slot,
+              statusCode,
+              poolModel,
+              retryAfterSeconds?.toString(),
+              this.getAccountLabel(slot)
+            )
+            this.logger.warn(
+              `[Codex] ${purpose} rejected ${this.getAccountLabel(slot)}: HTTP ${statusCode}${detail ? ` ${detail.slice(0, 300)}` : ""}`
+            )
+          },
         },
       }
     }
@@ -1372,24 +1438,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   /**
-   * Clear response state in the turn context when the transcript baseline is
-   * no longer safe for incremental append.
-   */
-  private resetTurnContextResponseState(
-    conversationId: string,
-    reason?: string
-  ): void {
-    const previousResponseId =
-      this.turnContexts.resetResponseState(conversationId)
-    if (previousResponseId && reason) {
-      this.logger.debug(
-        `[Codex][TurnContext] ${reason} for ${conversationId}, ` +
-          `discarding stale previous_response_id=${previousResponseId}`
-      )
-    }
-  }
-
-  /**
    * A rebuilt WebSocket must not reuse its earlier request delta for this
    * physical dispatch. This remains request-local: if the dispatch is
    * abandoned, its accepted baseline is still available to the next attempt.
@@ -1963,7 +2011,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return getCodexRateLimitAccountSummary(
       account.rateLimitSnapshots,
       DEFAULT_CODEX_RATE_LIMIT_MODEL,
-      (normalizedModel) => this.getCodexDisplayModel(normalizedModel)
+      (normalizedModel) => this.getCodexDisplayModel(normalizedModel),
+      account.imageGenLimit
     )
   }
 
@@ -2734,6 +2783,80 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return selection.slot
   }
 
+  /**
+   * Pick an account for a standalone image call. The text model only gates
+   * which accounts can make the call; its cooldowns do not, because image
+   * generation spends its own limit. Holds on the image key still apply.
+   */
+  private selectImageRequestSlot(modelName: string): CodexAccountSlot {
+    if (this.accounts.length === 0) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+    const normalized = modelName.toLowerCase().trim()
+    if (!this.hasSupportingAccount(normalized)) {
+      throw new CodexApiError(
+        400,
+        `Model ${modelName} is not supported by the configured Codex account(s).`
+      )
+    }
+
+    const now = Date.now()
+    const slot = this.slotRouter.pickFromCurrentIndex({
+      candidates: this.accounts,
+      isSlotUsable: (candidate) =>
+        this.isImageSlotUsable(candidate, normalized, now),
+    })
+    if (slot) {
+      return slot
+    }
+
+    const retrySeconds = getAllCodexAccountsRateLimitedRetrySeconds(
+      this.accounts.map((candidate) =>
+        getCodexSlotRecoveryTimeForModel({
+          slot: candidate,
+          model: CODEX_IMAGE_MODEL,
+          now,
+          isModelSupported: (supported) =>
+            this.isModelSupportedBySlot(supported, normalized),
+          getWeeklyQuotaCooldownUntil: () => 0,
+        })
+      ),
+      now
+    )
+    throw new CodexApiError(
+      429,
+      `All Codex accounts are rate-limited for image generation. ` +
+        `Retry after ${retrySeconds} seconds.`,
+      retrySeconds
+    )
+  }
+
+  /** Look up, without advancing the rotation, an account for an image call. */
+  private findImageRequestSlot(modelName: string): CodexAccountSlot | null {
+    const now = Date.now()
+    const normalized = modelName.toLowerCase().trim()
+    return (
+      this.slotRouter.findFromCurrentIndex({
+        candidates: this.accounts,
+        isSlotUsable: (candidate) =>
+          this.isImageSlotUsable(candidate, normalized, now),
+      })?.account ?? null
+    )
+  }
+
+  private isImageSlotUsable(
+    slot: CodexAccountSlot,
+    normalizedModel: string,
+    now: number
+  ): boolean {
+    return (
+      this.isModelSupportedBySlot(slot, normalizedModel) &&
+      isAccountAvailableForModel(slot, CODEX_IMAGE_MODEL, now)
+    )
+  }
+
   private codexPhysicalErrorClass(error: unknown): BackendErrorClass {
     if (error instanceof CodexApiError) {
       if (error.errorClass) return error.errorClass
@@ -2752,7 +2875,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private async toRetryableCodexPhysicalFailure(
     error: unknown,
     modelName: string,
-    slot?: CodexAccountSlot
+    slot?: CodexAccountSlot,
+    options: {
+      readonly cooldownModels?: readonly string[]
+      /** Whether some account can take the next attempt right now. */
+      readonly hasUsableAccount?: () => boolean
+    } = {}
   ): Promise<ProviderAttemptRetryableError> {
     if (isProviderAttemptRetryableError(error)) {
       return error
@@ -2765,13 +2893,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     const statusCode =
       error instanceof CodexApiError ? error.getStatus() : undefined
-    const retryAfterMs =
-      error instanceof CodexApiError && error.retryAfterSeconds !== undefined
-        ? Math.min(
-            error.retryAfterSeconds * 1_000,
-            this.allRateLimitMaxWaitSeconds * 1_000
-          )
-        : undefined
 
     if (slot && statusCode !== undefined) {
       let refreshed = false
@@ -2782,17 +2903,35 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         ))
       }
       if (!refreshed) {
-        markAccountCooldown(
-          slot,
-          statusCode,
-          modelName,
-          error instanceof CodexApiError
-            ? error.retryAfterSeconds?.toString()
-            : undefined,
-          this.getAccountLabel(slot)
-        )
+        for (const cooldownModel of options.cooldownModels ?? [modelName]) {
+          markAccountCooldown(
+            slot,
+            statusCode,
+            cooldownModel,
+            error instanceof CodexApiError
+              ? error.retryAfterSeconds?.toString()
+              : undefined,
+            this.getAccountLabel(slot)
+          )
+        }
       }
     }
+
+    // A retry-after belongs to the account that sent it, which is now held.
+    // Wait it out only when no account can take the next attempt, the same
+    // case the all-accounts-limited error reports on its own.
+    const hasUsableAccount =
+      options.hasUsableAccount ??
+      (() => this.findNextAvailableAccount(modelName) !== null)
+    const retryAfterMs =
+      error instanceof CodexApiError &&
+      error.retryAfterSeconds !== undefined &&
+      !(slot && hasUsableAccount())
+        ? Math.min(
+            error.retryAfterSeconds * 1_000,
+            this.allRateLimitMaxWaitSeconds * 1_000
+          )
+        : undefined
 
     return new ProviderAttemptRetryableError(
       `Codex physical dispatch failed before acceptance: ${
@@ -2981,21 +3120,26 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
   }
 
+  /**
+   * Generate or edit one image natively, the way the official Codex CLI's
+   * standalone image extension does: a direct `images/generations` or
+   * `images/edits` call on the Codex backend with `gpt-image-2`. It is not a
+   * Responses turn, so it does not spend the conversation quota; the backend
+   * meters it on its own image limit. The result is always PNG data.
+   */
   async generateImage(input: {
     prompt: string
     model?: string
     conversationId?: string
-    outputFormat?: string
+    background?: CodexImageBackground
+    referenceImages?: readonly CodexImageReference[]
   }): Promise<{
     imageData: string
     revisedPrompt?: string
     status?: string
+    background?: CodexImageBackground
+    generationId?: string
   }> {
-    const prompt = input.prompt.trim()
-    if (!prompt) {
-      throw new Error("Image generation prompt is required")
-    }
-
     const requestedModel = input.model?.trim() || ""
     const modelName =
       requestedModel && this.hasSupportingAccount(requestedModel)
@@ -3003,27 +3147,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         : DEFAULT_CODEX_RATE_LIMIT_MODEL
     const conversationId =
       input.conversationId || `image-${crypto.randomUUID()}`
-    const upstreamIdentity = createCodexRootProviderIdentity()
-    const executionRequest = this.prepareBridgeNativeExecutionRequest({
+    const imageRequest = buildCodexStandaloneImageRequest({
+      prompt: input.prompt,
       model: modelName,
-      upstreamIdentity,
-      localProjectionKey: conversationId,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      tools: [
-        {
-          type: "image_generation",
-          name: "image_generation",
-          description: "Generate an image from the user prompt.",
-          output_format: input.outputFormat?.trim() || "png",
-        },
-      ],
-      parallelToolCalls: false,
-      textVerbosity: "low",
+      conversationId,
+      upstreamIdentity: createCodexRootProviderIdentity(),
+      background: input.background,
+      referenceImages: input.referenceImages,
     })
     this.onLiveRequestStart()
     try {
@@ -3032,109 +3162,52 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           scope: `codex:image-generation:${conversationId}:${crypto.randomUUID()}`,
           backend: "codex",
           model: modelName,
-          request: executionRequest,
+          request: imageRequest,
         },
         execute: (dispatch) =>
-          this.dispatchCodexServerToolRequest(dispatch, {
+          this.dispatchCodexStandaloneImageRequest(dispatch, {
             timeoutMs: 600_000,
           }),
       })
-      const fullBody = await response.text()
-      let imageData = ""
-      let revisedPrompt: string | undefined
-      let status: string | undefined
-
-      for (const line of fullBody.split("\n")) {
-        const payload = parseCodexSsePayload(line.trim())
-        const item =
-          payload?.type === "response.output_item.done" &&
-          payload.item &&
-          typeof payload.item === "object"
-            ? (payload.item as Record<string, unknown>)
-            : undefined
-        if (item?.type === "image_generation_call") {
-          if (typeof item.result === "string" && item.result.trim()) {
-            imageData = item.result.trim()
-          }
-          if (typeof item.revised_prompt === "string") {
-            revisedPrompt = item.revised_prompt
-          }
-          if (typeof item.status === "string") {
-            status = item.status
-          }
-        }
-
-        const responseOutput =
-          payload?.type === "response.completed" &&
-          payload.response &&
-          typeof payload.response === "object"
-            ? (payload.response as Record<string, unknown>).output
-            : undefined
-        if (Array.isArray(responseOutput)) {
-          for (const outputItem of responseOutput) {
-            if (
-              outputItem &&
-              typeof outputItem === "object" &&
-              (outputItem as Record<string, unknown>).type ===
-                "image_generation_call"
-            ) {
-              const record = outputItem as Record<string, unknown>
-              if (typeof record.result === "string" && record.result.trim()) {
-                imageData = record.result.trim()
-              }
-              if (typeof record.revised_prompt === "string") {
-                revisedPrompt = record.revised_prompt
-              }
-              if (typeof record.status === "string") {
-                status = record.status
-              }
-            }
-          }
-        }
+      const decoded = decodeCodexStandaloneImageResponse(await response.json())
+      return {
+        imageData: decoded.imageData,
+        status: "completed",
+        ...(decoded.revisedPrompt
+          ? { revisedPrompt: decoded.revisedPrompt }
+          : {}),
+        ...(decoded.background ? { background: decoded.background } : {}),
+        ...(decoded.generationId ? { generationId: decoded.generationId } : {}),
       }
-
-      if (!imageData) {
-        throw new Error("Codex image_generation completed without image data")
-      }
-
-      return { imageData, revisedPrompt, status }
     } finally {
       this.onLiveRequestEnd()
     }
   }
 
-  /**
-   * Dispatch exactly one server-side Responses tool request. A successful HTTP
-   * response is the upstream acceptance boundary even when its SSE body is
-   * still being parsed locally, so a malformed or interrupted body can never
-   * cause this model request to be replayed.
-   */
-  private async dispatchCodexServerToolRequest(
-    dispatch: ProviderPhysicalDispatch<CodexExecutionRequest>,
+  /** Complete one physical native `images/*` dispatch. */
+  private async dispatchCodexStandaloneImageRequest(
+    dispatch: ProviderPhysicalDispatch<CodexStandaloneImageRequest>,
     options: CodexServerToolExecutionOptions
   ): Promise<Response> {
     assertProviderPhysicalDispatch({
       dispatch,
       backend: "codex",
-      label: "Codex server tool dispatch",
+      label: "Codex standalone image dispatch",
     })
-    if (dispatch.request.model !== dispatch.attempt.model) {
+    const request = dispatch.request
+    if (request.model !== dispatch.attempt.model) {
       throw new Error(
-        "Codex server tool request model does not match its physical attempt model"
+        "Codex standalone image model does not match its physical attempt model"
       )
     }
 
-    const request = dispatch.request
     const modelName = request.model
     let slot: CodexAccountSlot | undefined
-
+    // Image calls spend their own limit, so their holds go on the image key.
+    let cooldownModels: readonly string[] = [CODEX_IMAGE_MODEL]
     try {
       options.signal?.throwIfAborted()
-      slot = this.selectRequestSlot(
-        modelName,
-        this.getLocalProjectionKey(request),
-        { preferWarmPool: false }
-      )
+      slot = this.selectImageRequestSlot(modelName)
       const token = await this.getBearerToken(slot)
       if (!token) {
         throw new Error(
@@ -3142,36 +3215,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
       }
 
-      const { codexRequest: assembledCodexRequest, clientMetadata } =
-        this.attachBridgeNativeClientMetadata(
-          request,
-          buildCodexRequest(
-            {
-              ...request,
-              modelProfile: getCodexModelProfile(
-                modelName,
-                this.modelCatalogScope(slot)
-              ),
-            },
-            modelName
-          ) as Record<string, unknown>
-        )
-      const codexRequest = this.cacheService.injectSessionCacheKey(
-        assembledCodexRequest,
-        this.getUpstreamIdentity(request)
-      )
-      const url = this.buildUrl(slot, "responses")
-      const headers = this.buildHeaders(slot, token, true, {
-        localProjectionKey: this.getLocalProjectionKey(request),
-        upstreamIdentity: this.getUpstreamIdentity(request),
-        clientMetadata,
-        useResponsesLite: this.usesResponsesLite(modelName, slot),
+      const headers = buildCodexNonTurnHttpHeaders({
+        token,
+        isApiKey: this.isApiKeyMode(slot),
+        accept: "application/json",
+        identity: {
+          version: this.identity.version(),
+          userAgent: this.identity.userAgent(),
+          originator: this.identity.originator(),
+        },
+        accountId: this.getSlotAccountId(slot),
+        workspaceId: slot.workspaceId,
       })
+      // The official client tags every image call with the turn it belongs to.
+      headers["x-codex-image-turn-id"] = request.localProjectionKey
       const timeoutSignal = AbortSignal.timeout(options.timeoutMs)
       const fetchOptions: RequestInit & { dispatcher?: unknown } = {
         method: "POST",
         headers,
-        body: JSON.stringify(prepareCodexRequestForSend(codexRequest)),
+        body: JSON.stringify(request.body),
         signal: options.signal
           ? AbortSignal.any([options.signal, timeoutSignal])
           : timeoutSignal,
@@ -3181,20 +3243,47 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         fetchOptions.dispatcher = dispatcher
       }
 
-      const response = await fetch(url, fetchOptions)
+      const response = await fetch(
+        this.buildUrl(slot, request.endpoint),
+        fetchOptions
+      )
       if (!response.ok) {
         const errorBody = await response.text()
+        const activeLimit = readCodexActiveLimit(response.headers)
+        if (
+          response.status === 429 &&
+          activeLimit &&
+          !isCodexImageLimitId(activeLimit)
+        ) {
+          // Refused on a limit that conversation turns spend as well.
+          cooldownModels = [CODEX_IMAGE_MODEL, modelName]
+        }
+        const limitError = parseCodexImageGenLimitError(
+          response.status,
+          response.headers,
+          errorBody
+        )
+        if (limitError) {
+          this.setImageGenLimit(slot, limitError)
+        }
         throw createCodexApiErrorFromBody(response.status, errorBody)
       }
 
-      this.captureCodexRateLimitHeaders(
-        response.headers,
-        slot,
-        modelName,
-        "request"
-      )
+      // The x-codex-* headers describe whichever limit the call spent; only
+      // a shared one belongs in the text model's snapshot.
+      const imageGenReading = parseCodexImageGenLimitHeaders(response.headers)
+      if (imageGenReading) {
+        this.setImageGenLimit(slot, imageGenReading)
+      } else {
+        this.captureCodexRateLimitHeaders(
+          response.headers,
+          slot,
+          modelName,
+          "request"
+        )
+      }
       await dispatch.lifecycle.accept({})
-      markAccountSuccess(slot, modelName)
+      markAccountSuccess(slot, CODEX_IMAGE_MODEL)
       return response
     } catch (error) {
       if (
@@ -3204,7 +3293,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         throw error
       }
       options.signal?.throwIfAborted()
-      throw await this.toRetryableCodexPhysicalFailure(error, modelName, slot)
+      throw await this.toRetryableCodexPhysicalFailure(error, modelName, slot, {
+        cooldownModels,
+        hasUsableAccount: () => this.findImageRequestSlot(modelName) !== null,
+      })
     }
   }
 
@@ -5158,6 +5250,32 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     } catch {
       // Non-critical: silently ignore parse failures
+    }
+  }
+
+  /** Keep the newest image-limit reading for an account. */
+  private setImageGenLimit(
+    slot: CodexAccountSlot,
+    reading: CodexImageGenLimitSnapshot
+  ): void {
+    slot.imageGenLimit = reading
+    const windows = [
+      reading.primary && formatCodexRateLimitWindow("primary", reading.primary),
+      reading.secondary &&
+        formatCodexRateLimitWindow("secondary", reading.secondary),
+      reading.resetsAt &&
+        `resetAt=${new Date(reading.resetsAt * 1000).toISOString()}`,
+    ].filter(Boolean)
+    const message =
+      `[Codex][RateLimit] ${this.getAccountLabel(slot)}: ` +
+      `limit=${reading.limitName || "image"}, ` +
+      `source=${reading.source}, ` +
+      `${windows.length > 0 ? windows.join(", ") : "windows=unavailable"}` +
+      (reading.limitReached ? ", limit reached" : "")
+    if (reading.limitReached) {
+      this.logger.warn(message)
+    } else {
+      this.logger.log(message)
     }
   }
 

@@ -54,9 +54,29 @@ export interface CodexRateLimitModelSummary {
   updatedAt: number
 }
 
+/**
+ * Where an image-limit reading came from: the headers of an image response,
+ * or an image request refused because the limit is spent.
+ */
+export type CodexImageGenLimitSource = "response" | "limit-error"
+
+/** The backend's separate meter for standalone image generation. */
+export interface CodexImageGenLimitSnapshot {
+  source: CodexImageGenLimitSource
+  /** The backend's limit id, e.g. `imagegen_premium`. */
+  limitName?: string
+  primary?: CodexRateLimitWindow
+  secondary?: CodexRateLimitWindow
+  limitReached?: boolean
+  /** Unix seconds; set when the backend names one reset for the whole limit. */
+  resetsAt?: number
+  updatedAt: number
+}
+
 export interface CodexRateLimitAccountSummary {
   effective: CodexRateLimitSnapshot | null
   models: CodexRateLimitModelSummary[]
+  imageGen?: CodexImageGenLimitSnapshot
   updatedAt: number | null
 }
 

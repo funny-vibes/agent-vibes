@@ -1,3 +1,4 @@
+import { GptRequestError } from "../../llm/shared/gpt-api-contract"
 import {
   CodexResponsesService,
   type CodexResponsesContext,
@@ -57,7 +58,12 @@ export class ChatCompletionsService {
     const dto = translateOpenAiChatToCreateMessage(req)
     dto.stream = false
     const response: AnthropicResponse =
-      await this.messagesService.createMessage(dto)
+      await this.messagesService.createMessage(
+        dto,
+        undefined,
+        undefined,
+        req.provider === "codex" ? "codex" : undefined
+      )
     const created = Math.floor(Date.now() / 1000)
     return translateAnthropicToOpenAiChat(response, req.model, created)
   }
@@ -83,7 +89,12 @@ export class ChatCompletionsService {
       includeUsage: req.stream_options?.include_usage === true,
     })
 
-    const upstream = this.messagesService.createMessageStream(dto)
+    const upstream = this.messagesService.createMessageStream(
+      dto,
+      undefined,
+      undefined,
+      req.provider === "codex" ? "codex" : undefined
+    )
     for await (const chunk of upstream) {
       for (const frame of translator.push(chunk)) {
         yield frame
@@ -100,6 +111,12 @@ export class ChatCompletionsService {
     req: OpenAiResponsesRequest,
     context: CodexResponsesContext = { owner: "local" }
   ): Promise<OpenAiResponsesResponse | Record<string, unknown>> {
+    if (req.provider === "codex" && !this.codexResponses.usesCodex(req.model)) {
+      throw new GptRequestError(
+        "The model is not available through provider: codex",
+        "model"
+      )
+    }
     if (this.codexResponses.usesCodex(req.model))
       return this.codexResponses.create(req, context)
     const dto = translateOpenAiResponseToCreateMessage(req)
@@ -117,6 +134,12 @@ export class ChatCompletionsService {
     req: OpenAiResponsesRequest,
     context: CodexResponsesContext = { owner: "local" }
   ): AsyncGenerator<string, void, unknown> {
+    if (req.provider === "codex" && !this.codexResponses.usesCodex(req.model)) {
+      throw new GptRequestError(
+        "The model is not available through provider: codex",
+        "model"
+      )
+    }
     if (this.codexResponses.usesCodex(req.model)) {
       yield* this.codexResponses.stream(req, context)
       return

@@ -14,20 +14,19 @@
 </p>
 
 <p align="center">
-  <strong>统一 Agent 网关</strong> —
-  通过 <strong>Claude Code CLI</strong> 和 <strong>Cursor IDE</strong>
-  使用 <strong>Antigravity</strong>、<strong>Codex</strong>
-  与 <strong>Kiro (AWS)</strong> AI 后端。
+  <strong>在 Cursor 中使用多种 AI 编程后端</strong> — 接入
+  <strong>Antigravity</strong>、<strong>Codex</strong> 和
+  <strong>Kiro (AWS)</strong>，也支持 <strong>Claude Code CLI</strong>。
 </p>
 
 ## 概览
 
-Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后端之间的协议转换，还完整实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道与流式工具调用循环，并在 Antigravity、Claude 兼容、Codex、OpenAI-compatible 与 Kiro (AWS CodeWhisperer) 等后端之间进行请求路由。
+Agent Vibes 是面向 Cursor 的扩展与本地桥接服务，用于连接 Antigravity、Codex、Claude 兼容接口和 Kiro 等后端。支持 Cursor Agent 的流式对话与工具调用，并提供账号管理、模型选择和额度查看；也支持 Claude Code CLI。
 
 **客户端**（前端）：
 
-- **Claude Code CLI** — Anthropic API
 - **Cursor IDE** — 协议兼容的原生 ConnectRPC/gRPC 实现
+- **Claude Code CLI** — Anthropic API
 
 **后端**（后端）：
 
@@ -684,24 +683,26 @@ agent-vibes/
 
 ## API 端点
 
-| 路径                           | 方法 | 协议                     | 说明                     |
-| ------------------------------ | ---- | ------------------------ | ------------------------ |
-| `/v1/messages`                 | POST | Anthropic API (SSE)      | Claude Code CLI          |
-| `/v1/messages/count_tokens`    | POST | Anthropic API            | 请求 token 计数          |
-| `/v1/web-gpt/chat/completions` | POST | OpenAI Chat API          | ChatGPT 网页额度（文本） |
-| `/v1/web-gpt/responses`        | POST | OpenAI Responses API     | ChatGPT 网页额度（文本） |
-| `/v1/web-gpt/models`           | GET  | REST JSON                | 网页端模型列表           |
-| `/v1/realtime/calls`           | POST | WebRTC SDP               | ChatGPT OAuth 语音       |
-| `/agent.v1.AgentService/Run`   | POST | ConnectRPC (HTTP/2 BiDi) | Cursor IDE（Agent 模式） |
-| `/v1/models`                   | GET  | REST JSON                | Anthropic 模型列表       |
-| `/v1/anthropic/models`         | GET  | REST JSON                | 可用模型列表             |
-| `/health`                      | GET  | REST JSON                | 健康检查                 |
-| `/docs`                        | GET  | Swagger UI               | API 文档                 |
+本地桥接服务默认端口为 `2026`。
 
-`/v1/realtime/calls` 使用已配置的 ChatGPT OAuth 账号，将浏览器 WebRTC SDP
-offer 交换为 SDP answer。该接口不使用 Platform API key，并强制要求配置
-`PROXY_API_KEY`。上游能力目前仍属实验性；未获开放的账号会收到 `503`，错误码为
-`realtime_not_available`。
+| 路径                                 | 方法                 | 用途                             |
+| ------------------------------------ | -------------------- | -------------------------------- |
+| `/agent.v1.AgentService/Run`         | POST                 | Cursor Agent 对话与工具调用      |
+| `/v1/messages`                       | POST                 | Claude Code / Anthropic 兼容对话 |
+| `/v1/messages/count_tokens`          | POST                 | 请求 token 计数                  |
+| `/v1/chat/completions`               | POST                 | OpenAI Chat 兼容对话             |
+| `/v1/responses`                      | POST                 | OpenAI Responses 兼容对话        |
+| `/v1/web-gpt/chat/completions`       | POST                 | GPT Web 对话                     |
+| `/v1/web-gpt/responses`              | POST                 | GPT Web Responses                |
+| `/v1/images/generations`             | POST                 | 图片生成                         |
+| `/v1/images/edits`                   | POST                 | 参考图编辑                       |
+| `/v1/images/jobs/{id}`               | GET                  | 图片任务状态与结果               |
+| `/v1/realtime/calls`                 | POST                 | 创建语音连接                     |
+| `/v1/realtime/calls/{id}`            | GET / PATCH / DELETE | 语音会话查询、关联与清理         |
+| `/v1/realtime/files/{fileId}`        | GET                  | 获取 Web 语音生成的文件          |
+| `/v1/models`、`/v1/anthropic/models` | GET                  | 模型列表                         |
+| `/v1/web-gpt/models`                 | GET                  | GPT Web 模型列表                 |
+| `/health`                            | GET                  | 服务健康检查                     |
 
 ## 技术栈
 

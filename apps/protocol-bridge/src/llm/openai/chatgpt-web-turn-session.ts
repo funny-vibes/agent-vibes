@@ -61,8 +61,6 @@ export class ChatGptWebTurnSession {
   private readonly source: AsyncIterable<ChatGptWebEvent>
   private readonly queue: Segment[] = []
   private readonly pending = new Map<string, PendingTool>()
-  /** Every tool call id this turn has issued, released or not. */
-  private readonly dispatched = new Set<string>()
   private wake: (() => void) | null = null
   private reading = false
   private sourceDone = false
@@ -114,25 +112,12 @@ export class ChatGptWebTurnSession {
           )
         )
       }, this.toolTimeoutMs)
-      this.dispatched.add(toolCallId)
       this.pending.set(toolCallId, { toolCallId, resolve, reject, timer })
       this.push({ kind: "tool", toolCallId, name, input })
     })
   }
 
   /** The editor answered; release the MCP request that was waiting. */
-  /**
-   * Whether this id was ever dispatched by this turn.
-   *
-   * Cursor resends every result it has accumulated on each continuation, so a
-   * result that matches no waiter is almost always one already released. That
-   * is worth telling apart from an id this turn never issued, which would mean
-   * the two sides disagree about whose call it is.
-   */
-  hasDispatched(toolCallId: string): boolean {
-    return this.dispatched.has(toolCallId)
-  }
-
   submitToolResult(toolCallId: string, result: McpToolResult): boolean {
     const waiter = this.pending.get(toolCallId)
     if (!waiter) return false

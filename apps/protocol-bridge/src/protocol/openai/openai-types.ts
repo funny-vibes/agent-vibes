@@ -1,3 +1,7 @@
+import type {
+  GptProvider,
+  GptHistoryPolicy,
+} from "../../llm/shared/gpt-api-contract"
 /**
  * OpenAI Chat Completions / Completions wire types.
  *
@@ -63,6 +67,8 @@ export interface OpenAiStreamOptions {
 }
 
 export interface OpenAiChatCompletionRequest {
+  provider?: GptProvider
+  history_policy?: GptHistoryPolicy
   model: string
   messages: OpenAiChatMessage[]
   tools?: OpenAiFunctionTool[]
@@ -76,6 +82,7 @@ export interface OpenAiChatCompletionRequest {
   n?: number
   stop?: string | string[]
   reasoning_effort?: string
+  service_tier?: string
   response_format?: { type: string; [key: string]: unknown }
   [key: string]: unknown
 }
@@ -201,6 +208,8 @@ export type OpenAiResponseToolChoice =
   | { type: "function"; name: string }
 
 export interface OpenAiResponsesRequest {
+  provider?: GptProvider
+  history_policy?: GptHistoryPolicy
   model: string
   input: string | OpenAiResponseInputItem[]
   instructions?: string
@@ -211,6 +220,7 @@ export interface OpenAiResponsesRequest {
   temperature?: number
   top_p?: number
   reasoning?: { effort?: string; summary?: string }
+  service_tier?: string
   parallel_tool_calls?: boolean
   previous_response_id?: string | null
   store?: boolean

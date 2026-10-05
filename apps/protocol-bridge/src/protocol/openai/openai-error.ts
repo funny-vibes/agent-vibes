@@ -1,3 +1,4 @@
+import { GptRequestError } from "../../llm/shared/gpt-api-contract"
 import { CodexApiError } from "../../llm/openai/codex-api-error"
 import { ChatGptWebError } from "../../llm/openai/chatgpt-web-conversation.service"
 import { ChatGptWebSessionError } from "../../llm/openai/chatgpt-web-session"
@@ -81,6 +82,7 @@ export function renderOpenAiError(error: unknown): OpenAiErrorRendering {
   // down. The generic taxonomy would flatten those into "request shape is
   // invalid", so pass the original message and code straight through.
   if (
+    error instanceof GptRequestError ||
     error instanceof ChatGptWebError ||
     error instanceof ChatGptWebSessionError
   ) {
@@ -90,7 +92,7 @@ export function renderOpenAiError(error: unknown): OpenAiErrorRendering {
         error: {
           message: error.message,
           type: openAiErrorTypeFromStatus(error.statusCode),
-          param: null,
+          param: error instanceof GptRequestError ? error.param : null,
           code: error.code,
         },
       },

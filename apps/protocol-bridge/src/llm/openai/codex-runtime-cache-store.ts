@@ -250,21 +250,6 @@ export class CodexRuntimeCacheStore {
     return entry && isValidCodexCachedWsEntry(entry) ? entry : undefined
   }
 
-  deleteWsEntriesBySessionId(sessionId: string): number {
-    const exactSessionId = requireExactDurableIdentifier(
-      sessionId,
-      "Codex runtime cache WebSocket session id"
-    )
-    let deleted = 0
-    for (const [key, entry] of this.cachedWsSessions) {
-      if (entry.wsSessionId === exactSessionId) {
-        this.cachedWsSessions.delete(key)
-        deleted++
-      }
-    }
-    return deleted
-  }
-
   clearWsBaselinesByConversationHash(conversationIdHash: string): {
     clearedCount: number
     discardedPreviousResponseId: string | undefined

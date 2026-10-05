@@ -1,3 +1,4 @@
+import { GptRequestError } from "../shared/gpt-api-contract"
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "node:crypto"
 import type { CodexRealtimeAccountLease } from "./codex-realtime-account"
@@ -34,6 +35,13 @@ export class ChatGptWebRealtimeService {
   async createCall(
     request: ChatGptWebRealtimeCallRequest
   ): Promise<ChatGptWebRealtimeCallResult> {
+    if (request.historyPolicy !== "delete_after_completion") {
+      throw new GptRequestError(
+        "ChatGPT Web voice requires history_policy: delete_after_completion",
+        "history_policy"
+      )
+    }
+    normalizeChatGptWebVoice(resolveRequestedVoice(request.session))
     const accountCount = this.codex.getChatGptWebRealtimeAccountCount()
     if (accountCount === 0) {
       throw new ChatGptWebRealtimeServiceError(
@@ -113,6 +121,7 @@ export class ChatGptWebRealtimeService {
             callId: `web_${crypto.randomUUID().replaceAll("-", "")}`,
             sdp: response.text,
             transport: "chatgpt-web-voice",
+            accountKey: lease.accountKey,
           }
         }
 
@@ -162,6 +171,7 @@ export function buildChatGptWebSession(
     model_slug: "",
     model_slug_advanced: "",
     client_tools: [],
+    // Web voice rejects temporary chats. The gateway tracks end-of-call cleanup.
     history_and_training_disabled: false,
     conversation_mode: { kind: "primary_assistant" },
     enable_message_streaming: true,
@@ -224,7 +234,12 @@ export function normalizeChatGptWebVoice(value: string): string {
   }
   const normalized = value.trim().toLowerCase()
   const resolved = aliases[normalized] || normalized
-  return CHATGPT_WEB_VOICES.has(resolved) ? resolved : "cove"
+  if (!CHATGPT_WEB_VOICES.has(resolved))
+    throw new GptRequestError(
+      `Unsupported ChatGPT Web voice: ${value}`,
+      "session.voice"
+    )
+  return resolved
 }
 
 function safeDetail(value: string): string {

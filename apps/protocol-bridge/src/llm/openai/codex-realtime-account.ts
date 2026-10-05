@@ -1,6 +1,9 @@
 import * as crypto from "crypto"
+import type { Dispatcher } from "undici"
 
 export const CHATGPT_WEB_REALTIME_POOL_MODEL = "chatgpt-web-voice"
+/** Cooldowns for Codex voice calls are kept apart from ChatGPT Web voice. */
+export const CODEX_VOICE_POOL_MODEL = "codex-voice"
 
 export interface CodexRealtimeAccountLease {
   readonly accountKey: string
@@ -20,6 +23,17 @@ export interface CodexRealtimeAccountLease {
    * next request then has nowhere to go.
    */
   abandon(): void
+}
+
+/**
+ * A lease for a Codex voice call: the account, plus how its Codex backend is
+ * reached — the call endpoint, the Codex identity headers for a token, and
+ * the account's proxy.
+ */
+export interface CodexVoiceAccountLease extends CodexRealtimeAccountLease {
+  readonly callUrl: string
+  headers(accessToken: string): Record<string, string>
+  readonly dispatcher?: Dispatcher
 }
 
 /**

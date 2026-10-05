@@ -1137,15 +1137,6 @@ export class CodexWebSocketService implements OnModuleDestroy {
   }
 
   /**
-   * Close all sessions.
-   */
-  closeAllSessions(): void {
-    for (const [id] of this.sessions) {
-      this.closeSession(id, "close_all_sessions")
-    }
-  }
-
-  /**
    * Check if WebSocket transport is available.
    * Returns true since the ws module is a static dependency.
    */

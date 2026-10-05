@@ -272,7 +272,20 @@ export function translateOpenAiChatToCreateMessage(
   // reasoning_effort → Anthropic-style thinking hint via output_config.effort,
   // which the backends already understand for GPT/Claude reasoning models.
   if (typeof req.reasoning_effort === "string" && req.reasoning_effort) {
-    dto.output_config = { effort: req.reasoning_effort }
+    // The canonical adapter reads output_config only when thinking is enabled.
+    // Merely copying effort silently dropped xhigh and used the model default.
+    dto.thinking =
+      req.reasoning_effort === "none"
+        ? { type: "disabled" }
+        : { type: "adaptive" }
+    if (req.reasoning_effort !== "none")
+      dto.output_config = { effort: req.reasoning_effort }
+  }
+
+  // service_tier ("fast", "priority", ...) is carried as-is; the backend
+  // decides what it means (Codex reads "fast" as its priority tier).
+  if (typeof req.service_tier === "string" && req.service_tier) {
+    dto.service_tier = req.service_tier
   }
 
   return dto
@@ -369,6 +382,7 @@ export function translateOpenAiResponseToCreateMessage(
     temperature: req.temperature,
     top_p: req.top_p,
     reasoning_effort: req.reasoning?.effort,
+    service_tier: req.service_tier,
   })
 }
 

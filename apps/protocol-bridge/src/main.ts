@@ -239,6 +239,13 @@ async function bootstrap() {
     origin: "*",
     methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: "*",
+    exposedHeaders: [
+      "Location",
+      "Retry-After",
+      "X-Agent-Vibes-Provider",
+      "X-Agent-Vibes-Realtime-Protocol",
+      "X-Agent-Vibes-History-Policy",
+    ],
     credentials: false,
   })
 

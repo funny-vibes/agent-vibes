@@ -7,6 +7,10 @@ import {
   type ChatGptWebEvent,
   type ChatGptWebMessage,
 } from "../../llm/openai/chatgpt-web-conversation.service"
+import {
+  readImageUrl,
+  type ChatGptWebImage,
+} from "../../llm/openai/chatgpt-web-image"
 import { webGptTarget } from "../../llm/shared/model-registry"
 import type {
   OpenAiChatCompletionRequest,
@@ -25,6 +29,10 @@ import type {
  * carrying tools are rejected here rather than silently answered without
  * them, which would strand an agent waiting for a tool call that can never
  * arrive. Text and reasoning stream through unchanged.
+ *
+ * An `image_url` part is uploaded to the account's file store and named from
+ * the message. One that cannot be delivered is refused by name: dropping it
+ * is what used to leave the model answering as though nothing was attached.
  */
 
 interface ThreadRef {
@@ -42,19 +50,17 @@ export class ChatGptWebProtocolService {
    * Where each answer left its conversation.
    *
    * A caller continues by naming one — `conversation` for the thread itself,
-   * or `previous_response_id` for the turn that produced it — and gets back a
-   * thread that is a real conversation on the account, openable in the web UI.
+   * or `previous_response_id` for the turn that produced it. Parent message
+   * ids keep temporary chats resumable without reading saved history.
    */
   private readonly threads = new Map<string, ThreadRef>()
 
   constructor(private readonly conversation: ChatGptWebConversationService) {}
 
   /**
-   * Route a turn to whichever transport the request asks for.
-   *
-   * Only the browser transport can offer the model any tools, so tool use is
-   * refused on the HTTP one rather than answered without them — an agent left
-   * waiting for a call that can never arrive is worse than a clear error.
+   * Run a text turn through the ChatGPT Web HTTP backend. Native function
+   * calling is not supported here; Cursor's MCP connector is handled by
+   * ChatGptWebCursorBridge instead.
    */
   private async *run(
     model: string,
@@ -64,7 +70,7 @@ export class ChatGptWebProtocolService {
     thread: ThreadRef,
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
-    const named = stripLegacyBrowserPrefix(model)
+    const named = parseModelRequest(model.trim()).baseModel
     const { slug, thinkingEffort } = webGptTarget(named, requestedDepth)
     this.rejectToolUse(hasTools)
     const source = this.startHttpTurn(
@@ -90,9 +96,8 @@ export class ChatGptWebProtocolService {
    *
    * Continuing means upstream already holds the history, so only the newest
    * user message is sent — repeating the rest would say it all twice in the
-   * thread. The message it answers is read from upstream rather than from
-   * memory, so a conversation carried on by hand in the web UI is picked up
-   * where the person left it.
+   * thread. A previous response supplies its exact parent; a conversation id
+   * alone uses the latest parent remembered by the conversation service.
    */
   private async startHttpTurn(
     slug: string,
@@ -102,7 +107,8 @@ export class ChatGptWebProtocolService {
     signal?: AbortSignal
   ): Promise<AsyncGenerator<ChatGptWebEvent>> {
     const continuing = thread.conversationId
-      ? await this.conversation.currentNode(thread.conversationId)
+      ? (thread.messageId ??
+        (await this.conversation.currentNode(thread.conversationId)))
       : null
     if (thread.conversationId && !continuing) {
       this.logger.warn(
@@ -162,7 +168,10 @@ export class ChatGptWebProtocolService {
   async createChatCompletion(
     req: OpenAiChatCompletionRequest
   ): Promise<OpenAiChatCompletionResponse> {
-    const messages = normalizeChatMessages(req.messages)
+    const messages = withResponseFormat(
+      normalizeChatMessages(req.messages),
+      req.response_format
+    )
     const thread = this.threadFromRequest(req)
     const id = `chatcmpl-${randomId()}`
 
@@ -193,7 +202,9 @@ export class ChatGptWebProtocolService {
           index: 0,
           message: {
             role: "assistant",
-            content: text,
+            // A JSON-mode caller parses this directly, and the web backend
+            // still tends to fence its answer however the prompt asks.
+            content: req.response_format ? unfenceJson(text) : text,
             ...(reasoning ? { reasoning_content: reasoning } : {}),
           },
           finish_reason: "stop",
@@ -211,7 +222,12 @@ export class ChatGptWebProtocolService {
   async *createChatCompletionStream(
     req: OpenAiChatCompletionRequest
   ): AsyncGenerator<string, void, unknown> {
-    const messages = normalizeChatMessages(req.messages)
+    // Deltas cannot be unfenced after the fact, so the instruction carries the
+    // whole contract here: it forbids the fence rather than stripping it.
+    const messages = withResponseFormat(
+      normalizeChatMessages(req.messages),
+      req.response_format
+    )
     const thread = this.threadFromRequest(req)
     const id = `chatcmpl-${randomId()}`
     const created = Math.floor(Date.now() / 1_000)
@@ -425,20 +441,62 @@ function requestedDepth(
   return explicit || fromReasoning?.effort || fromSuffix
 }
 
-/** Flatten OpenAI content parts down to the plain text upstream accepts. */
+/**
+ * Flatten OpenAI content parts into the text and the images upstream takes.
+ *
+ * Image parts used to fall out here — anything without a `text` field was
+ * mapped to the empty string and filtered away — so a caller that attached a
+ * picture got an answer to the prompt alone, and the answer was usually that
+ * no image had been provided. They are carried now, and an image that cannot
+ * be carried is refused by name instead of vanishing.
+ */
 function flattenContent(
   content: string | OpenAiContentPart[] | null | undefined
-): string {
-  if (typeof content === "string") return content
-  if (!Array.isArray(content)) return ""
-  return content
-    .map((part) => {
-      if (!part || typeof part !== "object" || !("text" in part)) return ""
-      const text = (part as { text?: unknown }).text
-      return typeof text === "string" ? text : ""
-    })
-    .filter(Boolean)
-    .join("\n")
+): { text: string; images: ChatGptWebImage[] } {
+  if (typeof content === "string") return { text: content, images: [] }
+  if (!Array.isArray(content)) return { text: "", images: [] }
+
+  const text: string[] = []
+  const images: ChatGptWebImage[] = []
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue
+    const url = imageUrlOf(part)
+    if (url !== null) {
+      const read = readImageUrl(url, images.length)
+      if (!read.ok) {
+        throw new ChatGptWebError(
+          400,
+          "chatgpt_web_image_unsupported",
+          `Image ${images.length + 1} cannot be sent to ChatGPT Web: ${read.reason}`
+        )
+      }
+      images.push(read.image)
+      continue
+    }
+    if (!("text" in part)) continue
+    const value = (part as { text?: unknown }).text
+    if (typeof value === "string" && value) text.push(value)
+  }
+  return { text: text.join("\n"), images }
+}
+
+/**
+ * The URL an image part names, whichever surface it arrived from.
+ *
+ * Chat Completions spells it `image_url` with an object; the Responses API
+ * spells it `input_image` and allows the bare string. Null means the part is
+ * not an image at all.
+ */
+function imageUrlOf(part: object): string | null {
+  const type = (part as { type?: unknown }).type
+  if (type !== "image_url" && type !== "input_image") return null
+  const value = (part as { image_url?: unknown }).image_url
+  if (typeof value === "string") return value
+  if (value && typeof value === "object") {
+    const url = (value as { url?: unknown }).url
+    if (typeof url === "string") return url
+  }
+  return ""
 }
 
 function normalizeChatMessages(
@@ -456,10 +514,86 @@ function normalizeChatMessages(
           : message.role === "system"
             ? "system"
             : "user"
-    const content = flattenContent(message.content)
-    if (content) normalized.push({ role, content })
+    const { text, images } = flattenContent(message.content)
+    // Upstream hangs an attachment off a user turn and nowhere else, so an
+    // image on any other role is refused rather than quietly left behind.
+    if (images.length && role !== "user") {
+      throw new ChatGptWebError(
+        400,
+        "chatgpt_web_image_unsupported",
+        `ChatGPT Web takes an image only on a user message; one arrived on a ${role} message`
+      )
+    }
+    if (!text && !images.length) continue
+    normalized.push({
+      role,
+      content: text,
+      ...(images.length ? { images } : {}),
+    })
   }
   return normalized
+}
+
+/**
+ * ChatGPT Web has no structured-output mode: upstream ignores
+ * `response_format` outright, so a `json_schema` caller receives prose — or a
+ * bare scalar where it asked for an object — and fails to parse it. The
+ * contract is restored the only way this backend honours, as an instruction
+ * the model reads, and the schema travels with it so `strict` still means
+ * something.
+ *
+ * The instruction rides on the last user message rather than a system turn of
+ * its own: a continuing thread resends only that message, so a separate turn
+ * would be dropped on every request after the first.
+ */
+function withResponseFormat(
+  messages: ChatGptWebMessage[],
+  format: OpenAiChatCompletionRequest["response_format"]
+): ChatGptWebMessage[] {
+  const type = typeof format?.type === "string" ? format.type : ""
+  if (type !== "json_object" && type !== "json_schema") return messages
+
+  const lines = [
+    "Respond with a single JSON value and nothing else.",
+    "Do not wrap it in a code fence and do not add commentary around it.",
+    "Escape newlines and other control characters inside string values.",
+  ]
+  const schema = (format as { json_schema?: { schema?: unknown } })?.json_schema
+    ?.schema
+  if (type === "json_schema" && schema) {
+    lines.push(
+      "The JSON must validate against this schema:",
+      JSON.stringify(schema),
+      // Observed: asked for one `drill` object the model wanted to give two, so
+      // it wrote `"drill":{…},{…}` — a second object where the next property
+      // name belonged, which no parser accepts. Cardinality needs saying out
+      // loud, because this backend treats the schema as advice either way.
+      "Match the structure exactly. Where the schema declares an object, emit" +
+        " exactly one object; only an array may hold several entries. Never" +
+        " place a second value after one that is already complete."
+    )
+  }
+  const instruction = lines.join("\n")
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]!.role !== "user") continue
+    const carried = messages.slice()
+    // Spread rather than rebuild: a message carrying images has to keep them,
+    // and a literal here would drop them on every json-mode request.
+    carried[index] = {
+      ...messages[index]!,
+      content: `${messages[index]!.content}\n\n${instruction}`,
+    }
+    return carried
+  }
+  return [...messages, { role: "user", content: instruction }]
+}
+
+/** Strip a fence the model added anyway, so the caller can parse directly. */
+function unfenceJson(text: string): string {
+  const trimmed = text.trim()
+  const fenced = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n?```$/i.exec(trimmed)
+  return fenced ? fenced[1]!.trim() : trimmed
 }
 
 function normalizeResponsesInput(
@@ -478,23 +612,22 @@ function normalizeResponsesInput(
     const record = item as unknown as Record<string, unknown>
     if (record.type && record.type !== "message") continue
     const role = record.role === "assistant" ? "assistant" : "user"
-    const content = flattenContent(
+    const { text, images } = flattenContent(
       record.content as string | OpenAiContentPart[] | null
     )
-    if (content) messages.push({ role, content })
+    if (images.length && role !== "user") {
+      throw new ChatGptWebError(
+        400,
+        "chatgpt_web_image_unsupported",
+        `ChatGPT Web takes an image only on a user message; one arrived on a ${role} message`
+      )
+    }
+    if (!text && !images.length) continue
+    messages.push({ role, content: text, ...(images.length ? { images } : {}) })
   }
   return messages
 }
 
 function randomId(): string {
   return crypto.randomBytes(12).toString("hex")
-}
-
-/**
- * Tolerate a `browser/` prefix from a configuration written when there were
- * two transports. There is one now, so the prefix names nothing — but a model
- * id carrying it should still resolve rather than 404.
- */
-function stripLegacyBrowserPrefix(model: string): string {
-  return parseModelRequest(model.trim().replace(/^browser[/:]/i, "")).baseModel
 }

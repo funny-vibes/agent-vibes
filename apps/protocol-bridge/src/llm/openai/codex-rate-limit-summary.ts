@@ -1,4 +1,5 @@
 import type {
+  CodexImageGenLimitSnapshot,
   CodexRateLimitAccountSummary,
   CodexRateLimitModelSummary,
   CodexRateLimitSnapshot,
@@ -62,7 +63,8 @@ export function getCodexRateLimitModelSummary(
 export function getCodexRateLimitAccountSummary(
   snapshotsByModel: CodexRateLimitSnapshotMap,
   preferredModel: string,
-  resolveDisplayModel: CodexDisplayModelResolver
+  resolveDisplayModel: CodexDisplayModelResolver,
+  imageGen?: CodexImageGenLimitSnapshot
 ): CodexRateLimitAccountSummary | undefined {
   const models = Array.from(snapshotsByModel.keys())
     .map((modelName) =>
@@ -76,7 +78,9 @@ export function getCodexRateLimitAccountSummary(
     .sort((left, right) => right.updatedAt - left.updatedAt)
 
   if (models.length === 0) {
-    return undefined
+    return imageGen
+      ? { effective: null, models, imageGen, updatedAt: imageGen.updatedAt }
+      : undefined
   }
 
   const normalizedPreferred = normalizeCodexRateLimitModelName(preferredModel)
@@ -87,6 +91,7 @@ export function getCodexRateLimitAccountSummary(
   return {
     effective,
     models,
+    ...(imageGen ? { imageGen } : {}),
     updatedAt,
   }
 }

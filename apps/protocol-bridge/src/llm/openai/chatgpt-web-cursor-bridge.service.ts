@@ -74,14 +74,9 @@ export class ChatGptWebCursorBridge {
   private readonly logger = new Logger(ChatGptWebCursorBridge.name)
   private active: ActiveTurn | null = null
   /**
-   * Which ChatGPT thread each Cursor conversation is having.
-   *
-   * One tab serves every conversation, so without this a turn would land in
-   * whichever thread the last one left open: two chats would braid together
-   * and a new one would inherit an old one's context. It is also what makes
-   * the pairing usable by hand — the thread is a real conversation on the
-   * account, so it can be opened in the web UI and carried on there, and the
-   * next Cursor turn picks up everything that was said.
+   * Each Cursor conversation owns a separate temporary ChatGPT thread.
+   * Parent message ids are retained by ChatGptWebConversationService rather
+   * than loaded from the account's saved chat history.
    */
   /** Why the most recent turn ended, for the refusal message below. */
   private lastEnd: { conversationId: string; reason: string } | null = null
@@ -114,11 +109,8 @@ export class ChatGptWebCursorBridge {
   /**
    * One ChatGPT turn, as raw SSE, over the plain HTTP transport.
    *
-   * This used to drive a browser tab, on the belief that a connector activates
-   * only for a request the web app itself built. It does not: a request built
-   * here activates it just as well, and the tool call arrives at this bridge.
-   * What the app supplied was a fresh sentinel and a trusted session, which
-   * this transport already obtains per turn.
+   * A fresh sentinel and the per-account HTTP session authorize each turn.
+   * The configured MCP connector delivers tool calls to this bridge.
    *
    * The conversation id still has to be learned from the frames, because a
    * thread that did not exist before is named by the response rather than by
@@ -401,12 +393,12 @@ export class ChatGptWebCursorBridge {
       }),
     }
     this.active = turn
-    const typed = blocks.join("\n\n")
+    const prompt = blocks.join("\n\n")
     this.logger.warn(
       `${host ? "Tool host" : "ChatGPT Web turn"} started for ` +
-        `${params.conversationId.slice(0, 8)}… — typing ${typed.length} chars ` +
+        `${params.conversationId.slice(0, 8)}… — sending ${prompt.length} chars ` +
         `into ${thread ? "thread " + thread.slice(0, 8) + "…" : "a new thread"}: ` +
-        JSON.stringify(typed.slice(0, 80))
+        JSON.stringify(prompt.slice(0, 80))
     )
     return turn
   }
@@ -477,7 +469,7 @@ export class ChatGptWebCursorBridge {
     )
   }
 
-  /** Drop the turn for a conversation, if it owns the tab. */
+  /** Drop the active turn if it belongs to this conversation. */
   release(conversationId: string, reason: string): void {
     if (this.active?.conversationId === conversationId) {
       this.end(this.active, reason)

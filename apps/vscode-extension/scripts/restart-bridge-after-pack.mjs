@@ -4,6 +4,12 @@ import path from "path"
 import https from "https"
 import { execFileSync, spawn } from "child_process"
 import { fileURLToPath } from "url"
+import {
+  managedBridgeProcesses,
+  managedLinuxBridgeProcesses,
+  selectBridgePids,
+  healthMatchesChild,
+} from "./bridge-process-identity.mjs"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -198,11 +204,21 @@ function readPid() {
   }
 }
 
-function listBridgePids() {
-  const binaryRealPath = fs.existsSync(binaryPath)
-    ? fs.realpathSync(binaryPath)
-    : binaryPath
+function portOwnerPids(port) {
+  try {
+    return execFileSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], {
+      encoding: "utf-8",
+    })
+      .trim()
+      .split(/\s+/)
+      .map(Number)
+      .filter(Number.isSafeInteger)
+  } catch {
+    return []
+  }
+}
 
+function listBridgePids(port) {
   const pids = new Set()
 
   try {
@@ -227,30 +243,32 @@ function listBridgePids() {
         if (Number.isFinite(pid)) pids.add(pid)
       }
     } else {
-      const psOutput = execFileSync("ps", ["-axo", "pid=,command="], {
-        encoding: "utf-8",
-      })
-      lines = psOutput
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean)
-      for (const line of lines) {
-        const match = line.match(/^(\d+)\s+(.*)$/)
-        if (!match) continue
-        const pid = Number.parseInt(match[1], 10)
-        const command = match[2] || ""
-        if (!Number.isFinite(pid)) continue
-        if (
-          command.includes("agent-vibes-bridge") &&
-          (command.includes(binaryRealPath) ||
-            command.includes(installedExtensionDir))
-        ) {
-          pids.add(pid)
-        }
+      const listeningPids = portOwnerPids(port)
+      const pidFilePid = readPid()
+      const identityOptions = {
+        extensionsRoot: path.dirname(installedExtensionDir),
+        publisher,
+        extensionName,
+        target,
       }
+      const processes =
+        process.platform === "linux"
+          ? managedLinuxBridgeProcesses(
+              [...listeningPids, pidFilePid],
+              identityOptions
+            )
+          : managedBridgeProcesses(
+              execFileSync("ps", ["-axo", "pid=,comm="], { encoding: "utf-8" }),
+              identityOptions
+            )
+      return selectBridgePids(processes, listeningPids, pidFilePid)
     }
-  } catch {
-    // ps/powershell not available — fall back to PID file only
+  } catch (error) {
+    // A stale PID file can point at an unrelated process after PID reuse.
+    // Do not signal anything unless its executable identity was verified.
+    throw new Error(
+      `Cannot identify the installed bridge process: ${error instanceof Error ? error.message : String(error)}`
+    )
   }
 
   const pidFilePid = readPid()
@@ -553,8 +571,8 @@ async function assertSafeToRestartBridge(port, caCertPath) {
   )
 }
 
-async function stopExistingBridge() {
-  const pids = listBridgePids().filter((pid) => pid !== process.pid)
+async function stopExistingBridge(port) {
+  const pids = listBridgePids(port).filter((pid) => pid !== process.pid)
   if (pids.length === 0) return
 
   console.log(
@@ -563,7 +581,9 @@ async function stopExistingBridge() {
   for (const pid of pids) {
     try {
       process.kill(pid, "SIGTERM")
-    } catch {}
+    } catch {
+      /* Already stopped or the recoverable log/PID file was absent. */
+    }
   }
 
   const deadline = Date.now() + 5000
@@ -577,12 +597,16 @@ async function stopExistingBridge() {
     if (!isAlive(pid)) continue
     try {
       process.kill(pid, "SIGKILL")
-    } catch {}
+    } catch {
+      /* Already stopped or the recoverable log/PID file was absent. */
+    }
   }
 
   try {
     fs.unlinkSync(PID_FILE)
-  } catch {}
+  } catch {
+    /* Already stopped or the recoverable log/PID file was absent. */
+  }
 }
 
 function rotateLogFile() {
@@ -590,30 +614,48 @@ function rotateLogFile() {
 
   try {
     fs.rmSync(PREVIOUS_LOG_FILE, { force: true })
-  } catch {}
+  } catch {
+    /* Already stopped or the recoverable log/PID file was absent. */
+  }
 
   try {
     fs.renameSync(LOG_FILE, PREVIOUS_LOG_FILE)
     console.log(`[restart:bridge] Rotated log to ${PREVIOUS_LOG_FILE}`)
     return
-  } catch {}
+  } catch {
+    /* Already stopped or the recoverable log/PID file was absent. */
+  }
 
   try {
     fs.truncateSync(LOG_FILE, 0)
     console.log(`[restart:bridge] Truncated existing log at ${LOG_FILE}`)
-  } catch {}
+  } catch {
+    /* Already stopped or the recoverable log/PID file was absent. */
+  }
 }
 
 function waitForHealth(
   port,
   caCertPath,
+  childPid,
   timeoutMs = STARTUP_HEALTH_TIMEOUT_MS
 ) {
   const ca = fs.existsSync(caCertPath) ? fs.readFileSync(caCertPath) : undefined
   const startedAt = Date.now()
 
   return new Promise((resolve) => {
+    const retry = () => {
+      if (!isAlive(childPid) || Date.now() - startedAt >= timeoutMs) {
+        resolve(false)
+        return
+      }
+      setTimeout(attempt, 500)
+    }
     const attempt = () => {
+      if (!isAlive(childPid)) {
+        resolve(false)
+        return
+      }
       const req = https.get(
         {
           hostname: "localhost",
@@ -625,16 +667,22 @@ function waitForHealth(
         },
         (res) => {
           res.resume()
-          resolve(res.statusCode === 200)
+          const healthy =
+            process.platform === "win32"
+              ? res.statusCode === 200 && isAlive(childPid)
+              : healthMatchesChild(
+                  res.statusCode,
+                  childPid,
+                  isAlive(childPid),
+                  portOwnerPids(port)
+                )
+          if (healthy) resolve(true)
+          else retry()
         }
       )
 
       req.on("error", () => {
-        if (Date.now() - startedAt >= timeoutMs) {
-          resolve(false)
-          return
-        }
-        setTimeout(attempt, 500)
+        retry()
       })
 
       req.setTimeout(3000, () => {
@@ -654,11 +702,13 @@ async function main() {
   const { env, port, dataDir, caCertPath } = resolveConfig()
   fs.mkdirSync(env.AGENT_VIBES_LOG_DIR, { recursive: true })
   await assertSafeToRestartBridge(port, caCertPath)
-  await stopExistingBridge()
+  await stopExistingBridge(port)
   rotateLogFile()
 
   const logFd = fs.openSync(LOG_FILE, "a")
   const child = spawn(binaryPath, [], {
+    // Never load a checkout's .env.local into the installed editor runtime.
+    cwd: installedExtensionDir,
     env: {
       ...process.env,
       ...env,
@@ -673,7 +723,7 @@ async function main() {
     fs.writeFileSync(PID_FILE, String(child.pid))
   }
 
-  const healthy = await waitForHealth(port, caCertPath)
+  const healthy = await waitForHealth(port, caCertPath, child.pid)
   if (healthy) {
     console.log(
       `[restart:bridge] Bridge restarted successfully on https://localhost:${port} ` +
